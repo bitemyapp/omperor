@@ -1,0 +1,78 @@
+diff --git a/crates/envd/src/docserver/fs.rs b/crates/envd/src/docserver/fs.rs
+index a9ece570ba..e5bd430b78 100644
+--- a/crates/envd/src/docserver/fs.rs
++++ b/crates/envd/src/docserver/fs.rs
+@@ -2784,10 +2784,9 @@ impl LocalFs {
+ 	}
+ 
+ 	fn flush_directory(directory: &Dir, path: &Path) -> Result<()> {
+-		let clone = directory
+-			.try_clone()
+-			.map_err(|source| Self::io_error("clone parent directory handle", path, source))?;
+-		match clone.into_std_file().sync_all() {
++		let file = directory_file(directory)
++			.map_err(|source| Self::io_error("open parent directory handle", path, source))?;
++		match file.sync_all() {
+ 			Ok(()) => Ok(()),
+ 			Err(source)
+ 				if matches!(
+@@ -2937,6 +2936,25 @@ impl LocalFs {
+ 	}
+ }
+ 
++/// An ordinary file handle on a directory, which `flock` and `fsync` accept.
++/// On Linux cap-std opens a directory it only resolves names in with
++/// `O_PATH`, and both refuse such a handle (`EBADF`), so the directory is
++/// opened again through it, for reading.
++#[cfg(unix)]
++pub(crate) fn directory_file(directory: &Dir) -> io::Result<std::fs::File> {
++	use rustix::fs::{Mode, OFlags, openat};
++
++	let fd =
++		openat(directory, ".", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
++	Ok(std::fs::File::from(fd))
++}
++
++/// A new file handle on a directory, which locking and flushing accept.
++#[cfg(windows)]
++pub(crate) fn directory_file(directory: &Dir) -> io::Result<std::fs::File> {
++	directory.open_dir(".").map(Dir::into_std_file)
++}
++
+ #[cfg(test)]
+ mod tests {
+ 	use std::{fs, num::NonZeroU64};
+diff --git a/crates/envd/src/docserver/types.rs b/crates/envd/src/docserver/types.rs
+index 01f323d34a..a72e9b35db 100644
+--- a/crates/envd/src/docserver/types.rs
++++ b/crates/envd/src/docserver/types.rs
+@@ -719,8 +719,6 @@ impl ServerConfig {
+ 	/// Other namespaces may observe the same project; final disk mutations
+ 	/// still serialize on a separate physical-project lock.
+ 	pub fn try_lock_authority(&self) -> Result<AuthorityLock> {
+-		use cap_std::fs;
+-
+ 		if self
+ 			.authority_held
+ 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+@@ -736,15 +734,11 @@ impl ServerConfig {
+ 			});
+ 		}
+ 		let result = (|| {
+-			let root = self
+-				.root
+-				.open_dir(".")
+-				.map(fs::Dir::into_std_file)
+-				.map_err(|source| Error::Io {
+-					operation: sf!("open Environment authority handle"),
+-					path: self.environment_root.clone(),
+-					source,
+-				})?;
++			let root = super::fs::directory_file(&self.root).map_err(|source| Error::Io {
++				operation: sf!("open Environment authority handle"),
++				path: self.environment_root.clone(),
++				source,
++			})?;
+ 			root.try_lock_shared().map_err(|source| Error::Io {
+ 				operation: sf!("lock Environment authority"),
+ 				path:      self.environment_root.clone(),

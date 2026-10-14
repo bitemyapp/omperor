@@ -23,6 +23,8 @@ python3 scripts/linux-prepare.py
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 export OMPEROR_SOURCE_DIR="$PROJECT_DIR"
 status=0
-cargo --config "$CONFIG_FILE" "$COMMAND" --manifest-path "$OVERLAY_DIR/omperor/Cargo.toml" "$@" || status=$?
+# After the subcommand, so that external subcommands such as clippy pass the
+# overlay on to the cargo they run.
+cargo "$COMMAND" --config "$CONFIG_FILE" --manifest-path "$OVERLAY_DIR/omperor/Cargo.toml" "$@" || status=$?
 cp "$OVERLAY_DIR/omperor/Cargo.lock" "$PROJECT_DIR/Cargo.linux.lock"
 exit "$status"

@@ -27,6 +27,7 @@ pub(crate) struct ChangeFilter {
 
 impl ChangeFilter {
     /// Judges nothing ignored — the state before any ignore file was read.
+    #[cfg(target_os = "macos")]
     pub(crate) fn empty(root: &Path) -> Self {
         Self {
             root: root.to_owned(),

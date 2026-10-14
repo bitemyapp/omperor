@@ -6,13 +6,15 @@ The default serializes first-time store initialization; --cold-start races it.
 --isolated-stores checks separate app data roots in the same physical project;
 --other-helper additionally exercises two different packaged executables.
 Artifacts are retained in the printed temporary directory. No user credentials
-or project files are used. Run after scripts/build-app.sh, or pass --helper.
+or project files are used. Run after scripts/build-app.sh (macOS) or `just linux`,
+or pass --helper.
 """
 import argparse
 import json
 import os
 from pathlib import Path
 import queue
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -115,7 +117,11 @@ class Helper:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cold-start", action="store_true", help="Also race first-time credential store initialization")
-    parser.add_argument("--helper", type=Path, default=ROOT / "target/Omperor Dev.app/Contents/Helpers/omp")
+    # The macOS Dev bundle's helper, or on Linux the one `just linux` installs.
+    default_helper = ROOT / (
+        "target/Omperor Dev.app/Contents/Helpers/omp" if sys.platform == "darwin" else "target/omperor-helpers/omp"
+    )
+    parser.add_argument("--helper", type=Path, default=default_helper)
     parser.add_argument("--other-helper", type=Path, help="Use a second bundle's helper for isolated-store checks")
     parser.add_argument("--isolated-stores", action="store_true", help="Separate both stores while sharing HOME and the project")
     args = parser.parse_args()
@@ -181,7 +187,9 @@ def main():
             b.send("prompt", message="survivor-b")
             b.wait("agent_end")
             # Start an actual tool descendant, then shut down during that tool.
-            mock.replies = (call("bash", command="/usr/bin/python3 -c 'import os,time; open(\"descendant.pid\",\"w\").write(str(os.getpid())); time.sleep(120)'", timeout=130, i="Testing shutdown"),)
+            # This interpreter, by absolute path: not every system has /usr/bin/python3.
+            python = shlex.quote(sys.executable)
+            mock.replies = (call("bash", command=f"{python} -c 'import os,time; open(\"descendant.pid\",\"w\").write(str(os.getpid())); time.sleep(120)'", timeout=130, i="Testing shutdown"),)
             b.send("prompt", message="start-owned-descendant")
             marker = root / "project/descendant.pid"
             deadline = time.monotonic() + 30

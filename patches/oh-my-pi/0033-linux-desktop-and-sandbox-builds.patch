@@ -1,0 +1,60 @@
+diff --git a/crates/desktop/src/linux/actor.rs b/crates/desktop/src/linux/actor.rs
+index b42dd19f1a..af16177c29 100644
+--- a/crates/desktop/src/linux/actor.rs
++++ b/crates/desktop/src/linux/actor.rs
+@@ -1,4 +1,7 @@
+-use std::sync::{LazyLock, mpsc};
++use std::{
++	sync::{LazyLock, mpsc},
++	thread,
++};
+ 
+ use atspi::ObjectRefOwned;
+ use flume::{Receiver, Sender};
+diff --git a/crates/desktop/src/linux/wayland/libei.rs b/crates/desktop/src/linux/wayland/libei.rs
+index b4bbc66bba..f3665fac49 100644
+--- a/crates/desktop/src/linux/wayland/libei.rs
++++ b/crates/desktop/src/linux/wayland/libei.rs
+@@ -54,7 +54,7 @@ struct PortalSession {
+ }
+ 
+ pub(crate) struct ActorLibei {
+-	context:        Context,
++	context:        ei::Context,
+ 	pointer:        Option<EiDevice>,
+ 	keyboard:       Option<EiDevice>,
+ 	sequence:       u32,
+diff --git a/crates/sandbox/src/backends/landlock.rs b/crates/sandbox/src/backends/landlock.rs
+index 3cd7d48250..75e9ef995c 100644
+--- a/crates/sandbox/src/backends/landlock.rs
++++ b/crates/sandbox/src/backends/landlock.rs
+@@ -150,10 +150,7 @@ pub fn compile(
+ 	Ok(plan)
+ }
+ 
+-pub const fn prepare(
+-	spec: &SandboxSpec,
+-	prepared: &mut PreparedSandbox,
+-) -> Result<(), SandboxError> {
++pub fn prepare(spec: &SandboxSpec, prepared: &mut PreparedSandbox) -> Result<(), SandboxError> {
+ 	#[cfg(not(target_os = "linux"))]
+ 	{
+ 		let _ = (spec, prepared);
+@@ -293,7 +290,7 @@ fn write_paths(writer: &mut impl Write, paths: &[PathBuf]) -> io::Result<()> {
+ 
+ /// Returns the running kernel's Landlock ABI, or `None` when unavailable.
+ #[must_use]
+-pub const fn abi() -> Option<u32> {
++pub fn abi() -> Option<u32> {
+ 	#[cfg(not(target_os = "linux"))]
+ 	{
+ 		None
+@@ -345,7 +342,7 @@ pub fn probe() -> BackendStatus {
+ /// The caller must dispatch this before launching untrusted work. The helper
+ /// reads an owned BPF artifact, optionally applies an owned Landlock manifest,
+ /// and then `execve(2)`s the command following the required `--` separator.
+-pub const fn run_child_entry() -> Result<(), SandboxError> {
++pub fn run_child_entry() -> Result<(), SandboxError> {
+ 	#[cfg(not(target_os = "linux"))]
+ 	{
+ 		Err(SandboxError::UnsupportedHost { os: std::env::consts::OS })

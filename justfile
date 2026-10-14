@@ -68,8 +68,9 @@ test:
     test -f vendor/upleft/corpus/generated/docs/Docs__STATUS.md || (cd vendor/upleft && python3 scripts/build-corpus.py)
     cargo test
 
-# Build the native Linux app using Sidestep.
+# Build the native Linux app using Sidestep, and the OMP helper it runs (rebuilt only if its inputs changed).
 linux:
+    scripts/build-omp-helper.sh >/dev/null
     scripts/linux-cargo build --release --locked
 
 # Verify the Linux app and its platform-independent unit tests.

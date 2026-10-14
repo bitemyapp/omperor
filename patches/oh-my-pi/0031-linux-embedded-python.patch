@@ -1,0 +1,34 @@
+diff --git a/crates/py/scripts/fetch-python.sh b/crates/py/scripts/fetch-python.sh
+index 73d805131b..370aa912f4 100755
+--- a/crates/py/scripts/fetch-python.sh
++++ b/crates/py/scripts/fetch-python.sh
+@@ -91,6 +91,12 @@ prepare_tree() {
+ 	LIB_NAME=$(basename "${CONFIG_LIBS[0]}" .a | sed 's/^lib//')
+ 	local EXECUTABLE="$VENDOR/install/bin/python3.14td"
+ 	[ -x "$EXECUTABLE" ] || EXECUTABLE="$VENDOR/install/bin/python3.14t"
++	# The archive's interpreter asks for the dynamic loader at its standard
++	# path, which NixOS doesn't have (it has a stub there that refuses to
++	# run it). Under a Nix toolchain it gets that toolchain's loader.
++	if ! "$EXECUTABLE" -c '' 2>/dev/null && [ -f "${NIX_CC:-}/nix-support/dynamic-linker" ]; then
++		patchelf --set-interpreter "$(cat "$NIX_CC/nix-support/dynamic-linker")" "$(readlink -f "$EXECUTABLE")"
++	fi
+ 
+ 	echo "generating ${VENDOR_NAME}/stdlib.bin..." >&2
+ 	"$EXECUTABLE" "$SCRIPT_DIR/pack-pymodules.py" "$STDLIB_DIR" "$VENDOR/stdlib.bin" \
+diff --git a/justfile b/justfile
+index 80db3d107f..14159f283c 100644
+--- a/justfile
++++ b/justfile
+@@ -114,10 +114,10 @@ check-pkg pkg:
+ build:
+     cargo build -p omp-app --bin omp --locked
+ 
+-# Build the `omp` CLI/daemon binary (release profile; macOS needs vendored release Python + Homebrew LLD, see AGENTS.md "Embedded Python").
++# Build the `omp` CLI/daemon binary (release profile; macOS needs vendored release Python + Homebrew LLD, see AGENTS.md "Embedded Python"; Linux has one embedded Python tree, vendor/python, for both profiles).
+ [group('build & check')]
+ build-release:
+-    PYO3_CONFIG_FILE="{{ justfile_directory() }}/vendor/python-release/pyo3-config.txt" \
++    PYO3_CONFIG_FILE="{{ justfile_directory() }}/vendor/{{ if os() == "macos" { "python-release" } else { "python" } }}/pyo3-config.txt" \
+         cargo build -p omp-app --bin omp --release --locked
+ 
+ # ---------------------------------------------------------------------------

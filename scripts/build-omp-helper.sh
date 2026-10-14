@@ -34,6 +34,10 @@ PATCH_FILES=(
     "$PROJECT_DIR/patches/oh-my-pi/0028-codex-conversation-routing-headers.patch"
     "$PROJECT_DIR/patches/oh-my-pi/0029-browser-and-computer-use-vocabulary.patch"
     "$PROJECT_DIR/patches/oh-my-pi/0030-browser-lifetime.patch"
+    "$PROJECT_DIR/patches/oh-my-pi/0031-linux-embedded-python.patch"
+    "$PROJECT_DIR/patches/oh-my-pi/0032-linux-mv-xattrs.patch"
+    "$PROJECT_DIR/patches/oh-my-pi/0033-linux-desktop-and-sandbox-builds.patch"
+    "$PROJECT_DIR/patches/oh-my-pi/0034-lockable-directory-handles.patch"
 )
 
 FORCE_BUILD=false
@@ -62,10 +66,6 @@ if [[ -z "${SDKROOT:-}" ]]; then
     done
 fi
 
-if [[ ! -f "$VENDOR_DIR/vendor/python/pyo3-config.txt" ]]; then
-    just --justfile "$VENDOR_DIR/justfile" --working-directory "$VENDOR_DIR" setup-python
-fi
-
 TARGET_DIR="${CARGO_TARGET_DIR:-$VENDOR_DIR/target}"
 if [[ "$TARGET_DIR" != /* ]]; then
     TARGET_DIR="$PROJECT_DIR/$TARGET_DIR"
@@ -81,20 +81,33 @@ BUILD_KEY_FILE="$HELPER_DIR/omp.build-key"
 if [[ ! -f "$STAGING_DIR/.omperor-source" ]] || \
     ! grep -Fqx "$STAGING_KEY" "$STAGING_DIR/.omperor-source"; then
     rm -rf "$STAGING_DIR"
-    git clone --quiet --shared "$VENDOR_DIR" "$STAGING_DIR"
-    git -C "$STAGING_DIR" checkout --quiet --detach "$SOURCE_REV"
+    git clone --quiet --shared --no-checkout "$VENDOR_DIR" "$STAGING_DIR"
+    git -c advice.detachedHead=false -C "$STAGING_DIR" checkout --quiet --detach "$SOURCE_REV"
     for patch_file in "${PATCH_FILES[@]}"; do
         git -C "$STAGING_DIR" apply --unidiff-zero "$patch_file"
     done
     mkdir -p "$STAGING_DIR/vendor"
-    ln -s "$VENDOR_DIR/vendor/python" "$STAGING_DIR/vendor/python"
-    if [[ -d "$VENDOR_DIR/vendor/python-release" ]]; then
-        ln -s "$VENDOR_DIR/vendor/python-release" "$STAGING_DIR/vendor/python-release"
-    fi
     printf '%s\n' "$STAGING_KEY" > "$STAGING_DIR/.omperor-source"
 fi
 
-PYTHON_RELEASE_DIR="$VENDOR_DIR/vendor/python-release"
+# The embedded Python lives in the vendor checkout's ignored vendor/, so it
+# survives restaging. The staged fetch script carries the patches (0031 runs
+# the archive's interpreter under a Nix toolchain's loader).
+if [[ ! -f "$VENDOR_DIR/vendor/python/pyo3-config.txt" ]]; then
+    "$STAGING_DIR/crates/py/scripts/fetch-python.sh" "$VENDOR_DIR/vendor"
+fi
+for tree in python python-release; do
+    if [[ -d "$VENDOR_DIR/vendor/$tree" ]]; then
+        ln -sfn "$VENDOR_DIR/vendor/$tree" "$STAGING_DIR/vendor/$tree"
+    fi
+done
+
+# macOS release helpers link the PGO+LTO tree; Linux has one tree for both.
+if [[ "$(uname -s)" == Darwin ]]; then
+    PYTHON_RELEASE_DIR="$VENDOR_DIR/vendor/python-release"
+else
+    PYTHON_RELEASE_DIR="$VENDOR_DIR/vendor/python"
+fi
 LLD_VERSION="$({
     for linker in /opt/homebrew/opt/lld@22/bin/ld64.lld /opt/homebrew/opt/lld/bin/ld64.lld; do
         if [[ -x "$linker" ]]; then
