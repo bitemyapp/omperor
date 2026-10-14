@@ -2,12 +2,17 @@
 
 Omperor and Omperor Dev can run together, including in the same repository. Build both with the current helper: older helpers hold an exclusive repository lock that prevents another edition from opening it. Finish work and quit the older app before replacing it.
 
-| Launch | Default state root |
+| Launch | Default state root (macOS; Linux) |
 |---|---|
-| Installed Omperor (`production` Cargo feature) | `~/Library/Application Support/Omperor` |
-| Local Omperor Dev, debug or release | `~/Library/Application Support/Omperor Dev` |
+| Installed Omperor (`production` Cargo feature) | `~/Library/Application Support/Omperor`; `$XDG_DATA_HOME/omperor` |
+| Local Omperor Dev, debug or release | `~/Library/Application Support/Omperor Dev`; `$XDG_DATA_HOME/omperor-dev` |
 | `omperor eval`, from either executable | Omperor Dev’s root |
 | Design preview | Temporary fixture state; no real accounts or inference |
+
+On Linux, `$XDG_DATA_HOME` defaults to `~/.local/share`, and a root that
+earlier Linux builds created under `~/Library/Application Support` keeps
+being used where it is. `omperor --state-paths` prints the roots a build
+resolves.
 
 Each root owns `omperor.sqlite3` (preferences, account labels/defaults and the project/session registry), `omp/sessions` (journals and metrics), `omp/data`, `archives`, `worktrees`, and debug `logs`. OMP’s state, cache, configuration and worktree directories are pinned beneath that root’s `omp/data`, with the default OMP profile. Inherited TUI `OMP_*_DIR` settings cannot redirect these child stores. Global `~/.o2` configuration is not automatically imported.
 

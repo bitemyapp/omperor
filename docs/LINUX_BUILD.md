@@ -1,27 +1,74 @@
 # Linux build with Sidestep
 
 Omperor uses the same AppKit UI on macOS and Linux. Linux links the pinned
-`vendor/sidestep` runtime and frameworks. A Wayland session and system fonts
-are needed to run the app; X11 is not supported by Sidestep yet.
+`vendor/sidestep` runtime and frameworks. Linux support is experimental:
+Sidestep does not match every AppKit behavior.
 
-Initialize the submodules, then build with the repository's Rust toolchain:
+## Requirements
+
+- x86-64 Linux. The OMP helper embeds a Python build that is fetched only for
+  x86-64 Linux (and Apple silicon macOS).
+- A Wayland session and system fonts (found through fontconfig) to run the
+  app. X11 is not supported by Sidestep yet. Tested on Hyprland and sway.
+- Network access for the first build: Cargo downloads crates, the overlay
+  step fetches the objc2 crates it patches, and the helper build fetches the
+  Python archive from GitHub and one package from PyPI.
+
+**NixOS** is the tested setup. The repository's flake provides the pinned
+Rust toolchain and every tool the build uses; run the build inside its dev
+shell. NixOS has no global library path, so executables find their
+libraries by run path: the shell has rustc link through the Nix linker
+wrapper, which records the libraries a binary links (the OMP helper's
+libopus), rather than with rustc's bundled LLD, and adds fontconfig, which
+Sidestep loads at run time to find fonts. A build outside the shell draws no
+text, and its helper doesn't start.
+
+**Other distributions** need no Nix: Ubuntu 24.04 is tested. Install
+[rustup](https://rustup.rs) (it installs the nightly toolchain that
+`rust-toolchain.toml` pins on first use), a C compiler, `just`, Python 3,
+Git, `flock` (util-linux), Perl (for `shasum`), curl, zstd, uv, pkg-config,
+CMake, Ninja, and fontconfig. libopus's development files are optional:
+without them the helper build compiles opus from source. patchelf is needed
+only on NixOS.
+
+## Build
 
 ```sh
 git submodule update --init --recursive
-scripts/linux-cargo build --release --locked
-# or: just linux
+nix develop -c just linux   # on NixOS
+just linux                  # elsewhere
 ```
 
-The executable is `target/release/omperor`. To select an OMP helper:
+`just linux` builds the OMP helper, then the app. The executable is
+`target/release/omperor`. `scripts/build-omp-helper.sh` stages the pinned
+`vendor/oh-my-pi` with the patches in `patches/oh-my-pi/` (0031–0034 are the
+Linux ones: the embedded Python, `mv` extended attributes, the desktop and
+sandbox crates, and lockable directory handles), fetches its embedded Python
+(on x86-64 Linux, the free-threaded debug build serves release helpers too),
+and installs `target/omperor-helpers/omp`, rebuilding only when its inputs
+change. The first build takes tens of minutes. On NixOS the fetched
+interpreter is pointed at the toolchain's dynamic loader, as the standard
+one doesn't exist there. Without a helper, a conversation fails with "OMP
+RPC startup failed: … No such file or directory". To select another helper:
 
 ```sh
 OMPEROR_OMP_EXECUTABLE=/absolute/path/to/omp target/release/omperor
 ```
 
-Check or test through the same wrapper:
+State lives in `$XDG_DATA_HOME/omperor-dev` (`~/.local/share/omperor-dev` by
+default) for local builds; see [state isolation](STATE_ISOLATION.md). Git is
+found on `PATH`. "Open in" and "Open Terminal Here" start the first editor or
+terminal found on `PATH` from `src/launchers.rs`'s list (Zed, VS Code, Kate,
+…; Ghostty, kitty, foot, Konsole, …, then `xdg-terminal-exec`), or the one
+chosen in Settings; links and "Show in Files" go through
+xdg-desktop-portal. Menu shortcuts written with ⌘ are Super on Linux.
+
+Check, lint or test through the same wrapper the build uses (`just
+test-linux` runs the tests):
 
 ```sh
 scripts/linux-cargo check --locked
+scripts/linux-cargo clippy --locked
 scripts/linux-cargo test --locked
 ```
 
@@ -34,6 +81,20 @@ numeric parser a valid C locale. macOS continues using the original tokenizer.
 `patches/sidestep/` fixes live text-field values and
 overlapping text in the composer and transparent popup controls, and adds the
 desktop font fallback stack for symbols missing from the interface font.
+Setting a field's value keeps its editor and the keyboard, as in AppKit, so
+the composer takes typing right after launch and after each send, and shows
+its placeholder while empty. Sidestep draws every SF Symbol name Omperor and
+Upleft ask for (the crown, row icons, status marks, callout and code-block
+glyphs), in a symbol configuration's hierarchical or palette colours. Text
+drawn under a scaled transform scales with it, so Mermaid labels, which
+Upleft renders into a bitmap at the screen's scale, land in their boxes.
+Each window's own Wayland surface is a frame that starts at the top of the
+menu bar, with the content under it, so compositors that place a window by
+its surface rather than its window geometry (Hyprland) keep the menu bar
+inside the window instead of cutting it off at the top. Every commit of a
+scroll tile brings a buffer: Hyprland drops a subsurface's buffer on a
+commit without one, which left scrolled text missing in bands and whole
+tiles.
 `animator()` interpolates geometry and opacity on the render thread, and
 animation completions run during mouse tracking. Scrolling draws TextKit 2
 text into every scroll tile it paints: Sidestep keeps the tiles it draws

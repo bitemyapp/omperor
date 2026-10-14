@@ -126,6 +126,8 @@ In an existing clone, fetch them with `git submodule update --init --recursive`.
 | `just install` | Builds the production app and copies it to `/Applications/Omperor.app`, using `sudo` if that folder is not writable. It does not stop a running copy. |
 | `just debug` | Builds a debug bundle, for use under a debugger. |
 | `just test` | Runs `cargo test`, generating the Markdown renderer's test corpus first if needed. |
+| `just linux` | Builds the Linux app and its helper ([docs/LINUX_BUILD.md](docs/LINUX_BUILD.md)). |
+| `just test-linux` | Runs the tests on Linux. |
 | `just readme-shots` | Regenerates the screenshots above, headless. |
 | `just` | Lists every recipe. |
 
@@ -153,10 +155,13 @@ anything you care about.
 
 ## Where state lives
 
-| Edition | State root |
-|---|---|
-| Omperor (`just install`) | `~/Library/Application Support/Omperor` |
-| Omperor Dev (local builds) | `~/Library/Application Support/Omperor Dev` |
+| Edition | macOS state root | Linux state root |
+|---|---|---|
+| Omperor (`just install`) | `~/Library/Application Support/Omperor` | `$XDG_DATA_HOME/omperor` |
+| Omperor Dev (local builds) | `~/Library/Application Support/Omperor Dev` | `$XDG_DATA_HOME/omperor-dev` |
+
+`$XDG_DATA_HOME` defaults to `~/.local/share`. A Linux root that earlier
+builds created under `~/Library/Application Support` is used where it is.
 
 Each root holds Omperor's database (`omperor.sqlite3`), OMP's session
 journals and metrics (`omp/sessions`), OMP's credentials and caches
@@ -195,12 +200,15 @@ Building for Linux:
 
 ```sh
 git submodule update --init --recursive
-just linux          # or: scripts/linux-cargo build --release --locked
-just test-linux     # the Linux build's tests
+nix develop -c just linux   # on NixOS, in the flake's dev shell
+just linux                  # elsewhere: the helper, then the app
+just test-linux             # the Linux build's tests
 ```
 
 The executable is `target/release/omperor`. It looks for the OMP helper at
-`target/omperor-helpers/omp`, or wherever `OMPEROR_OMP_EXECUTABLE` points.
+`target/omperor-helpers/omp`, which `just linux` builds, or wherever
+`OMPEROR_OMP_EXECUTABLE` points. [docs/LINUX_BUILD.md](docs/LINUX_BUILD.md)
+lists the requirements.
 
 `scripts/linux-cargo` needs Python 3, Git and `flock`. It builds Sidestep's
 fixed objc2 crates into the ignored `.objc2-overlay/` directory, and stages
@@ -212,12 +220,16 @@ Linux-only differences live in small patches applied to the staged copies,
 never to the submodules. `patches/upleft/` covers atomic file operations,
 theme watching with inotify, ICU sentence boundaries in place of Apple's
 tokenizer, and Mermaid's number parsing. `patches/sidestep/` covers text
-fields, transparent popups, symbol font fallback, animation, and scrolling.
+fields, transparent popups, symbols, scaled text, animation, scrolling, and
+window placement and scroll tiles on Hyprland.
 
 What to expect:
 
 - **Wayland only.** Sidestep does not support X11 yet. The app needs a Wayland
-  session and system fonts through fontconfig.
+  session and system fonts through fontconfig. Hyprland and sway are tested.
+- **Super for ⌘.** Shortcuts the menus write with ⌘ take the Super key, which
+  tiling compositors often reserve (Super+1…5 switch workspaces in many
+  Hyprland setups).
 - **The whole interface builds.** The composer, the transcript with Upleft's
   rendering, scrolling and animated transitions have been exercised on Linux.
   Diagnostics check typing and submitting, scrolling under real input timing,

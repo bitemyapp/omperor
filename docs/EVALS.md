@@ -18,7 +18,7 @@ just release                               # builds target/Omperor Dev.app and i
 
 `login` runs OMP's interactive sign-in: it prints an authorization URL, you finish in any browser, and paste the callback URL back. Nothing needs a local browser or a GUI. The new account is recorded with its label so suites can pick it by default.
 
-Evals use Omperor Dev's state (`~/Library/Application Support/Omperor Dev`) unless `OMPEROR_STATE_DIR` names another absolute root; see [state isolation](STATE_ISOLATION.md). To evaluate with accounts that live in another edition's store, point `OMPEROR_STATE_DIR` at that root and `OMPEROR_OMP_EXECUTABLE` at the helper that edition runs, so one data store always sees one helper generation.
+Evals use Omperor Dev's state root unless `OMPEROR_STATE_DIR` names another absolute root; see [state isolation](STATE_ISOLATION.md). To evaluate with accounts that live in another edition's store, point `OMPEROR_STATE_DIR` at that root and `OMPEROR_OMP_EXECUTABLE` at the helper that edition runs, so one data store always sees one helper generation.
 
 ## Suites
 
