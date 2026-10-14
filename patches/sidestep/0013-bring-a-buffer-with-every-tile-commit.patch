@@ -1,0 +1,83 @@
+From 11f1a95caead7ad26f856a01c172f68561004b99 Mon Sep 17 00:00:00 2001
+From: Chris Allen <callen.23dc@gmail.com>
+Date: Wed, 14 Oct 2026 00:27:58 -0500
+Subject: [PATCH] Bring a buffer with every commit of a scroll tile
+
+Hyprland (0.56) doesn't keep a subsurface's buffer through a commit that
+brings none, as the protocol has it. A tile commits without new pixels
+when only its crop changes, which a tile at the edge of a scrolling
+view does every frame, and when it asks for the frame callback a
+present needs while nothing else commits. Hyprland then showed nothing
+in the tile's place, or stretched its buffer's last row over the new
+crop: on Hyprland scrolled text went missing in bands and whole tiles,
+and stayed missing at rest; SCENARIO=scroll in appkit-slice showed
+streaks and blank stretches.
+
+Every tile commit now brings a buffer. With nothing new to show, the
+free buffer takes only what it missed (usually nothing), and is
+attached undamaged, since it shows what the surface showed. Under sway
+nothing changes; under Hyprland appkit-slice's scroll and Omperor's
+transcript draw whole while scrolling and after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/sidestep-appkit/src/backend/tiles.rs | 26 +++++++++++++++++----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/crates/sidestep-appkit/src/backend/tiles.rs b/crates/sidestep-appkit/src/backend/tiles.rs
+index d6de834..c662259 100644
+--- a/crates/sidestep-appkit/src/backend/tiles.rs
++++ b/crates/sidestep-appkit/src/backend/tiles.rs
+@@ -691,13 +691,19 @@ fn present_layers(state: &mut State, window: WindowId, seq: u64) -> Stats {
+         }
+     }
+     // Nothing committed: a tile asks for the frame callback anyway, as a
+-    // compositor may send none to a window surface its tiles cover.
++    // compositor may send none to a window surface its tiles cover. Its
++    // commit brings its pixels again (see `upload`).
+     if !frame_asked
+         && let Some((_, id, key)) = fallback
+-        && let Some(s) = layers.layers.get(&id).and_then(|l| l.tiles.get(&key)).and_then(|t| t.shown.as_ref())
++        && let Some(layer) = layers.layers.get_mut(&id)
++        && let Some(tile) = layer.tiles.get_mut(&key)
++        && let Some(shown) = tile.shown.as_mut()
+     {
+-        s.surfaces.surface.frame(ctx.qh, FrameTag { window: ctx.window, seq: ctx.seq });
+-        s.surfaces.surface.commit();
++        let (.., w, h) = layer.place.grid.pixels(key);
++        let canvas = Pixels { px: &tile.canvas, size: (w, h), alpha: layer.place.opaque.is_none() };
++        ctx.stats.bytes += upload(ctx.pool, shown, &[], canvas, ctx.as_is);
++        shown.surfaces.surface.frame(ctx.qh, FrameTag { window: ctx.window, seq: ctx.seq });
++        shown.surfaces.surface.commit();
+         ctx.stats.commits += 1;
+     }
+     // Restack only when what's on screen changed: each surface directly
+@@ -802,7 +808,9 @@ fn show(
+     }
+     let shown = slot.as_mut().expect("on screen");
+     let mut commit = false;
+-    if !dirty.is_empty() {
++    // Every commit brings a buffer (see `upload`): a new crop alone
++    // re-attaches the pixels as they are.
++    if !dirty.is_empty() || shown.crop != Some(crop) {
+         ctx.stats.bytes += upload(ctx.pool, shown, dirty, canvas, ctx.as_is);
+         dirty.clear();
+         commit = true;
+@@ -831,6 +839,14 @@ fn show(
+ /// Copy what changed of a canvas into a buffer the compositor isn't
+ /// reading (the one it misses least, made if both are busy), attach it,
+ /// and damage only what changed. Returns the bytes copied.
++///
++/// A tile's commits always bring a buffer, with `dirty` empty when only
++/// its crop changed or it asks for a frame callback: the free buffer takes
++/// what it missed and is attached undamaged, as it shows what the surface
++/// showed. Hyprland (0.56) doesn't keep a subsurface's buffer through a
++/// commit that brings none, as the protocol has it: it showed nothing
++/// there, or stretched the buffer's last row over a new crop, so scrolled
++/// text went missing in bands and whole tiles.
+ fn upload(pool: &mut SlotPool, shown: &mut Shown, dirty: &[Rect], canvas: Pixels<'_>, as_is: (bool, bool)) -> usize {
+     let (w, h) = canvas.size;
+     let as_is = if canvas.alpha { as_is.0 } else { as_is.1 };
+-- 
+2.55.0
+

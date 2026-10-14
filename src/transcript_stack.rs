@@ -4528,8 +4528,14 @@ fn speaker_name(message: &TranscriptMessage) -> String {
 
 fn speaker_text(name: &str, font: &NSFont, color: &NSColor) -> Retained<objc2_foundation::NSAttributedString> {
     // Omperor's turns wear the crown: the gate's gold mark before the name.
-    let crowned = name == "Omperor";
-    let text = NSMutableAttributedString::from_nsstring(&NSString::from_str(&if crowned { format!("\u{fffc}\u{2009}{name}") } else { name.to_owned() }));
+    // Without the symbol (Sidestep lacks some) the name goes bare, rather
+    // than behind an object-replacement character drawn as a missing glyph.
+    // SAFETY: AppKit exports the weight for the process lifetime.
+    let weight = unsafe { objc2_app_kit::NSFontWeightSemibold };
+    let crown = (name == "Omperor")
+        .then(|| theme::symbol("crown.fill", font.pointSize() * 0.82, weight, Some(&theme::accent())))
+        .flatten();
+    let text = NSMutableAttributedString::from_nsstring(&NSString::from_str(&if crown.is_some() { format!("\u{fffc}\u{2009}{name}") } else { name.to_owned() }));
     let range = NSRange::new(0, text.length());
     // SAFETY: the attribute names are paired with the value types AppKit
     // documents for them, over the whole string.
@@ -4537,18 +4543,14 @@ fn speaker_text(name: &str, font: &NSFont, color: &NSColor) -> Retained<objc2_fo
         text.addAttribute_value_range(objc2_app_kit::NSFontAttributeName, font, range);
         text.addAttribute_value_range(objc2_app_kit::NSForegroundColorAttributeName, color, range);
     }
-    if crowned {
-        // SAFETY: AppKit exports the weight for the process lifetime.
-        let weight = unsafe { objc2_app_kit::NSFontWeightSemibold };
-        if let Some(image) = theme::symbol("crown.fill", font.pointSize() * 0.82, weight, Some(&theme::accent())) {
-            let attachment = objc2_app_kit::NSTextAttachment::new();
-            attachment.setImage(Some(&image));
-            let size = image.size();
-            attachment.setBounds(NSRect::new(NSPoint::new(0.0, -size.height * 0.08), size));
-            // SAFETY: an NSTextAttachment is the attachment attribute's value;
-            // the object-replacement character is the first UTF-16 unit.
-            unsafe { text.addAttribute_value_range(objc2_app_kit::NSAttachmentAttributeName, &attachment, NSRange::new(0, 1)) };
-        }
+    if let Some(image) = crown {
+        let attachment = objc2_app_kit::NSTextAttachment::new();
+        attachment.setImage(Some(&image));
+        let size = image.size();
+        attachment.setBounds(NSRect::new(NSPoint::new(0.0, -size.height * 0.08), size));
+        // SAFETY: an NSTextAttachment is the attachment attribute's value;
+        // the object-replacement character is the first UTF-16 unit.
+        unsafe { text.addAttribute_value_range(objc2_app_kit::NSAttachmentAttributeName, &attachment, NSRange::new(0, 1)) };
     }
     Retained::into_super(text)
 }

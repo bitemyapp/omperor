@@ -1,0 +1,161 @@
+From f926e43417e19f59dc12eeed11b4a688af010565 Mon Sep 17 00:00:00 2001
+From: Chris Allen <callen.23dc@gmail.com>
+Date: Tue, 13 Oct 2026 23:46:56 -0500
+Subject: [PATCH 1/2] Keep editing when a field's value is set, as AppKit does
+
+Setting a text field's value while its field editor was active aborted
+editing, and with it the keyboard: the window became first responder,
+so keys typed afterwards went nowhere until the field was clicked.
+Omperor restores a session's draft into its composer, and clears the
+composer after each send, with setStringValue:, so on Linux typing
+stopped working right after launch and after every message. On macOS
+editing goes on. The field editor now takes the new value quietly,
+caret at its end, and keeps the keyboard; the unvalidated text it held
+still can't come back.
+
+A field being edited drew nothing of its own text, placeholder
+included, so a focused empty field (Omperor's composer, now that it
+keeps the keyboard) lost its placeholder. As on macOS, the placeholder
+now shows under an empty editor, and the field redraws as the editor's
+text comes and goes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../sidestep-appkit/src/controls/control.rs   | 11 ++++++--
+ .../src/controls/text_field.rs                | 28 ++++++++++++++++---
+ .../sidestep-appkit/tests/control_editing.rs  | 20 +++++++++----
+ 3 files changed, 46 insertions(+), 13 deletions(-)
+
+diff --git a/crates/sidestep-appkit/src/controls/control.rs b/crates/sidestep-appkit/src/controls/control.rs
+index 4bd35fc..32a9491 100644
+--- a/crates/sidestep-appkit/src/controls/control.rs
++++ b/crates/sidestep-appkit/src/controls/control.rs
+@@ -353,13 +353,18 @@ define_class!(
+ 
+         #[unsafe(method(setStringValue:))]
+         fn set_string_value(&self, string: &NSString) {
+-            // A programmatic replacement ends editing, discarding the
+-            // unvalidated editor text before changing the cell's value.
+-            self.as_control().abortEditing();
+             match self.the_cell() {
+                 Some(c) => c.setStringValue(string),
+                 None => self.set_loose(Value::String(string.copy())),
+             }
++            // Editing goes on, as in AppKit: the field editor takes the new
++            // value, caret at its end (quietly: no text-did-change), so the
++            // unvalidated text it held can't come back, and the keyboard
++            // stays where the user left it.
++            if let Some(editor) = self.as_control().currentEditor() {
++                editor.setString(string);
++                self.as_view().setNeedsDisplay(true);
++            }
+         }
+ 
+         #[unsafe(method_id(attributedStringValue))]
+diff --git a/crates/sidestep-appkit/src/controls/text_field.rs b/crates/sidestep-appkit/src/controls/text_field.rs
+index 9884a48..0c2b214 100644
+--- a/crates/sidestep-appkit/src/controls/text_field.rs
++++ b/crates/sidestep-appkit/src/controls/text_field.rs
+@@ -490,14 +490,24 @@ fn draw_field_frame(cell: &NSTextFieldCellImpl, frame: NSRect, _view: &NSView) {
+ /// while other colors and the placeholder stay, as on macOS
+ /// (`conformance/tests/cell_backgrounds.rs`, `emphasized_text`).
+ fn draw_field_text(cell: &NSTextFieldCellImpl, title: NSRect, view: &NSView) {
++    if !theme::paint::recording() {
++        return;
++    }
+     // The field editor draws the live text over this view. The cell still
+-    // draws its frame, but neither its old value nor its placeholder.
+-    if !theme::paint::recording() || crate::textkit::field_editor::current_editor(view).is_some() {
++    // draws its frame, never its old value, and its placeholder while the
++    // editor is empty, as on macOS.
++    let editing = crate::textkit::field_editor::current_editor(view).map(|editor| {
++        // SAFETY: a field editor is a text view, whose string is an NSString.
++        let text: Retained<NSString> = unsafe { msg_send![&*editor, string] };
++        text.length() == 0
++    });
++    let has_placeholder = cell.ivars().placeholder.borrow().is_some();
++    if editing.is_some_and(|empty| !empty || !has_placeholder) {
+         return;
+     }
+     let p = theme::palette();
+     let base = cell.base();
+-    let placeholder = shows_placeholder(cell);
++    let placeholder = editing.is_some() || shows_placeholder(cell);
+     let emphasized = !placeholder && cell::draws_on_emphasis(base);
+     let text_color = cell.ivars().text_color.borrow().clone();
+     let mut color = match text_color.as_deref() {
+@@ -510,7 +520,14 @@ fn draw_field_text(cell: &NSTextFieldCellImpl, title: NSRect, view: &NSView) {
+     if !base.has(Flags::ENABLED) {
+         color = theme::palette::dimmed(color);
+     }
+-    let styled = crate::color::with_emphasis(emphasized, || field_styled(cell, color));
++    let styled = if editing.is_some() {
++        // The cell's value may still hold text the editor no longer has.
++        let font = cell::font_of(base);
++        let text = cell.ivars().placeholder.borrow().clone().unwrap_or_default();
++        Styled::of(&text, cell::attrs(base, &font, color))
++    } else {
++        crate::color::with_emphasis(emphasized, || field_styled(cell, color))
++    };
+     let r = NSRect::new(
+         NSPoint::new(title.origin.x + metrics::TEXT_PADDING, title.origin.y),
+         NSSize::new(title.size.width - 2.0 * metrics::TEXT_PADDING, title.size.height),
+@@ -999,6 +1016,9 @@ define_class!(
+ 
+         #[unsafe(method(textDidChange:))]
+         fn text_did_change(&self, notification: &NSNotification) {
++            // The placeholder under the editor comes and goes with its text.
++            let view: &NSView = self.as_control();
++            view.setNeedsDisplay(true);
+             relay(self, notification, "NSControlTextDidChangeNotification", sel!(controlTextDidChange:), false);
+         }
+ 
+diff --git a/crates/sidestep-appkit/tests/control_editing.rs b/crates/sidestep-appkit/tests/control_editing.rs
+index 835dd38..cba12fe 100644
+--- a/crates/sidestep-appkit/tests/control_editing.rs
++++ b/crates/sidestep-appkit/tests/control_editing.rs
+@@ -57,9 +57,10 @@ mod linux {
+         };
+     }
+ 
+-    /// The getter validates the active editor; the setter aborts it.
++    /// The getter validates the active editor; the setter replaces its
++    /// text, and editing goes on, as in AppKit.
+     fn live_values(mtm: MainThreadMarker) {
+-        let (_window, field) = field(mtm);
++        let (window, field) = field(mtm);
+         let editor = start(&field);
+         type_text(&editor, "Typed prompt");
+         assert_eq!(editor.string().to_string(), "Typed prompt");
+@@ -67,10 +68,14 @@ mod linux {
+         assert_eq!(field.cell().unwrap().stringValue().to_string(), "Typed prompt", "validate the cell");
+         type_text(&editor, " uncommitted");
+         field.setStringValue(&NSString::from_str("Replacement"));
+-        assert!(field.currentEditor().is_none(), "setting a value ends editing");
+-        assert_eq!(field.stringValue().to_string(), "Replacement");
+-        let editor = start(&field);
+-        assert_eq!(editor.string().to_string(), "Replacement");
++        let still: Retained<NSTextView> =
++            field.currentEditor().expect("setting a value keeps editing").downcast().expect("text view");
++        assert!(std::ptr::eq(&*still, &*editor), "the same editor");
++        let responder = window.firstResponder().expect("a first responder");
++        assert!(std::ptr::eq(Retained::as_ptr(&responder).cast::<u8>(), Retained::as_ptr(&editor).cast::<u8>()), "the editor keeps the keyboard");
++        assert_eq!(editor.string().to_string(), "Replacement", "the editor shows the new value");
++        assert_eq!(editor.selectedRange(), NSRange::new(11, 0), "the caret at its end");
++        assert_eq!(field.stringValue().to_string(), "Replacement", "the old text doesn't come back");
+         type_text(&editor, "Discard this");
+         assert!(field.abortEditing());
+         assert_eq!(field.stringValue().to_string(), "Replacement", "abort keeps the last validated value");
+@@ -107,6 +112,9 @@ mod linux {
+             let cell = field.cell().unwrap();
+             assert!(ink(&cell, &field, true) > 0, "idle field draws its value or placeholder");
+             let editor = start(&field);
++            if initial.is_empty() {
++                assert!(ink(&cell, &field, true) > 0, "an empty editor shows the placeholder, as on macOS");
++            }
+             type_text(&editor, "New text");
+             assert_eq!(ink(&cell, &field, true), 0, "the active editor owns text drawing");
+             field.setBezeled(true);
+-- 
+2.55.0
+
