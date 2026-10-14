@@ -1,0 +1,162 @@
+diff --git a/crates/envd/src/browser_daemon.rs b/crates/envd/src/browser_daemon.rs
+index e5f4046ffe..7f09380699 100644
+--- a/crates/envd/src/browser_daemon.rs
++++ b/crates/envd/src/browser_daemon.rs
+@@ -212,6 +212,7 @@ enum Request {
+ 		headless: bool,
+ 		reply:    flume::Sender<Result<(), Fault>>,
+ 	},
++	Stop,
+ }
+ 
+ #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+@@ -225,10 +226,14 @@ struct TabSession {
+ 	backend: Str,
+ }
+ 
++/// How long dropping the daemon waits for its actor to close every tab.
++const STOP_TIMEOUT: Duration = Duration::from_secs(10);
++
+ /// Process-local browser supervisor. One actor owns every webview handle and
+-/// tears the complete tab set down when its request channel closes.
++/// tears the complete tab set down when the daemon is dropped.
+ pub(crate) struct BrowserDaemon {
+ 	requests: flume::Sender<Request>,
++	stopped:  flume::Receiver<()>,
+ }
+ 
+ impl BrowserDaemon {
+@@ -236,11 +241,28 @@ impl BrowserDaemon {
+ 	/// initial typed backend settings.
+ 	pub(crate) fn start(blobs: BlobHost, settings: BrowserSettings) -> Arc<Self> {
+ 		let (requests, receiver) = flume::unbounded::<Request>();
++		let (stopped_sender, stopped) = flume::bounded(1);
+ 		thread::Builder::new()
+ 			.name("omp-browser-daemon".to_owned())
+-			.spawn(move || run(receiver, blobs, settings))
++			.spawn(move || {
++				run(receiver, blobs, settings);
++				let _ = stopped_sender.send(());
++			})
+ 			.expect("browser daemon actor starts");
+-		Arc::new(Self { requests })
++		Arc::new(Self { requests, stopped })
++	}
++}
++
++impl Drop for BrowserDaemon {
++	/// Wait for the actor to close its tabs and the browsers it launched. Left
++	/// to itself it was cut off when the process exited, orphaning every
++	/// browser (headless or windowed) along with its memory.
++	fn drop(&mut self) {
++		if self.requests.send(Request::Stop).is_ok()
++			&& self.stopped.recv_timeout(STOP_TIMEOUT).is_err()
++		{
++			tracing::warn!("browser daemon did not close its tabs before shutdown");
++		}
+ 	}
+ }
+ 
+@@ -316,9 +338,17 @@ fn run(receiver: Receiver<Request>, blobs: BlobHost, mut settings: BrowserSettin
+ 				tracing::info!(headless, tabs_closed, "browser daemon restarted for mode change");
+ 				let _ = reply.send(Ok(()));
+ 			},
++			Request::Stop => break,
+ 		}
+ 	}
+-	tracing::info!(tabs_closed = tabs.len(), "browser daemon stopped");
++	tracing::info!(
++		tabs_closed = tabs.len(),
++		released = released_spawned.len(),
++		"browser daemon stopped"
++	);
++	// Closing each view ends the browser process it launched.
++	drop(tabs);
++	drop(released_spawned);
+ }
+ 
+ fn execute(
+@@ -2604,6 +2634,83 @@ mod tests {
+ 		assert_eq!(state, json!([["click", "dbl", "submit:h"], 250]));
+ 	}
+ 
++	fn browser_children(parent: u32) -> Vec<i32> {
++		let output = Command::new("pgrep")
++			.args(["-P", &parent.to_string(), "-f", "omp-webview"])
++			.output()
++			.expect("pgrep");
++		String::from_utf8_lossy(&output.stdout)
++			.lines()
++			.filter_map(|line| line.trim().parse().ok())
++			.collect()
++	}
++
++	/// Opens a tab, drops the daemon, and exits at once, as a daemon process
++	/// does when it goes idle; prints the browsers it had launched.
++	#[test]
++	fn daemon_exit_subprocess_helper() {
++		if std::env::var_os("OMP_BROWSER_EXIT_HELPER").is_none() {
++			return;
++		}
++		let temp = tempfile::tempdir().expect("tempdir");
++		let daemon =
++			BrowserDaemon::start(BlobHost::open(temp.path()).expect("blobs"), BrowserSettings {
++				enabled:   true,
++				headless:  true,
++				cdp_url:   Str::default(),
++				relay:     false,
++				relay_url: Str::default(),
++			});
++		let mut open = params(Action::Open);
++		open.name = Some(sf!("lifetime"));
++		open.url = Some(sf!("about:blank"));
++		let (updates, _receiver) = flume::unbounded();
++		tokio::runtime::Builder::new_current_thread()
++			.enable_all()
++			.build()
++			.expect("runtime")
++			.block_on(daemon.execute(sf!("owner"), open, CancellationToken::new(), updates))
++			.expect("open tab");
++		println!("browsers {:?}", browser_children(std::process::id()));
++		drop(daemon);
++		std::process::exit(0);
++	}
++
++	#[test]
++	#[ignore = "requires an installed headless browser engine"]
++	fn browsers_do_not_outlive_their_daemon_process() {
++		let output = Command::new(std::env::current_exe().expect("test executable"))
++			.args(["daemon_exit_subprocess_helper", "--nocapture", "--include-ignored"])
++			.env("OMP_BROWSER_EXIT_HELPER", "1")
++			.output()
++			.expect("helper");
++		let stdout = String::from_utf8_lossy(&output.stdout);
++		let launched = stdout
++			.lines()
++			.find_map(|line| line.strip_prefix("browsers "))
++			.expect("helper reports its browsers")
++			.trim_matches(['[', ']'])
++			.split(", ")
++			.filter_map(|pid| pid.parse::<i32>().ok())
++			.collect::<Vec<_>>();
++		assert!(!launched.is_empty(), "the tab launched a browser: {stdout}");
++		// SAFETY: signal 0 only asks whether the process still exists.
++		let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
++		let deadline = Instant::now() + Duration::from_secs(5);
++		while launched.iter().any(|pid| alive(*pid)) && Instant::now() < deadline {
++			thread::sleep(Duration::from_millis(50));
++		}
++		let orphaned = launched
++			.into_iter()
++			.filter(|pid| alive(*pid))
++			.collect::<Vec<_>>();
++		for pid in &orphaned {
++			// SAFETY: these are browsers this test's helper launched.
++			unsafe { libc::kill(*pid, libc::SIGKILL) };
++		}
++		assert!(orphaned.is_empty(), "browsers {orphaned:?} outlived their daemon process");
++	}
++
+ 	#[test]
+ 	fn chords_accept_trained_spellings() {
+ 		let primary = if cfg!(target_os = "macos") {

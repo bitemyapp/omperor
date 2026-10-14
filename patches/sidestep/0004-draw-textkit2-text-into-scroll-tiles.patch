@@ -1,0 +1,561 @@
+From c45a92101865ef508da8e6f6143fc47fff7ee5f9 Mon Sep 17 00:00:00 2001
+From: Chris Allen <cma@bitemyapp.com>
+Date: Fri, 2 Oct 2026 18:24:17 -0500
+Subject: [PATCH 4/6] Draw TextKit 2 text into every scroll tile a pass paints
+
+Scroll layers keep the tiles a display pass draws, including the tile
+it draws ahead of a scroll while the compositor shows the frame. A
+TextKit 2 text view drew only the fragments its viewport controller had
+configured, and its viewport was exactly what showed, so a tile drawn
+ahead held the view's background but none of its text. The tile stayed
+valid, and when it scrolled into view nothing redrew it unless layout
+happened to report damage, which text laid out already never does: a
+transcript scrolled back over went blank for seconds, until something
+unrelated invalidated it.
+
+A text view now takes what a pass asks it to draw into its viewport
+before drawing, as overdraw kept within two heights of what shows (at
+least 1024 points), the way AppKit lays out its overdraw. The fragments
+there are laid out and configured, then drawn. Layout during drawing
+doesn't scroll to keep text in place; viewWillDraw did that before the
+pass.
+
+Scrolling no longer sends viewWillDraw down the whole window and walks
+every view for bounded layer canvases on each step: the clip views that
+scrolled or resized are noted, and only their documents are prepared,
+unless something is damaged, when the whole tree gets viewWillDraw as
+before.
+
+linux_scroll's new test scrolls a text view in a container down and back
+up in small steps and fails if any part of what shows was never painted
+with text; it fails without this change.
+
+Signed-off-by: Chris Allen <cma@bitemyapp.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../sidestep-appkit/src/quartzcore/backing.rs |  26 ++++
+ .../sidestep-appkit/src/textkit/text_view.rs  |  72 ++++++++--
+ crates/sidestep-appkit/src/textkit2/view.rs   |  24 +++-
+ crates/sidestep-appkit/src/view_layout.rs     |  29 +++-
+ crates/sidestep-appkit/src/window.rs          |  26 ++++
+ crates/sidestep-appkit/tests/linux_scroll.rs  | 126 +++++++++++++++++-
+ docs/architecture.md                          |  14 +-
+ docs/text.md                                  |   8 +-
+ 8 files changed, 302 insertions(+), 23 deletions(-)
+
+diff --git a/crates/sidestep-appkit/src/quartzcore/backing.rs b/crates/sidestep-appkit/src/quartzcore/backing.rs
+index 8567dee..78e69a0 100644
+--- a/crates/sidestep-appkit/src/quartzcore/backing.rs
++++ b/crates/sidestep-appkit/src/quartzcore/backing.rs
+@@ -518,6 +518,32 @@ fn canvas_rect(view: &NSViewImpl, props: &Props, scale: f64) -> Option<([f64; 4]
+     Some((r, (r[2] * scale).ceil() as u32, (r[3] * scale).ceil() as u32))
+ }
+ 
++/// What `view` (a clip view that scrolled or resized) shows changed,
++/// though its descendants' geometry didn't. Canvases cut to what shows
++/// (`canvas_rect`) that no longer cover it are drawn again; the commit
++/// holds presentation until they are painted, as for any canvas change.
++pub(crate) fn prepare_viewports(view: &NSViewImpl) {
++    if views::is_hidden(view) {
++        return;
++    }
++    if let Some(old) = state(view).canvas.get()
++        && composited(view)
++        && let Some(layer) = layer_of(view)
++    {
++        let li = imp(&layer);
++        let props = li.read(|m| m.props.clone());
++        let scale = views::window_of(view).map_or(1.0, |w| w.scale());
++        if let Some((rect, _, _)) = canvas_rect(view, &props, scale)
++            && old != rect
++        {
++            super::transaction::mark_dirty(li);
++        }
++    }
++    for sub in views::subviews(view) {
++        prepare_viewports(views::imp(&sub));
++    }
++}
++
+ /// Whether a view updates its layer itself (`wantsUpdateLayer`).
+ pub(crate) fn updates_layer(view: &NSView) -> bool {
+     // SAFETY: wantsUpdateLayer takes nothing and returns BOOL.
+diff --git a/crates/sidestep-appkit/src/textkit/text_view.rs b/crates/sidestep-appkit/src/textkit/text_view.rs
+index 78a163f..0c9fe06 100644
+--- a/crates/sidestep-appkit/src/textkit/text_view.rs
++++ b/crates/sidestep-appkit/src/textkit/text_view.rs
+@@ -109,6 +109,12 @@ const HUGE: f64 = 10_000_000.0;
+ /// resize draws the whole view again).
+ const IDLE_RESIZE: Duration = Duration::from_millis(250);
+ 
++/// The overdraw (TextKit 2) is kept within this many heights of what shows,
++/// and at least [`OVERDRAW_MIN`] points: as far as scroll tiles are kept
++/// and drawn ahead of a scroll.
++const OVERDRAW_REACH: f64 = 2.0;
++const OVERDRAW_MIN: f64 = 1024.0;
++
+ /// The caret's blink: on and off this long each, stopping (on) after this
+ /// long without an edit or a move.
+ const BLINK: Duration = Duration::from_millis(600);
+@@ -2586,16 +2592,58 @@ impl NSTextViewImpl {
+         self.lm_impl().map(Geo::One)
+     }
+ 
+-    /// The viewport's bounds, as AppKit's text view works them out.
++    /// The viewport's bounds, as AppKit's text view works them out, with
++    /// the overdraw.
+     fn viewport_bounds(&self) -> NSRect {
+         let view = self.as_view();
+-        // What the clip view shows, not cut to the view (the viewport runs on
+-        // below a view that hasn't grown yet, as on macOS).
+-        let visible = match enclosing_clip(view) {
++        let visible = self.shown_rect();
++        let overdraw = visible.and(self.ivars().tk2.overdraw.get());
++        crate::textkit2::view::viewport_bounds(view.bounds(), visible, overdraw, self.origin())
++    }
++
++    /// What the clip view shows of the view, not cut to the view (the
++    /// viewport runs on below a view that hasn't grown yet, as on macOS);
++    /// all of it in a window without a clip view; nothing out of a window.
++    fn shown_rect(&self) -> Option<NSRect> {
++        let view = self.as_view();
++        match enclosing_clip(view) {
+             Some(clip) => Some(view.convertRect_fromView(clip.bounds(), Some(&clip))),
+             None => view.window().is_some().then(|| view.visibleRect()),
++        }
++    }
++
++    /// Keep the overdraw near what shows: past [`OVERDRAW_REACH`] of it, a
++    /// scroll has left it behind.
++    fn trim_overdraw(&self) {
++        let tk2 = &self.ivars().tk2;
++        let (Some((y0, y1)), Some(shown)) = (tk2.overdraw.get(), self.shown_rect()) else { return };
++        let reach = (shown.size.height * OVERDRAW_REACH).max(OVERDRAW_MIN);
++        let (top, bottom) = (y0.max(shown.origin.y - reach), y1.min(shown.origin.y + shown.size.height + reach));
++        tk2.overdraw.set((bottom > top).then_some((top, bottom)));
++    }
++
++    /// Have the viewport take in `dirty` (the view's coordinates) before
++    /// drawing it. Sidestep keeps what views draw in scroll tiles, and draws
++    /// tiles ahead of a scroll and the damage to tiles out of sight: text
++    /// drawn only where it shows would leave blanks those tiles keep. So the
++    /// drawn part joins the viewport as overdraw, whose fragments are laid
++    /// out, configured and drawn as AppKit's are in its overdraw.
++    fn cover(&self, dirty: NSRect) {
++        let tk2 = &self.ivars().tk2;
++        let b = self.as_view().bounds();
++        let (y0, y1) =
++            (dirty.origin.y.max(b.origin.y), (dirty.origin.y + dirty.size.height).min(b.origin.y + b.size.height));
++        let covered = |laid: Option<NSRect>| {
++            let o = self.origin();
++            laid.is_some_and(|l| l.origin.y + o.y <= y0 && y1 <= l.origin.y + l.size.height + o.y)
+         };
+-        crate::textkit2::view::viewport_bounds(view.bounds(), visible, self.origin())
++        if y1 > y0 && !covered(tk2.clean.get()) && self.shown_rect().is_some() {
++            let (top, bottom) = tk2.overdraw.get().map_or((y0, y1), |(t, b)| (t.min(y0), b.max(y1)));
++            tk2.overdraw.set(Some((top, bottom)));
++        }
++        // Drawing is no time to scroll: what shows was put in place before
++        // the pass drew (`viewWillDraw`).
++        self.lay_out_viewport(false);
+     }
+ 
+     /// Take over a TextKit 2 container's viewport: the view is its
+@@ -2627,6 +2675,13 @@ impl NSTextViewImpl {
+     /// is on screen when laying out what is above it changes its place
+     /// (estimates replaced by layout): the view scrolls by as much.
+     fn lay_out_viewport_if_needed(&self) {
++        self.trim_overdraw();
++        self.lay_out_viewport(true);
++    }
++
++    /// Lay the viewport out if its bounds or the layout changed; with
++    /// `keep_place`, scroll to keep what showed in place.
++    fn lay_out_viewport(&self, keep_place: bool) {
+         let Some(tlm) = self.tlm() else { return };
+         // SAFETY: the layout manager's accessor.
+         let vp: Option<Retained<AnyObject>> = unsafe { msg_send![&*tlm, textViewportLayoutController] };
+@@ -2647,7 +2702,8 @@ impl NSTextViewImpl {
+                 return;
+             }
+             let (y0, y1) = (bounds.origin.y, bounds.origin.y + bounds.size.height);
+-            let anchor = if touched { None } else { manager.as_ref().and_then(|m| m.first_laid_in(y0, y1)) };
++            let anchor =
++                if touched || !keep_place { None } else { manager.as_ref().and_then(|m| m.first_laid_in(y0, y1)) };
+             // SAFETY: layoutViewport takes nothing.
+             let _: () = unsafe { msg_send![&*vp, layoutViewport] };
+             let (Some(m), Some((o, top))) = (&manager, anchor) else { return };
+@@ -2685,9 +2741,7 @@ impl NSTextViewImpl {
+         if !matches!(geo, Geo::Two(_)) {
+             return;
+         }
+-        if self.ivars().tk2.clean.get().is_none() {
+-            self.lay_out_viewport_if_needed();
+-        }
++        self.cover(dirty);
+         // SAFETY: the layout manager's own accessor.
+         let vp: Option<Retained<AnyObject>> =
+             self.tlm().and_then(|tlm| unsafe { msg_send![&*tlm, textViewportLayoutController] });
+diff --git a/crates/sidestep-appkit/src/textkit2/view.rs b/crates/sidestep-appkit/src/textkit2/view.rs
+index b6736fa..428ec8f 100644
+--- a/crates/sidestep-appkit/src/textkit2/view.rs
++++ b/crates/sidestep-appkit/src/textkit2/view.rs
+@@ -21,7 +21,10 @@
+ //! neither, as good as unbounded below its top (so laying the viewport out
+ //! lays the whole text out: on macOS too, 20 000 lines in 0.4 s). The
+ //! viewport is laid out before the view draws (`viewWillDraw`) when
+-//! something moved or changed; the fragments it configured are what the
++//! something moved or changed, and again when the display pass asks for
++//! more than it holds (tiles ahead of a scroll, damage out of sight): what
++//! it reaches joins the viewport as overdraw, near what shows. The
++//! fragments it configured are what the
+ //! view draws, each through `drawAtPoint:inContext:` after the view's own
+ //! `drawRect:` (as AppKit draws them above it, in views of their own), with
+ //! the caret above them. As on macOS, a fragment draws at the point zero,
+@@ -130,6 +133,9 @@ pub(crate) type Network = (Retained<AnyObject>, Option<Retained<AnyObject>>);
+ pub(crate) struct ViewState {
+     /// Laid out since the layout last changed, for these bounds.
+     pub clean: Cell<Option<NSRect>>,
++    /// How far drawing reached past what shows, top and bottom in the
++    /// view's coordinates: the overdraw, laid out with what shows.
++    pub overdraw: Cell<Option<(f64, f64)>>,
+     /// The layout manager and content manager the view keeps alive.
+     pub network: RefCell<Option<Network>>,
+ }
+@@ -144,12 +150,22 @@ impl ViewState {
+ /// The viewport bounds of a view whose bounds are `bounds`, `visible` of
+ /// which shows (what its clip view shows, not cut to its bounds; `None`: in
+ /// no clip view or window, as good as all of it below its top), with its
+-/// container at `origin`.
+-pub(crate) fn viewport_bounds(bounds: NSRect, visible: Option<NSRect>, origin: NSPoint) -> NSRect {
+-    let (top, bottom) = match visible {
++/// container at `origin`. `overdraw` (top and bottom, in the view's
++/// coordinates) is drawn though it doesn't show, and is in the viewport too.
++pub(crate) fn viewport_bounds(
++    bounds: NSRect,
++    visible: Option<NSRect>,
++    overdraw: Option<(f64, f64)>,
++    origin: NSPoint,
++) -> NSRect {
++    let (mut top, mut bottom) = match visible {
+         Some(v) => (v.origin.y.max(bounds.origin.y), v.origin.y + v.size.height),
+         None => (bounds.origin.y, f64::MAX / 2.0),
+     };
++    if let Some((y0, y1)) = overdraw {
++        top = top.min(y0.max(bounds.origin.y));
++        bottom = bottom.max(y1);
++    }
+     NSRect::new(
+         NSPoint::new(bounds.origin.x - origin.x, top - origin.y),
+         NSSize::new(bounds.size.width, (bottom - top).max(0.0)),
+diff --git a/crates/sidestep-appkit/src/view_layout.rs b/crates/sidestep-appkit/src/view_layout.rs
+index d4303bc..5a06a38 100644
+--- a/crates/sidestep-appkit/src/view_layout.rs
++++ b/crates/sidestep-appkit/src/view_layout.rs
+@@ -227,8 +227,12 @@ pub(crate) fn follow_clip_view(view: &NSViewImpl) {
+     set_flag(view, FOLLOWS_CLIP, true);
+ }
+ 
+-/// A clip view scrolled or resized: documents that follow it need layout.
++/// A clip view scrolled or resized: documents that follow it need layout,
++/// and what it shows needs `viewWillDraw` before the next frame.
+ pub(crate) fn clip_moved(clip: &NSViewImpl) {
++    if let Some(window) = views::window_of(clip) {
++        window.clip_exposed(views::as_view(clip));
++    }
+     for sub in views::subviews(clip).iter() {
+         let s = views::imp(sub);
+         if has(s, FOLLOWS_CLIP) {
+@@ -867,17 +871,32 @@ fn lay_out(view: &NSViewImpl, layout: bool) {
+     }
+ }
+ 
+-/// The window's pass before a frame: layout, then `viewWillDraw` if
+-/// anything will be drawn, and layout again for anything that asked for it
+-/// there.
++/// The window's pass before a frame: layout, then `viewWillDraw`, and
++/// layout again for anything that asked for it there. `viewWillDraw` goes
++/// down the whole tree when anything will be drawn, else only into clip
++/// views that scrolled or resized: moving tiles draws no pixels, but what
++/// shows changed (a TextKit view lays out its viewport, and keeps what
++/// showed in place), and tiles may come into view. Their layer-backed
++/// views' canvases follow what shows.
+ pub(crate) fn run(window: &NSWindowImpl) {
+     let Some(content) = window.content() else { return };
+     let root = views::imp(&content);
+     lay_out(root, true);
+-    if window.has_damage() {
++    let exposed = window.take_exposed();
++    let damaged = window.has_damage();
++    if damaged {
+         content.viewWillDraw();
++    } else {
++        for clip in &exposed {
++            clip.viewWillDraw();
++        }
++    }
++    if damaged || !exposed.is_empty() {
+         lay_out(root, true);
+     }
++    for clip in &exposed {
++        crate::quartzcore::backing::prepare_viewports(views::imp(clip));
++    }
+ }
+ 
+ /// Before `view` is drawn outside the display pass, into a snapshot
+diff --git a/crates/sidestep-appkit/src/window.rs b/crates/sidestep-appkit/src/window.rs
+index 52c9041..264ab4f 100644
+--- a/crates/sidestep-appkit/src/window.rs
++++ b/crates/sidestep-appkit/src/window.rs
+@@ -127,6 +127,9 @@ pub(crate) struct WindowIvars {
+     /// A frame was presented and the render thread hasn't shown it yet.
+     frame_pending: Cell<bool>,
+     needs_display: Cell<bool>,
++    /// Clip views that scrolled or resized since the last pass: what they
++    /// show of their documents changed, even if every pixel is in tiles.
++    exposed: RefCell<Vec<Retained<NSView>>>,
+     damage: RefCell<HashMap<LayerId, Vec<Rect>>>,
+     clips: RefCell<Vec<Retained<NSView>>>,
+     /// The scroll layers (see `layers`).
+@@ -284,6 +287,7 @@ define_class!(
+                 deferred: Cell::new(defer),
+                 frame_pending: Cell::new(false),
+                 needs_display: Cell::new(false),
++                exposed: RefCell::new(Vec::new()),
+                 damage: RefCell::new(HashMap::new()),
+                 clips: RefCell::new(Vec::new()),
+                 layers: RefCell::default(),
+@@ -1865,6 +1869,28 @@ impl NSWindowImpl {
+         self.ivars().needs_display.set(true);
+     }
+ 
++    /// `clip` scrolled or resized: before the next frame, what it shows of
++    /// its document gets `viewWillDraw` (see `view_layout::run`), though
++    /// moving tiles may draw nothing.
++    pub(crate) fn clip_exposed(&self, clip: &NSView) {
++        let mut exposed = self.ivars().exposed.borrow_mut();
++        if !exposed.iter().any(|c| std::ptr::eq(&**c, clip)) {
++            exposed.push(clip.retain());
++        }
++        drop(exposed);
++        self.ivars().needs_display.set(true);
++    }
++
++    /// The clip views that scrolled or resized since the last pass, and
++    /// are still in this window.
++    pub(crate) fn take_exposed(&self) -> Vec<Retained<NSView>> {
++        let exposed = std::mem::take(&mut *self.ivars().exposed.borrow_mut());
++        exposed
++            .into_iter()
++            .filter(|c| crate::views::window_of(crate::views::imp(c)).is_some_and(|w| std::ptr::eq(w, self)))
++            .collect()
++    }
++
+     /// Some layer has damage to draw in the next pass.
+     pub(crate) fn has_damage(&self) -> bool {
+         self.ivars().damage.borrow().values().any(|rects| !rects.is_empty())
+diff --git a/crates/sidestep-appkit/tests/linux_scroll.rs b/crates/sidestep-appkit/tests/linux_scroll.rs
+index 7dc2b1a..63cb458 100644
+--- a/crates/sidestep-appkit/tests/linux_scroll.rs
++++ b/crates/sidestep-appkit/tests/linux_scroll.rs
+@@ -26,8 +26,8 @@ mod linux {
+     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
+     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+     use objc2_app_kit::{
+-        NSApplication, NSBackingStoreType, NSCursor, NSResponder, NSScrollView, NSScrollerPart, NSScrollerStyle,
+-        NSView, NSViewLayerContentsRedrawPolicy, NSWindow, NSWindowStyleMask,
++        NSApplication, NSBackingStoreType, NSCursor, NSFont, NSResponder, NSScrollView, NSScrollerPart,
++        NSScrollerStyle, NSTextView, NSView, NSViewLayerContentsRedrawPolicy, NSWindow, NSWindowStyleMask,
+     };
+     use objc2_foundation::{NSNotification, NSNotificationCenter, NSPoint, NSRect, NSSize};
+     use sidestep_appkit::testing::{self, LayerInfo, Seen};
+@@ -275,6 +275,125 @@ mod linux {
+         close(&w);
+     }
+ 
++    fn scrolling_prepares_text_without_unrelated_damage(mtm: MainThreadMarker) {
++        let sv = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, 300.0, 150.0));
++        let text = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 0.0, 300.0, 10000.0));
++        text.setFont(Some(&NSFont::systemFontOfSize(12.0)));
++        text.setString(&objc2_foundation::NSString::from_str(&"Scrolling must prepare this line.\n".repeat(1000)));
++        sv.setDocumentView(Some(&text));
++        let (w, _, _) = shown(mtm, &[&sv]);
++        let controller = text.textLayoutManager().unwrap().textViewportLayoutController();
++        testing::note_painted_text(true);
++        for y in [2200.0, 4400.0, 6600.0, 3000.0, 1200.0] {
++            sv.contentView().scrollToPoint(pt(0.0, y));
++            // A real display pass, without manually preparing TextKit or
++            // invalidating unrelated views, must prepare the exposed text.
++            testing::settle();
++            // The viewport covers what shows, with what was drawn ahead.
++            let b = controller.viewportBounds();
++            assert!(
++                b.origin.y <= y + 1.0 && b.origin.y + b.size.height >= y + 149.0 && b.origin.y >= y - 2048.0,
++                "viewport stayed at {b:?} after scrolling to {y}"
++            );
++            assert!(controller.viewportRange().is_some(), "the exposed viewport has text");
++            assert!(
++                testing::take_painted_text().iter().any(|run| run.y as f64 >= y && (run.y as f64) < y + 150.0),
++                "newly exposed text must be painted before scrolling stops"
++            );
++        }
++        testing::note_painted_text(false);
++        close(&w);
++    }
++
++    /// Text is painted wherever a tile is drawn, in sight or ahead of a
++    /// scroll: a TextKit 2 view's text outside its viewport would leave
++    /// blanks in tiles that are kept and shown as they come into view. The
++    /// text view sits in a container, as a row of a list does. Scrolling
++    /// back up goes over text laid out already, which changes no layout
++    /// that would have it drawn again.
++    fn scrolling_paints_text_ahead(mtm: MainThreadMarker) {
++        let sv = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, 300.0, 150.0));
++        let container = view(mtm, rect(0.0, 0.0, 300.0, 6000.0), true);
++        // More text than the view holds, so text fills it to its bottom.
++        let text = NSTextView::initWithFrame(NSTextView::alloc(mtm), rect(0.0, 40.0, 300.0, 4500.0));
++        text.setFont(Some(&NSFont::systemFontOfSize(12.0)));
++        text.setString(&objc2_foundation::NSString::from_str(&"Every line of this is text.\n".repeat(400)));
++        container.addSubview(&text);
++        sv.setDocumentView(Some(&container));
++        // Noted from the first frame: tiles drawn then are kept.
++        testing::note_painted_text(true);
++        let (w, _, _) = shown(mtm, &[&sv]);
++        let clip = sv.contentView();
++        let scroll = |y: f64| {
++            clip.scrollToPoint(pt(0.0, y));
++            sv.reflectScrolledClipView(&clip);
++            testing::settle();
++        };
++        // Where text was painted (baselines), and whether what shows of the
++        // text has any gap in it more than a couple of lines tall.
++        let mut painted: Vec<f64> = Vec::new();
++        let check = |y: f64, painted: &mut Vec<f64>| {
++            painted.extend(testing::take_painted_text().iter().map(|run| f64::from(run.y)));
++            let t = text.frame();
++            let (top, bottom) = (y.max(t.origin.y), (y + 150.0).min(t.origin.y + t.size.height - 20.0));
++            let mut seen: Vec<f64> = painted.iter().copied().filter(|p| *p >= top && *p <= bottom + 20.0).collect();
++            seen.sort_by(f64::total_cmp);
++            let mut last = top;
++            for p in seen.iter().copied().chain([bottom + 20.0]) {
++                assert!(
++                    p - last < 40.0,
++                    "a blank from {last} to {p} shows at scroll {y}: text there was never painted"
++                );
++                last = p;
++            }
++        };
++        // Down a little at a time, as a touchpad scrolls: the tiles coming
++        // into view were drawn ahead.
++        let end = (text.frame().origin.y + text.frame().size.height).min(container.frame().size.height) - 150.0;
++        let mut y = 0.0;
++        while y < end {
++            y = (y + 40.0).min(end);
++            scroll(y);
++            check(y, &mut painted);
++        }
++        // Back up, once the tiles kept from the way down are behind.
++        painted.clear();
++        let kept = y - 3.0 * 512.0;
++        while y > 0.0 {
++            y = (y - 40.0).max(0.0);
++            scroll(y);
++            if y < kept {
++                check(y, &mut painted);
++            }
++        }
++        assert!(kept > 1000.0, "the text must be several tiles tall");
++        testing::note_painted_text(false);
++        close(&w);
++    }
++
++    fn scrolling_refreshes_large_layer_canvases(mtm: MainThreadMarker) {
++        let sv = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, 300.0, 150.0));
++        let doc = drawing(mtm, rect(0.0, 0.0, 300.0, 10000.0), "cached");
++        doc.setWantsLayer(true);
++        let container = view(mtm, doc.frame(), true);
++        container.addSubview(&doc);
++        sv.setDocumentView(Some(&container));
++        let (w, _, _) = shown(mtm, &[&sv]);
++        take_log();
++        sv.contentView().scrollToPoint(pt(0.0, 2200.0));
++        testing::settle();
++        assert!(take_log().is_empty(), "reuse a canvas that still covers the viewport");
++        for y in [4400.0, 8800.0, 1200.0] {
++            sv.contentView().scrollToPoint(pt(0.0, y));
++            testing::settle();
++            assert!(
++                take_log().iter().any(|s| s == "drew cached"),
++                "scrolling to {y} must draw content beyond the cached canvas"
++            );
++        }
++        close(&w);
++    }
++
+     /// With no time for tiles ahead, as on a slow machine, each pass puts
+     /// them off to the next, which draws them the way the layer went.
+     fn tiles_ahead_come_a_pass_late(mtm: MainThreadMarker) {
+@@ -793,6 +912,9 @@ mod linux {
+         let tests: &[Test] = &[
+             ("promotion", promotion),
+             ("scrolling_moves_layers", scrolling_moves_layers),
++            ("scrolling_prepares_text_without_unrelated_damage", scrolling_prepares_text_without_unrelated_damage),
++            ("scrolling_paints_text_ahead", scrolling_paints_text_ahead),
++            ("scrolling_refreshes_large_layer_canvases", scrolling_refreshes_large_layer_canvases),
+             ("tiles_ahead_come_a_pass_late", tiles_ahead_come_a_pass_late),
+             ("anchored_rows_and_columns", anchored_rows_and_columns),
+             ("nested_layers_stack_in_paint_order", nested_layers_stack_in_paint_order),
+diff --git a/docs/architecture.md b/docs/architecture.md
+index f0fa7ab..21f1f6b 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -2148,7 +2148,16 @@ damaged rectangle reaches, margins included) and presents; then, while it
+ has spent less than 4 ms, it draws one tile ahead in the direction the
+ layer moved (downward when it hasn't), after `prepareContentInRect:` to
+ the document, which the render thread rasterizes while the compositor
+-shows the frame. Tiles more
++shows the frame. What a pass draws, it keeps until it is damaged, so
++views must draw all of what they are asked to, shown or not (a TextKit 2
++text view takes what it is asked for into its viewport as overdraw, see
++[Text](#text)). Before a pass draws, the clip views that scrolled or
++resized since the last get `viewWillDraw` down their documents (the whole
++window does when anything is damaged): what shows changed even when every
++pixel is in tiles, so a text view lays out its viewport and keeps what
++showed in place, and layer-backed views whose canvases are cut to what
++shows (see [Core Animation](#core-animation)) draw a new one once what
++shows leaves theirs. Tiles more
+ than two tiles from the viewport go, and the farthest from their viewports
+ while a window's tiles hold more than 96 MB. An opaque clip view
+ background makes the layer opaque: its tiles are cleared to that color and
+@@ -2680,7 +2689,8 @@ positions in points. `crates/sidestep-appkit/src/text/` holds the stack.
+   clicks, and whose `drawAtPoint:inContext:` is called) take part as on
+   macOS. A text view in TextKit 2 mode (the default, as on macOS) reaches
+   its layout through one adapter (`textkit2::view::Geo`) for selection,
+-  carets, clicks and commands, lays out its viewport in `viewWillDraw`, and
++  carets, clicks and commands, lays out its viewport in `viewWillDraw` (and
++  again, as overdraw, when a pass draws a tile beyond it), and
+   draws the fragments its viewport controller configured after its
+   `drawRect:` (the display pass's `layers::record` calls it), as macOS
+   draws them in views above it: each at the point zero, the drawing state's
+diff --git a/docs/text.md b/docs/text.md
+index 9d09e5d..b4ddda8 100644
+--- a/docs/text.md
++++ b/docs/text.md
+@@ -792,7 +792,13 @@ as unbounded, so laying the viewport out lays out all of the text, as on
+ macOS (20 000 lines in 0.4 s there). The viewport is laid out before the
+ view draws (`viewWillDraw`) when layout changed or the view scrolled; text
+ that showed before stays in place on screen when laying out what is above it
+-moves it (the view scrolls by as much). The fragments configured draw after
++moves it (the view scrolls by as much). Drawing can reach past what shows:
++the display pass draws scroll tiles ahead of a scroll, and the damage to
++tiles out of sight, and keeps what it drew. So a draw reaching past the
++viewport adds what it reaches to it, as overdraw (kept within two heights of
++what shows, and at least 1024 points), laid out and configured before the
++fragments draw, as AppKit lays out its overdraw: text drawn only where it
++shows would leave blanks in tiles that show later. The fragments configured draw after
+ the view's `drawRect:` (as macOS draws them above it, in views of their
+ own), with the marked text and the caret above them, so a subclass drawing
+ in `drawRect:` draws under the text. The view sizes to the usage bounds (the
+-- 
+2.56.0
+

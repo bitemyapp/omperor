@@ -1,0 +1,424 @@
+From bef69ad9c8ae3590ab78919aff8766b105f024c3 Mon Sep 17 00:00:00 2001
+From: Chris Allen <cma@bitemyapp.com>
+Date: Fri, 2 Oct 2026 18:23:48 -0500
+Subject: [PATCH 3/6] Animate view changes made through animator
+
+A view's animator is now a forwarding proxy instead of the view itself.
+Each change made through it runs in an animation group, its own unless
+one is open, with implicit animation allowed for that change alone, so a
+layer-backed view's frame, bounds and alpha interpolate on the render
+thread over the group's duration and timing function while ordinary
+setters in the same group still apply at once. Completion handlers are
+scheduled in the common run loop modes, so they run while a control
+tracks the mouse or a modal loop is open, as the animation itself keeps
+being displayed. A window's animator is still the window.
+
+Signed-off-by: Chris Allen <cma@bitemyapp.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ conformance/tests/animation.rs               |   4 +-
+ crates/sidestep-appkit/src/animation.rs      | 137 +++++++++++++++++--
+ crates/sidestep-appkit/src/views.rs          |   3 +-
+ crates/sidestep-appkit/tests/linux_layers.rs |  88 +++++++++++-
+ docs/architecture.md                         |  23 ++--
+ docs/roadmap.md                              |   7 +-
+ 6 files changed, 232 insertions(+), 30 deletions(-)
+
+diff --git a/conformance/tests/animation.rs b/conformance/tests/animation.rs
+index 7a4dcfd..7c5b2ad 100644
+--- a/conformance/tests/animation.rs
++++ b/conformance/tests/animation.rs
+@@ -1,8 +1,8 @@
+ //! NSAnimationContext and `animator`, checked on macOS and on Linux alike:
+ //! the context's settings and how groups save and restore them, when
+ //! completion handlers run, and changes made through `animator` in a group
+-//! that lasts no time. (How AppKit animates over time isn't asserted:
+-//! Sidestep applies changes at once.)
++//! that lasts no time. Render-thread interpolation for shown, layer-backed
++//! views is covered by `sidestep-appkit/tests/linux_layers.rs`.
+ //!
+ //! AppKit belongs to the main thread, so this file has its own `main`.
+ 
+diff --git a/crates/sidestep-appkit/src/animation.rs b/crates/sidestep-appkit/src/animation.rs
+index ca9a8bd..4818df5 100644
+--- a/crates/sidestep-appkit/src/animation.rs
++++ b/crates/sidestep-appkit/src/animation.rs
+@@ -1,8 +1,8 @@
+ //! `NSAnimationContext` and `animator`.
+ //!
+-//! A change made through a view's or a window's `animator` (which is the
+-//! view or window itself, as objc2 types it) applies at once, as AppKit's
+-//! do with a duration of 0. A group is also a Core Animation transaction
++//! A view's `animator` forwards changes in an animation scope, without
++//! enabling implicit animation for other changes in the group. A group
++//! is also a Core Animation transaction
+ //! with its duration and timing function, so layers the program changes
+ //! in it animate over them, and so do layer-backed views' changes while
+ //! `allowsImplicitAnimation` is set (`quartzcore::backing`). What programs
+@@ -14,15 +14,18 @@
+ //! on the thread's run loop, so a program that waits for one (to remove a
+ //! view it faded out, or to chain animations) keeps its order and timing.
+ 
+-use std::cell::RefCell;
++use std::cell::{Cell, RefCell};
+ use std::ptr::NonNull;
+ 
+ use block2::{DynBlock, RcBlock};
+-use objc2::rc::Retained;
+-use objc2::runtime::{NSObject, NSObjectProtocol};
+-use objc2::{AnyThread, ClassType, define_class, msg_send};
+-use objc2_app_kit::NSAnimationContext;
+-use objc2_foundation::{NSTimeInterval, NSTimer};
++use objc2::rc::{PartialInit, Retained};
++use objc2::runtime::{NSObject, NSObjectProtocol, Sel};
++use objc2::{AnyThread, ClassType, DefinedClass, define_class, msg_send};
++use objc2_app_kit::{NSAnimationContext, NSView};
++use objc2_foundation::{
++    NSInvocation, NSMethodSignature, NSPoint, NSProxy, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSTimeInterval,
++    NSTimer,
++};
+ 
+ sidestep_runtime::static_class!(pub NSANIMATIONCONTEXT, NSANIMATIONCONTEXT_META = "NSAnimationContext", || {
+     let _ = NSAnimationContextImpl::class();
+@@ -49,16 +52,121 @@ impl Default for Group {
+ /// Whether the current group allows implicit animation (of views'
+ /// layers: `quartzcore::backing`).
+ pub(crate) fn allows_implicit() -> bool {
+-    STATE.with(|s| s.try_borrow().map(|s| s.1.last().is_some_and(|g| g.implicit) && s.1.len() > 1).unwrap_or(false))
++    ANIMATOR_DEPTH.with(|d| d.get() > 0)
++        || STATE
++            .with(|s| s.try_borrow().map(|s| s.1.last().is_some_and(|g| g.implicit) && s.1.len() > 1).unwrap_or(false))
+ }
+ 
+ thread_local! {
++    static ANIMATOR_DEPTH: Cell<usize> = const { Cell::new(0) };
+     /// The thread's context and the groups open on it, innermost last
+     /// (the first is outside any group).
+     static STATE: RefCell<(Option<Retained<NSAnimationContext>>, Vec<Group>)> =
+         RefCell::new((None, vec![Group::default()]));
+ }
+ 
++struct AnimatorIvars {
++    target: Retained<NSView>,
++}
++
++define_class!(
++    #[unsafe(super(NSProxy))]
++    #[name = "_SidestepViewAnimator"]
++    #[ivars = AnimatorIvars]
++    struct ViewAnimator;
++
++    impl ViewAnimator {
++        // Real method entries also let objc2 validate these signatures in
++        // debug builds, before Objective-C's forwarding is entered.
++        #[unsafe(method(setFrame:))]
++        fn set_frame(&self, frame: NSRect) {
++            with_animator(|| self.ivars().target.setFrame(frame));
++        }
++
++        #[unsafe(method(setFrameOrigin:))]
++        fn set_frame_origin(&self, origin: NSPoint) {
++            with_animator(|| self.ivars().target.setFrameOrigin(origin));
++        }
++
++        #[unsafe(method(setFrameSize:))]
++        fn set_frame_size(&self, size: NSSize) {
++            with_animator(|| self.ivars().target.setFrameSize(size));
++        }
++
++        #[unsafe(method(setBounds:))]
++        fn set_bounds(&self, bounds: NSRect) {
++            with_animator(|| self.ivars().target.setBounds(bounds));
++        }
++
++        #[unsafe(method(setBoundsOrigin:))]
++        fn set_bounds_origin(&self, origin: NSPoint) {
++            with_animator(|| self.ivars().target.setBoundsOrigin(origin));
++        }
++
++        #[unsafe(method(setBoundsSize:))]
++        fn set_bounds_size(&self, size: NSSize) {
++            with_animator(|| self.ivars().target.setBoundsSize(size));
++        }
++
++        #[unsafe(method(setAlphaValue:))]
++        fn set_alpha_value(&self, alpha: f64) {
++            with_animator(|| self.ivars().target.setAlphaValue(alpha));
++        }
++
++        #[unsafe(method(setHidden:))]
++        fn set_hidden(&self, hidden: bool) {
++            with_animator(|| self.ivars().target.setHidden(hidden));
++        }
++
++        #[unsafe(method_id(methodSignatureForSelector:))]
++        fn method_signature(&self, sel: Sel) -> Option<Retained<NSMethodSignature>> {
++            // SAFETY: NSView implements NSObject's method signatures.
++            unsafe { msg_send![&*self.ivars().target, methodSignatureForSelector: sel] }
++        }
++
++        #[unsafe(method(forwardInvocation:))]
++        fn forward_invocation(&self, invocation: &NSInvocation) {
++            // SAFETY: the invocation's signature comes from this target,
++            // which is retained for the proxy's lifetime.
++            with_animator(|| unsafe { invocation.invokeWithTarget(&self.ivars().target) });
++        }
++    }
++);
++
++fn with_animator(f: impl FnOnce()) {
++    // Outside an explicit group, AppKit's animator uses the current
++    // context's default duration and timing function.
++    let own_group = !in_group();
++    if own_group {
++        begin();
++    }
++    struct Scope(bool);
++    impl Drop for Scope {
++        fn drop(&mut self) {
++            ANIMATOR_DEPTH.with(|d| d.set(d.get() - 1));
++            if self.0 {
++                end(None);
++            }
++        }
++    }
++    ANIMATOR_DEPTH.with(|d| d.set(d.get() + 1));
++    let _scope = Scope(own_group);
++    f();
++}
++
++/// An animator has the target's static type in AppKit's protocol, while
++/// its dynamic type is a forwarding proxy. NSProxy has no initializer.
++pub(crate) fn view_animator(view: &NSView) -> Retained<NSView> {
++    use objc2::Message;
++    let mut this: PartialInit<ViewAnimator> = ViewAnimator::alloc().set_ivars(AnimatorIvars { target: view.retain() });
++    let ptr = PartialInit::as_mut_ptr(&mut this);
++    std::mem::forget(this);
++    // SAFETY: an allocated proxy with initialized ivars, transferring
++    // its owned reference; forwarded methods have NSView's signatures.
++    let proxy = unsafe { Retained::from_raw(ptr) }.expect("an allocated animator");
++    unsafe { Retained::cast_unchecked(proxy) }
++}
++
+ /// Run `f` on the innermost group's settings.
+ fn with_group<R>(f: impl FnOnce(&mut Group) -> R) -> R {
+     STATE.with(|s| {
+@@ -224,8 +332,13 @@ fn run_group(changes: &DynBlock<dyn Fn(NonNull<NSAnimationContext>) + '_>, compl
+ /// for none).
+ fn schedule(delay: NSTimeInterval, handler: Completion) {
+     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| handler.call(()));
+-    // SAFETY: the block owns what it calls, and the timer copies it.
+-    let _ = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block) };
++    // SAFETY: the block owns what it calls, and the timer copies it. A
++    // completion still runs while a control tracks the mouse, or a modal
++    // loop is open, just as the animation itself keeps being displayed.
++    unsafe {
++        let timer = NSTimer::timerWithTimeInterval_repeats_block(delay, false, &block);
++        NSRunLoop::currentRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/sidestep-appkit/src/views.rs b/crates/sidestep-appkit/src/views.rs
+index 59b7fb9..65e14a2 100644
+--- a/crates/sidestep-appkit/src/views.rs
++++ b/crates/sidestep-appkit/src/views.rs
+@@ -540,8 +540,7 @@ define_class!(
+ 
+         #[unsafe(method_id(animator))]
+         fn animator(&self) -> Retained<NSView> {
+-            // Changes apply at once (see `crate::animation`).
+-            as_view(self).retain()
++            crate::animation::view_animator(as_view(self))
+         }
+ 
+         #[unsafe(method_id(inputContext))]
+diff --git a/crates/sidestep-appkit/tests/linux_layers.rs b/crates/sidestep-appkit/tests/linux_layers.rs
+index c7c3743..00346d0 100644
+--- a/crates/sidestep-appkit/tests/linux_layers.rs
++++ b/crates/sidestep-appkit/tests/linux_layers.rs
+@@ -32,8 +32,8 @@ mod linux {
+     use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
+     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+     use objc2_app_kit::{
+-        NSAppearance, NSAppearanceNameAqua, NSApplication, NSBackingStoreType, NSColor, NSRectFill, NSView, NSWindow,
+-        NSWindowStyleMask,
++        NSAnimatablePropertyContainer, NSAnimationContext, NSAppearance, NSAppearanceNameAqua, NSApplication,
++        NSBackingStoreType, NSColor, NSRectFill, NSView, NSWindow, NSWindowStyleMask,
+     };
+     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+     use objc2_core_graphics::CGColor;
+@@ -269,6 +269,85 @@ mod linux {
+         testing::settle();
+     }
+ 
++    fn animator_interpolates_without_enabling_implicit_changes(mtm: MainThreadMarker) {
++        let (w, painter) = shown(mtm);
++        let child = Painter::new(mtm, rect(10.0, 10.0, 20.0, 20.0), [0.0, 0.0, 1.0]);
++        painter.addSubview(&child);
++        show(&w);
++        let layer = child.layer().unwrap();
++        let moving = child.clone();
++        let changes = block2::RcBlock::new(move |context: std::ptr::NonNull<NSAnimationContext>| {
++            let context = unsafe { context.as_ref() };
++            context.setDuration(LONG);
++            context.setTimingFunction(Some(&linear()));
++            assert!(!context.allowsImplicitAnimation());
++            moving.animator().setFrame(rect(110.0, 10.0, 20.0, 20.0));
++            moving.animator().setAlphaValue(0.5);
++            // An ordinary setter in this same group still applies at once.
++            moving.setBoundsOrigin(NSPoint::new(1.0, 0.0));
++        });
++        NSAnimationContext::runAnimationGroup(&changes);
++        show(&w);
++        let animation = unsafe { layer.animationForKey(&NSString::from_str("position")) }
++            .expect("animator creates an animation even when allowsImplicitAnimation is false");
++        let begin = animation.beginTime();
++        let draws = child.ivars().draws.get();
++        for step in 0..=20 {
++            let progress = step as f64 / 20.0;
++            let p = testing::presented_layer(&layer, begin + LONG * progress).unwrap();
++            assert!((p.position[0] - (10.0 + 100.0 * progress)).abs() < 0.01, "{:?}", p.position);
++            assert!((p.opacity - (1.0 - 0.5 * progress)).abs() < 0.01, "{}", p.opacity);
++            assert_eq!(p.bounds[0], 1.0, "direct setters remain immediate");
++            testing::composite_at(&w, begin + LONG * progress);
++        }
++        assert_eq!(child.ivars().draws.get(), draws, "animation reuses cached view drawing");
++        w.close();
++        testing::settle();
++    }
++
++    fn animator_resizes_and_completes_while_tracking(mtm: MainThreadMarker) {
++        let (w, painter) = shown(mtm);
++        let target = painter.clone();
++        let changes = block2::RcBlock::new(move |context: std::ptr::NonNull<NSAnimationContext>| {
++            // SAFETY: the animation group supplies its context.
++            let context = unsafe { context.as_ref() };
++            context.setDuration(LONG);
++            context.setTimingFunction(Some(&linear()));
++            target.animator().setFrameSize(NSSize::new(100.0, 100.0));
++        });
++        NSAnimationContext::runAnimationGroup(&changes);
++        show(&w);
++        let layer = painter.layer().unwrap();
++        let bounds = unsafe { layer.animationForKey(&NSString::from_str("bounds")) }.expect("animated resize");
++        let begin = bounds.beginTime();
++        let draws = painter.ivars().draws.get();
++        for step in 0..=20 {
++            let progress = step as f64 / 20.0;
++            let p = testing::presented_layer(&layer, begin + LONG * progress).unwrap();
++            assert!((p.bounds[2] - (200.0 - 100.0 * progress)).abs() < 0.01);
++            testing::composite_at(&w, begin + LONG * progress);
++        }
++        assert_eq!(painter.ivars().draws.get(), draws);
++
++        let done = std::rc::Rc::new(Cell::new(false));
++        let completed = done.clone();
++        let changes = block2::RcBlock::new(|context: std::ptr::NonNull<NSAnimationContext>| {
++            unsafe { context.as_ref() }.setDuration(0.0);
++        });
++        let completion = block2::RcBlock::new(move || completed.set(true));
++        NSAnimationContext::runAnimationGroup_completionHandler(&changes, Some(&completion));
++        // Keep the run loop in mouse tracking, as a held control does.
++        unsafe {
++            NSRunLoop::currentRunLoop().runMode_beforeDate(
++                objc2_app_kit::NSEventTrackingRunLoopMode,
++                &objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.02),
++            );
++        }
++        assert!(done.get(), "animation completion must not wait for mouse tracking to end");
++        w.close();
++        testing::settle();
++    }
++
+     fn opacity_and_transitions(mtm: MainThreadMarker) {
+         let (w, painter) = shown(mtm);
+         let root = painter.layer().expect("a layer");
+@@ -526,6 +605,11 @@ mod linux {
+         let tests: &[Test] = &[
+             ("views_and_layers_composite", views_and_layers_composite),
+             ("animations_draw_on_the_render_thread", animations_draw_on_the_render_thread),
++            (
++                "animator_interpolates_without_enabling_implicit_changes",
++                animator_interpolates_without_enabling_implicit_changes,
++            ),
++            ("animator_resizes_and_completes_while_tracking", animator_resizes_and_completes_while_tracking),
+             ("opacity_and_transitions", opacity_and_transitions),
+             ("masks_hide_what_they_leave_out", masks_hide_what_they_leave_out),
+             ("views_update_their_layers", views_update_their_layers),
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 90f491c..f0fa7ab 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -1346,14 +1346,19 @@ compositor.
+   symbol names to Sidestep's own line drawings, template images drawn by
+   a handler, sized and weighted by an `NSImageSymbolConfiguration`. No SF
+   Symbols artwork is used; other names give nil.
+-- **Animation.** `animator` is the view or window itself (as objc2 types
+-  it), so changes made through it apply at once. An `NSAnimationContext`
+-  group is a Core Animation transaction with the group's duration and
+-  timing function: layers changed in it animate over them, and so do
+-  layer-backed views' frame and alpha changes while the group allows
+-  implicit animation (see [Core Animation](#core-animation)). The context
+-  keeps its settings per group and runs completion handlers from the run
+-  loop once a group's duration has passed.
++- **Animation.** A view's `animator` is a proxy (typed as the view, as
++  objc2 types it) that makes each change in an animation group, its own
++  unless one is open, with implicit animation allowed for that change
++  alone: a layer-backed view's frame, bounds and alpha animate over the
++  group's duration on the render thread, and other messages are passed on.
++  A window's `animator` is the window, so its changes apply at once. An
++  `NSAnimationContext` group is a Core Animation transaction with the
++  group's duration and timing function: layers changed in it animate over
++  them, and so do layer-backed views' frame and alpha changes while the
++  group allows implicit animation (see [Core Animation](#core-animation)).
++  The context keeps its settings per group and runs completion handlers
++  from the run loop once a group's duration has passed, in the common
++  modes, so while a control tracks the mouse too.
+ 
+ ### CoreGraphics
+ 
+@@ -2383,7 +2388,7 @@ count and autoreversing don't limit its sublayers' time; the `frame` key
+ path doesn't animate, and gradient `colors` and `locations` don't when
+ the model has none; a value function given a value macOS raises for (a
+ lone number for a scale or translation, a missing `from` or `to`) does
+-nothing; changes made through `animator` apply at once; the continuous
++nothing; changes made through a window's `animator` apply at once; the continuous
+ corner curve (`render::rounded_rect`'s table, of which only the reach is
+ measured) is tighter near the edge than macOS's; `renderInContext:` follows the screen where macOS's
+ `renderInContext:` doesn't (it draws sublayers by `zPosition`, and honors
+diff --git a/docs/roadmap.md b/docs/roadmap.md
+index d9efa8a..b59675a 100644
+--- a/docs/roadmap.md
++++ b/docs/roadmap.md
+@@ -224,7 +224,8 @@ pictures on macOS for comparison):
+ - `NSGradient`, `NSShadow`, `NSVisualEffectView` (an opaque material),
+   `alphaValue`, and `NSAnimationContext` (a Core Animation transaction, in
+   which layer-backed views' frame and alpha changes animate while it
+-  allows implicit animation; changes through `animator` apply at once).
++  allows implicit animation, as do changes through a view's `animator`;
++  a window's apply at once).
+ - CoreGraphics (`coregraphics/`, the gallery's `SCENARIO=cg` page):
+   `CGContext` sharing `NSGraphicsContext`'s graphics state (paths, fills,
+   strokes, dashes, clips and clips to masks, blend modes, alpha, shadows,
+@@ -366,7 +367,7 @@ Next:
+   pasteboards.
+ - Drawing: text under a rotated transform (glyph runs take a translation
+   only), pattern colors (and `patternImage` on threads other than the
+-  image's), `-[NSView lockFocus]`, `animator` animating over time, blur behind
++  image's), `-[NSView lockFocus]`, a window's `animator` animating, blur behind
+   visual effect views (no Wayland protocol yet), and batching a bitmap
+   context's operations instead of rasterizing each at once (layouts other
+   than RGBA are unpacked and packed for each).
+@@ -387,7 +388,7 @@ Next:
+   between layers), `rotationMode`, `contentsCenter`, filters, conic
+   gradients, the continuous corner's exact curve, keyframes' tension,
+   continuity and bias, overdamped springs as macOS moves them, a layer's
+-  own duration and repeats, `animator` animating, `CATextLayer`,
++  own duration and repeats, a window's `animator` animating, `CATextLayer`,
+   `CAReplicatorLayer`, `CAScrollLayer`, `CATransformLayer`, `CATiledLayer`
+   and `CAEmitterLayer` (`CAMetalLayer` and `CAOpenGLLayer` wait for a GPU
+   renderer), and drawing layer trees with a GPU (see architecture.md's
+-- 
+2.56.0
+

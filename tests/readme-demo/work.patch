@@ -1,0 +1,88 @@
+diff --git a/src/chat.rs b/src/chat.rs
+index 71d8d70..deb8bee 100644
+--- a/src/chat.rs
++++ b/src/chat.rs
+@@ -2,6 +2,7 @@ use std::io::{self, BufRead, Write};
+ 
+ use anyhow::Result;
+ 
++use crate::measure;
+ use crate::session::Session;
+ 
+ const WIDTH: usize = 72;
+@@ -20,7 +21,7 @@ pub fn run(session: &mut Session) -> Result<()> {
+ 
+ fn print_wrapped(text: &str) {
+     let mut out = io::stdout().lock();
+-    for chunk in text.as_bytes().chunks(WIDTH) {
+-        let _ = writeln!(out, "{}", String::from_utf8_lossy(chunk));
++    for line in measure::wrap(text, WIDTH) {
++        let _ = writeln!(out, "{line}");
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index d4d8d0f..6f96e9d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,5 @@
+ mod chat;
++mod measure;
+ mod session;
+ 
+ use anyhow::Result;
+diff --git a/src/measure.rs b/src/measure.rs
+new file mode 100644
+index 0000000..059f045
+--- /dev/null
++++ b/src/measure.rs
+@@ -0,0 +1,34 @@
++//! Display width of text in terminal columns.
++
++use unicode_width::UnicodeWidthStr;
++
++/// Splits `text` into lines no wider than `width` columns, breaking at
++/// spaces where it can. Wide characters (CJK, emoji) count as two.
++pub fn wrap(text: &str, width: usize) -> Vec<String> {
++    let mut lines = Vec::new();
++    let mut line = String::new();
++    for word in text.split(' ') {
++        let needed = if line.is_empty() { word.width() } else { line.width() + 1 + word.width() };
++        if needed > width && !line.is_empty() {
++            lines.push(std::mem::take(&mut line));
++        }
++        if !line.is_empty() {
++            line.push(' ');
++        }
++        line.push_str(word);
++    }
++    if !line.is_empty() {
++        lines.push(line);
++    }
++    lines
++}
++
++#[cfg(test)]
++mod tests {
++    use super::wrap;
++
++    #[test]
++    fn wide_characters_count_twice() {
++        assert_eq!(wrap("日本語 text", 6), vec!["日本語", "text"]);
++    }
++}
+diff --git a/src/session.rs b/src/session.rs
+index 3992a05..7b0ff4c 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -18,6 +18,11 @@ impl Session {
+         Ok(Self { model: model.into(), messages: Vec::new() })
+     }
+ 
++    /// The last `n` messages, oldest first, for the model's context.
++    pub fn recent(&self, n: usize) -> &[Message] {
++        &self.messages[self.messages.len().saturating_sub(n)..]
++    }
++
+     pub fn push(&mut self, role: &str, text: &str) {
+         self.messages.push(Message { role: role.into(), text: text.into() });
+     }

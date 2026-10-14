@@ -1,0 +1,14 @@
+description = "A small change with tests in a large real repository (Ruff); the first run clones it once."
+tags = ["coding", "python", "external"]
+timeout_secs = 600
+prompt = """Update scripts/check_docs_formatted.py so python3 Markdown fences behave like python fences. \
+Preserve pyi, indentation, other languages, and parse-error handling. Add and run focused unittest coverage \
+without installing dependencies or building Ruff. Do not commit or push."""
+
+[workspace]
+git = { repo = "https://github.com/astral-sh/ruff", rev = "fde6172bad84378f483921e80f5f4a9a15a43746" }
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 60

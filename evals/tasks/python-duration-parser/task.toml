@@ -1,0 +1,39 @@
+description = "Python: implement a specified duration parser plus its CLI command, with exact decimals and strict errors; add tests."
+tags = ["coding", "python", "feature"]
+timeout_secs = 900
+prompt = """Can you pick up issue #41 in this repo (the `timespan` package)? Here's the issue text:
+
+---
+**#41: Add `parse_duration` and `timespan parse`**
+
+`parse_duration(text: str) -> int` (stub in `timespan/parsing.py`) returns the total number of seconds.
+
+- A duration is one or more components, each a number followed by a unit: `1h30m`, `2d 4h`, \
+`1 hour 30 minutes`. Whitespace is allowed between components and between a number and its unit; leading \
+and trailing whitespace is ignored.
+- Units are case-insensitive. Weeks: `w`, `wk`, `wks`, `week`, `weeks`. Days: `d`, `day`, `days`. Hours: \
+`h`, `hr`, `hrs`, `hour`, `hours`. Minutes: `m`, `min`, `mins`, `minute`, `minutes`. Seconds: `s`, `sec`, \
+`secs`, `second`, `seconds`. Nothing else (no `ms`).
+- Units appear largest first (w, d, h, m, s) and at most once each, so `30m1h` and `1h 1hour` are errors.
+- Numbers are ASCII digits with an optional decimal fraction (`1.5h`, `0.75 hours`). No signs, exponents, \
+underscores, thousands separators, or bare dots (`.5h`, `1.h`).
+- The total has to come out to a whole number of seconds, computed exactly: `1.5m` is 90 and `0.1h` is 360, \
+but `0.5s` is an error.
+- A plain integer with no unit means seconds (`90`), but only when it is the entire input (`1h 30` is an \
+error).
+- A single leading `-` negates the whole duration: `-1h30m` is -5400.
+- Anything else raises `DurationError` (already defined in `timespan/errors.py`; it's a `ValueError`) with \
+the offending input in the message. No other exception type should escape for string input.
+- Anything `format_duration` produces must parse back to the same number.
+
+CLI: `python3 -m timespan parse DURATION` prints the number of seconds. Bad input follows the existing \
+convention: `timespan: error: ...` on stderr, exit status 2, no traceback.
+---
+
+Standard library only, keep the existing `format` behaviour as it is, and add unit tests for the new code \
+under tests/ (we run `python3 -m unittest discover -s tests -t .`). Don't commit."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 120

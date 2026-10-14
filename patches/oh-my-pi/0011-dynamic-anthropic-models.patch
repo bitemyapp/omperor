@@ -1,0 +1,1296 @@
+diff --git a/crates/app/src/models_cmd.rs b/crates/app/src/models_cmd.rs
+--- a/crates/app/src/models_cmd.rs
++++ b/crates/app/src/models_cmd.rs
+@@ -62,7 +62,8 @@
+ 	// exposes a selector that planning cannot use.
+ 	let stale = match provider.as_str() {
+ 		"anthropic" => cached.rows.iter().any(|row| {
+-			!discovered_model_supports_chat(row) || row.wire_model.as_str().ends_with("[1m]")
++			!discovered_model_supports_chat(row)
++				|| row.source.as_str() != "runtime-anthropic-models-v1"
+ 		}),
+ 		"openai-codex" => cached.rows.iter().any(|row| {
+ 			row.declared_capabilities
+@@ -76,6 +77,24 @@
+ 		return Ok(None);
+ 	}
+ 	Ok(Some(discovered_selectors(&cached.rows)))
++}
++
++/// Last successful account-scoped listing, even after its refresh TTL.
++/// Callers must report live discovery failure when using this fallback.
++pub(crate) fn cached_provider_models(
++	data_dir: &Path,
++	provider: &ProviderId<str>,
++	principal: Option<&str>,
++) -> miette::Result<Option<Vec<String>>> {
++	let path = data_dir.join("models.db");
++	if !path.exists() {
++		return Ok(None);
++	}
++	Ok(DiscoveryStore::open(&path)
++		.into_diagnostic()?
++		.load_latest(&provider_cache_key(provider, principal))
++		.into_diagnostic()?
++		.map(|cached| discovered_selectors(&cached.rows)))
+ }
+ 
+ /// Discovers and atomically caches the models advertised by a provider's
+@@ -114,6 +133,7 @@
+ 			response_hooks: Default::default(),
+ 		};
+ 		let mut cursor = None;
++		let mut seen_cursors = BTreeSet::new();
+ 		loop {
+ 			let mut client = Client::new(registry.service(), planner.clone(), meta.clone());
+ 			if let Some(pins) = pins {
+@@ -136,6 +156,11 @@
+ 					.filter_map(|model| discovered(model, provider, &route, now_ms)),
+ 			);
+ 			cursor = page.next_cursor;
++			if let Some(next) = &cursor
++				&& !seen_cursors.insert(next.clone())
++			{
++				return Err(miette!("{provider} model discovery repeated a page cursor"));
++			}
+ 			if cursor.is_none() {
+ 				break;
+ 			}
+@@ -180,6 +205,7 @@
+ 	let mut selectors = rows
+ 		.iter()
+ 		.filter(|row| discovered_model_supports_chat(row))
++		.filter(|row| row.availability != Some(omp_catalog::ModelAvailability::Disabled))
+ 		.map(|row| format!("{}/{}", row.provider, row.wire_model))
+ 		.collect::<Vec<_>>();
+ 	selectors.sort();
+@@ -420,7 +446,7 @@
+ 			})
+ 		})?;
+ 	let mut declared_operations = model.capabilities.operations;
+-	// The Claude subscription bootstrap endpoint is itself an authoritative
++	// The authenticated Anthropic Models endpoint is an authoritative
+ 	// list of chat-selectable models. The mixed discovery projector may replace
+ 	// a compact response row with conservative catalog metadata, so retain this
+ 	// endpoint-level fact when materializing the durable cache row.
+@@ -440,7 +466,11 @@
+ 		declared_pricing: Box::new([]),
+ 		extended_context_mode: None,
+ 		availability: Some(model.availability.clone()),
+-		source: Str::new_static("runtime-inference-discovery"),
++		source: Str::new_static(if provider.as_str() == "anthropic" {
++			"runtime-anthropic-models-v1"
++		} else {
++			"runtime-inference-discovery"
++		}),
+ 		observed_at_ms: Some(now_ms),
+ 		updated_at_ms: None,
+ 		deprecated: None,
+@@ -522,6 +552,55 @@
+ 	use super::*;
+ 
+ 	#[test]
++	fn anthropic_bootstrap_cache_is_replaced_and_offline_fallback_is_scoped() {
++		let dir = tempfile::tempdir().unwrap();
++		let provider = ProviderId::from("anthropic");
++		let route = omp_catalog::RouteId::from("anthropic/primary");
++		let model = Catalog::embedded()
++			.model(omp_catalog::ModelKey::from_ref("anthropic/claude-opus-5"))
++			.unwrap();
++		let mut row = discovered(model, &provider, &route, 1).unwrap();
++		row.source = Str::new_static("runtime-inference-discovery");
++		let store = DiscoveryStore::open(&dir.path().join("models.db")).unwrap();
++		let key = provider_cache_key(&provider, Some("account-a"));
++		store
++			.publish(&key, &[row.clone()], discovery_now_ms().unwrap(), DISCOVERY_CACHE_TTL)
++			.unwrap();
++		assert!(
++			fresh_provider_models(dir.path(), &provider, Some("account-a"))
++				.unwrap()
++				.is_none()
++		);
++		row.source = Str::new_static("runtime-anthropic-models-v1");
++		store
++			.publish(&key, &[row.clone()], discovery_now_ms().unwrap(), DISCOVERY_CACHE_TTL)
++			.unwrap();
++		assert!(
++			fresh_provider_models(dir.path(), &provider, Some("account-a"))
++				.unwrap()
++				.is_some()
++		);
++		store
++			.publish(&key, &[row], 1, Duration::from_secs(1))
++			.unwrap();
++		assert!(
++			fresh_provider_models(dir.path(), &provider, Some("account-a"))
++				.unwrap()
++				.is_none()
++		);
++		assert!(
++			cached_provider_models(dir.path(), &provider, Some("account-a"))
++				.unwrap()
++				.is_some()
++		);
++		assert!(
++			cached_provider_models(dir.path(), &provider, Some("account-b"))
++				.unwrap()
++				.is_none()
++		);
++	}
++
++	#[test]
+ 	fn anthropic_cache_projection_retains_endpoint_chat_capability() {
+ 		let catalog = Catalog::embedded();
+ 		let provider = ProviderId::from("anthropic");
+diff --git a/crates/driver/src/registry.rs b/crates/driver/src/registry.rs
+--- a/crates/driver/src/registry.rs
++++ b/crates/driver/src/registry.rs
+@@ -407,17 +407,15 @@
+ 					principal.clone(),
+ 				)
+ 			});
+-		let mut cached = None;
+-		if let Some(scoped) = &scoped {
+-			cached = store
+-				.load_fresh(scoped, now_ms)
+-				.map_err(catalog_composition)?;
++		// Account listings remain usable offline after the refresh TTL. Never
++		// substitute a different account's listing for an explicitly pinned one.
++		let cache_key = scoped.as_ref().unwrap_or(&key);
++		let cached = if matches!(key.provider.as_str(), "anthropic" | "openai-codex") {
++			store.load_latest(cache_key)
++		} else {
++			store.load_fresh(cache_key, now_ms)
+ 		}
+-		if cached.is_none() {
+-			cached = store
+-				.load_fresh(&key, now_ms)
+-				.map_err(catalog_composition)?;
+-		}
++		.map_err(catalog_composition)?;
+ 		let Some(cached) = cached else {
+ 			continue;
+ 		};
+@@ -467,6 +465,9 @@
+ 				// model; every bundled key is `provider/model`, and selectors
+ 				// resolve by key, so prefix the provider here.
+ 				let mut record = record;
++				if key.provider.as_str() == "anthropic" && record.model.thinking.is_none() {
++					record.model.thinking = discovered_anthropic_thinking(&configured, &record.model);
++				}
+ 				if !record.model.key.as_str().contains('/') {
+ 					let prefixed =
+ 						omp_catalog::ModelKey::from(format!("{}/{}", key.provider, record.model.key));
+@@ -499,6 +500,40 @@
+ 		)
+ 		.map_err(catalog_composition)?;
+ 	Ok(Arc::new(catalog))
++}
++
++/// Reuse a supported wire contract by reported capability, never by model ID.
++/// Anthropic models must explicitly report adaptive thinking and effort
++/// support. Unknown contracts remain unknown instead of silently borrowing
++/// model specs.
++fn discovered_anthropic_thinking(
++	catalog: &snapshot::Catalog,
++	model: &omp_catalog::ModelSpec,
++) -> Option<omp_catalog::ThinkingPolicyId> {
++	use omp_catalog::{Availability, ReasoningFeatureBits, ThinkingMode};
++	let Availability::Native(reasoning) = &model.capabilities.chat.as_ref()?.reasoning else {
++		return None;
++	};
++	if !reasoning.features.contains(ReasoningFeatureBits::EFFORT)
++		|| !reasoning.features.contains(ReasoningFeatureBits::ADAPTIVE)
++	{
++		return None;
++	}
++	catalog.models().iter().find_map(|known| {
++		if !known.key.as_str().starts_with("anthropic/") {
++			return None;
++		}
++		let id = known.thinking.as_ref()?;
++		let policy = catalog.thinking_policy(id)?;
++		(policy.mode == ThinkingMode::AnthropicAdaptive
++			&& policy
++				.efforts
++				.iter()
++				.copied()
++				.map(omp_catalog::ReasoningEffort::from)
++				.eq(reasoning.efforts.iter().copied()))
++		.then(|| id.clone())
++	})
+ }
+ 
+ /// The one fact a live listing may change on a bundled model: the service
+@@ -1435,6 +1470,62 @@
+ 	use super::*;
+ 
+ 	#[test]
++	fn an_unbundled_anthropic_model_survives_cache_expiry_with_live_limits() {
++		use omp_catalog::{DiscoveredModel, ModelKey, ProviderId, RouteId, WireModelId};
++		let data_dir = tempfile::tempdir().expect("data dir");
++		let bundled = snapshot::Catalog::embedded();
++		let template = bundled
++			.model(ModelKey::from_ref("anthropic/claude-opus-5"))
++			.unwrap();
++		let key = ModelKey::from("anthropic/claude-opus-99-7");
++		assert!(bundled.model(&key).is_none());
++		let mut capabilities = template.capabilities.clone();
++		if let omp_catalog::Availability::Native(reasoning) =
++			&mut capabilities.chat.as_mut().unwrap().reasoning
++		{
++			reasoning.features =
++				omp_catalog::ReasoningFeatureBits::EFFORT | omp_catalog::ReasoningFeatureBits::ADAPTIVE;
++		}
++		let mut limits = template.limits;
++		limits.maximum_input_tokens = Some(987_654);
++		let row = DiscoveredModel {
++			provider:              ProviderId::from("anthropic"),
++			route:                 RouteId::from("anthropic/primary"),
++			wire_model:            WireModelId::from("claude-opus-99-7"),
++			aliases:               Box::new([]),
++			display_name:          Some(Str::new_static("Future model")),
++			declared_class:        Some(template.class.clone()),
++			declared_operations:   capabilities.operations,
++			declared_capabilities: Some(capabilities),
++			declared_limits:       Some(limits),
++			declared_pricing:      Box::new([]),
++			extended_context_mode: None,
++			availability:          Some(omp_catalog::ModelAvailability::Available),
++			source:                Str::new_static("runtime-anthropic-models-v1"),
++			observed_at_ms:        Some(1),
++			updated_at_ms:         None,
++			deprecated:            None,
++		};
++		omp_ai::discovery::DiscoveryStore::open(&data_dir.path().join("models.db"))
++			.unwrap()
++			.publish(
++				&omp_ai::discovery::DiscoveryCacheKey::provider("anthropic"),
++				&[row],
++				1,
++				Duration::from_secs(1),
++			)
++			.unwrap();
++		let catalog = production_catalog(data_dir.path()).expect("catalog hydrates offline");
++		let model = catalog
++			.model(&key)
++			.expect("unbundled model remains selectable");
++		assert_eq!(model.limits.maximum_input_tokens, Some(987_654));
++		assert_eq!(model.wire_ids[0].1.as_str(), "claude-opus-99-7");
++		assert!(model.thinking.is_some(), "observed adaptive effort contract is retained");
++		assert_eq!(model.pricing, omp_catalog::Pricing::default(), "no fabricated price");
++	}
++
++	#[test]
+ 	fn a_cached_row_for_a_bundled_model_changes_only_its_offered_tiers() {
+ 		use omp_catalog::{
+ 			Availability, DiscoveredModel, ModelKey, OperationBits, OperationKind, ProviderFamily,
+diff --git a/crates/ai/src/discovery/store.rs b/crates/ai/src/discovery/store.rs
+--- a/crates/ai/src/discovery/store.rs
++++ b/crates/ai/src/discovery/store.rs
+@@ -267,6 +267,16 @@
+ 			rows.push(serde_json::from_slice(&row?)?);
+ 		}
+ 		Ok(Some(CachedDiscovery { key: key.clone(), generation, rows, expires_at_ms }))
++	}
++
++	/// Loads the last successful generation, including expired rows, for an
++	/// explicitly labelled offline fallback. Expiry still governs refresh.
++	/// Account namespaces remain isolated and invalidation still removes it.
++	pub fn load_latest(
++		&self,
++		key: &DiscoveryCacheKey,
++	) -> Result<Option<CachedDiscovery>, DiscoveryStoreError> {
++		self.load_fresh(key, 0)
+ 	}
+ 
+ 	/// Invalidates exactly one endpoint/account namespace.
+@@ -457,6 +467,21 @@
+ 			Price { unit: PriceUnit::MtokCacheWrite, nanos_usd: 6_875_000_000 },
+ 		]);
+ 		assert!(reopened.load_fresh(&key, 1_101).expect("expired").is_none());
++		assert_eq!(
++			reopened
++				.load_latest(&key)
++				.expect("offline")
++				.unwrap()
++				.rows
++				.len(),
++			1
++		);
++		assert!(
++			reopened
++				.load_latest(&DiscoveryCacheKey::credential(provider.clone(), "other-account"))
++				.expect("isolated")
++				.is_none()
++		);
+ 		assert_eq!(
+ 			reopened.lifecycle(&key).expect("lifecycle").unwrap().state,
+ 			ProviderDiscoveryState::Ready
+@@ -591,6 +616,12 @@
+ 		store.invalidate(&key).expect("invalidate");
+ 		assert!(
+ 			store
++				.load_latest(&key)
++				.expect("offline after invalidation")
++				.is_none()
++		);
++		assert!(
++			store
+ 				.load_fresh(&key, 201)
+ 				.expect("load after invalidation")
+ 				.is_none()
+diff --git a/crates/catalog/src/capability.rs b/crates/catalog/src/capability.rs
+--- a/crates/catalog/src/capability.rs
++++ b/crates/catalog/src/capability.rs
+@@ -332,6 +332,8 @@
+ bitset!(/// Independent reasoning behaviors.
+ 	ReasoningFeatureBits, u8);
+ impl ReasoningFeatureBits {
++	/// The provider accepts adaptive thinking without an explicit token budget.
++	pub const ADAPTIVE: Self = Self(1 << 4);
+ 	/// An explicit token budget is accepted.
+ 	pub const BUDGET: Self = Self(1 << 2);
+ 	/// Named effort levels are accepted.
+diff --git a/crates/ai/src/codec/discovery.rs b/crates/ai/src/codec/discovery.rs
+--- a/crates/ai/src/codec/discovery.rs
++++ b/crates/ai/src/codec/discovery.rs
+@@ -3,8 +3,10 @@
+ use bytes::Bytes;
+ use omp_catalog::{
+ 	Availability, ChatCapabilities, ClassId, DiscoveredModel, DiscoveryKind, DiscoveryPagination,
+-	DiscoverySpec, ModalityBits, ModelAvailability, ModelLimits, OperationBits, OperationKind,
+-	ProviderId, RouteId, ToolCapabilities, ToolFeatureBits, WireModelId, unknown_capabilities,
++	DiscoverySpec, ImageDecoderFamily, ImageInputCapabilities, ImageInputFormatBits, ModalityBits,
++	ModelAvailability, ModelLimits, OperationBits, OperationKind, ProviderId, ReasoningCapabilities,
++	ReasoningEffort, ReasoningFeatureBits, RouteId, StructuredOutputBits, ToolCapabilities,
++	ToolFeatureBits, WireModelId, unknown_capabilities,
+ };
+ use omp_core::Str;
+ use serde::Deserialize;
+@@ -27,6 +29,7 @@
+ const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+ const ANTHROPIC_PROVIDER: &str = "anthropic";
+ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
++const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+ const CLAUDE_CODE_USER_AGENT: &str = "claude-code/2.1.258";
+ const CLAUDE_CODE_UPDATE_SENTINEL_PREFIX: &str = "cc-update-required-";
+ 
+@@ -56,7 +59,7 @@
+ 	}
+ }
+ 
+-/// Standalone account-scoped `{ "models": [...] }` discovery codec.
++/// Standalone account-scoped model discovery codec.
+ #[derive(Clone, Debug)]
+ pub struct AccountModelsDiscoveryCodec {
+ 	core: DiscoveryCore,
+@@ -65,6 +68,20 @@
+ impl AccountModelsDiscoveryCodec {
+ 	/// Constructs a codec from an exact account-models discovery specification.
+ 	pub fn from_spec(spec: &DiscoverySpec) -> Result<Self, Error> {
++		// Older bundled catalogs point at a client bootstrap whose optional
++		// model list is incomplete. The authenticated Models API is paginated
++		// and describes every model available to the account.
++		if matches!(
++			spec.path.as_str().split('?').next(),
++			Some("/api/claude_cli/bootstrap" | "/api/claude_code/bootstrap")
++		) {
++			let mut spec = spec.clone();
++			spec.path = Str::new_static("/v1/models?limit=1000");
++			spec.pagination =
++				DiscoveryPagination::Cursor { query_parameter: Str::new_static("after_id") };
++			spec.label = Str::new_static("anthropic-models-v1");
++			return DiscoveryCore::new(&spec, DiscoveryKind::AccountModels).map(|core| Self { core });
++		}
+ 		DiscoveryCore::new(spec, DiscoveryKind::AccountModels).map(|core| Self { core })
+ 	}
+ }
+@@ -136,7 +153,7 @@
+ 			OperationKind::DiscoverModels,
+ 			RequestMethod::Get,
+ 			uri,
+-			discovery_headers(&context.route.provider, context.auth_scheme),
++			discovery_headers(&context.route.provider, context.auth_scheme, self.spec.path.as_str()),
+ 			BodySource::Bytes(Bytes::new()),
+ 			FramingProtocol::Raw,
+ 			SizeBounds {
+@@ -175,16 +192,25 @@
+ fn discovery_headers(
+ 	provider: &ProviderId<str>,
+ 	auth_scheme: Option<AuthScheme>,
++	path: &str,
+ ) -> Box<[RequestHeader]> {
+-	if provider.as_str() == ANTHROPIC_PROVIDER && auth_scheme == Some(AuthScheme::OAuth) {
+-		return Box::new([
++	if provider.as_str() != ANTHROPIC_PROVIDER {
++		return Box::new([]);
++	}
++	let version = (path.split('?').next() == Some("/v1/models"))
++		.then(|| RequestHeader::new_static("anthropic-version", ANTHROPIC_API_VERSION));
++	if auth_scheme == Some(AuthScheme::OAuth) {
++		return [
+ 			RequestHeader::new_static("accept", "application/json, text/plain, */*"),
+ 			RequestHeader::new_static("content-type", "application/json"),
+ 			RequestHeader::new_static("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+ 			RequestHeader::new_static("user-agent", CLAUDE_CODE_USER_AGENT),
+-		]);
+-	}
+-	Box::new([])
++		]
++		.into_iter()
++		.chain(version)
++		.collect();
++	}
++	version.into_iter().collect()
+ }
+ 
+ fn discovery_uri(
+@@ -397,6 +423,9 @@
+ 		let envelope: AccountEnvelope =
+ 			serde_json::from_slice(payload).map_err(|_| protocol_error())?;
+ 		let cursor = envelope.cursor();
++		if cursor.has_more == Some(true) && cursor.next.is_none() && cursor.last_id.is_none() {
++			return Err(protocol_error());
++		}
+ 		let mut rows = Vec::with_capacity(envelope.models.len());
+ 		for model in envelope.models {
+ 			let wire_model = model
+@@ -414,11 +443,25 @@
+ 			};
+ 			let mut row =
+ 				self.row(wire_model, model.display_name, model.family.map(ClassId::from), availability);
+-			// Anthropic's compact bootstrap rows describe models selectable by
+-			// Claude's chat client but omit capability metadata. Absence there is
+-			// not evidence that the model cannot chat.
+ 			if self.provider.as_str() == ANTHROPIC_PROVIDER {
++				let maximum_input_tokens = model.max_input_tokens.filter(|tokens| *tokens > 0);
++				let maximum_output_tokens = model.max_tokens.filter(|tokens| *tokens > 0);
++				row.declared_limits = (maximum_input_tokens.is_some()
++					|| maximum_output_tokens.is_some())
++				.then_some(ModelLimits {
++					context_window: None,
++					maximum_input_tokens,
++					maximum_output_tokens,
++					maximum_batch: None,
++				});
++				// Both the Models API and compact bootstrap list selectable
++				// Messages models. Missing optional metadata is not rejection
++				// evidence for chat or ordinary client-side tool use.
+ 				row.declared_operations.insert_kind(OperationKind::Chat);
++				let mut capabilities = unknown_capabilities();
++				capabilities.operations = row.declared_operations;
++				capabilities.chat = Some(anthropic_chat_capabilities(model.capabilities.as_ref()));
++				row.declared_capabilities = Some(capabilities);
+ 			}
+ 			rows.push(row);
+ 		}
+@@ -475,11 +518,17 @@
+ 	fn next_cursor(&self, provider: ProviderCursor) -> Result<Option<Str>, Error> {
+ 		match &self.pagination {
+ 			DiscoveryPagination::SinglePage => Ok(None),
+-			DiscoveryPagination::Cursor { .. } => Ok(provider.next.or_else(|| {
+-				provider
+-					.has_more
+-					.and_then(|more| more.then_some(provider.last_id).flatten())
+-			})),
++			DiscoveryPagination::Cursor { .. } => {
++				let next = provider.next.or_else(|| {
++					provider
++						.has_more
++						.and_then(|more| more.then_some(provider.last_id).flatten())
++				});
++				if provider.has_more == Some(true) && next.as_deref().is_none_or(str::is_empty) {
++					return Err(protocol_error());
++				}
++				Ok(next)
++			},
+ 			DiscoveryPagination::PageNumber { first_page, .. } => {
+ 				if provider.has_more != Some(true) {
+ 					return Ok(None);
+@@ -497,6 +546,48 @@
+ 			},
+ 		}
+ 	}
++}
++
++fn anthropic_chat_capabilities(metadata: Option<&AnthropicCapabilities>) -> ChatCapabilities {
++	let mut chat = openai_chat_capabilities(
++		ModalityBits::TEXT,
++		Availability::Native(ToolCapabilities {
++			features:      ToolFeatureBits::empty(),
++			maximum_tools: None,
++		}),
++	);
++	let Some(metadata) = metadata else {
++		// A native bitset is a complete modality declaration; without image
++		// metadata, a text-only set would falsely reject image inputs.
++		chat.input_modalities = Availability::Unknown;
++		return chat;
++	};
++	match metadata
++		.image_input
++		.as_ref()
++		.and_then(|image| image.supported)
++	{
++		Some(true) => {
++			chat.input_modalities = Availability::Native(ModalityBits::TEXT | ModalityBits::IMAGE);
++			chat.image_input = Availability::Native(ImageInputCapabilities {
++				formats: ImageInputFormatBits::ALL,
++				decoder: ImageDecoderFamily::Native,
++			});
++		},
++		Some(false) => chat.image_input = Availability::Unsupported,
++		None => chat.input_modalities = Availability::Unknown,
++	}
++	chat.structured_output = match metadata
++		.structured_outputs
++		.as_ref()
++		.and_then(|structured| structured.supported)
++	{
++		Some(true) => Availability::Native(StructuredOutputBits::JSON_SCHEMA),
++		Some(false) => Availability::Unsupported,
++		None => Availability::Unknown,
++	};
++	chat.reasoning = metadata.reasoning();
++	chat
+ }
+ 
+ const fn openai_chat_capabilities(
+@@ -612,7 +703,7 @@
+ 
+ #[derive(Deserialize)]
+ struct AccountEnvelope {
+-	#[serde(default, alias = "additional_model_options")]
++	#[serde(default, alias = "additional_model_options", alias = "data")]
+ 	models:      Vec<AccountModel>,
+ 	#[serde(default)]
+ 	next:        Option<Str>,
+@@ -637,17 +728,118 @@
+ #[derive(Deserialize)]
+ struct AccountModel {
+ 	#[serde(default)]
+-	model:        Option<Str>,
+-	#[serde(default)]
+-	slug:         Option<Str>,
+-	#[serde(default)]
+-	id:           Option<Str>,
++	model:            Option<Str>,
++	#[serde(default)]
++	slug:             Option<Str>,
++	#[serde(default)]
++	id:               Option<Str>,
+ 	#[serde(default, alias = "name")]
+-	display_name: Option<Str>,
+-	#[serde(default)]
+-	family:       Option<Str>,
+-	#[serde(default)]
+-	visibility:   Option<Str>,
++	display_name:     Option<Str>,
++	#[serde(default)]
++	family:           Option<Str>,
++	#[serde(default)]
++	visibility:       Option<Str>,
++	#[serde(default)]
++	max_input_tokens: Option<u64>,
++	#[serde(default)]
++	max_tokens:       Option<u64>,
++	#[serde(default)]
++	capabilities:     Option<AnthropicCapabilities>,
++}
++
++#[derive(Deserialize)]
++struct AnthropicCapabilities {
++	image_input:        Option<AnthropicSupport>,
++	structured_outputs: Option<AnthropicSupport>,
++	thinking:           Option<AnthropicThinking>,
++	effort:             Option<AnthropicEffort>,
++}
++
++impl AnthropicCapabilities {
++	fn reasoning(&self) -> Availability<ReasoningCapabilities> {
++		let thinking = self.thinking.as_ref();
++		let supports_thinking = thinking.and_then(|thinking| thinking.supported);
++		let effort = self.effort.as_ref();
++		let supports_effort = effort.and_then(|effort| effort.supported) == Some(true);
++		if supports_thinking != Some(true) && !supports_effort {
++			return if supports_thinking == Some(false) {
++				Availability::Unsupported
++			} else {
++				Availability::Unknown
++			};
++		}
++		let mut features = ReasoningFeatureBits::empty();
++		if supports_thinking == Some(true) {
++			features.insert(ReasoningFeatureBits::VISIBLE | ReasoningFeatureBits::SIGNATURES);
++			if thinking
++				.and_then(|thinking| thinking.types.as_ref())
++				.and_then(|types| types.adaptive.as_ref())
++				.and_then(|support| support.supported)
++				== Some(true)
++			{
++				features.insert(ReasoningFeatureBits::ADAPTIVE);
++			}
++			if thinking
++				.and_then(|thinking| thinking.types.as_ref())
++				.and_then(|types| types.enabled.as_ref())
++				.and_then(|enabled| enabled.supported)
++				== Some(true)
++			{
++				features.insert(ReasoningFeatureBits::BUDGET);
++			}
++		}
++		let efforts: Box<[ReasoningEffort]> = if let Some(effort) = effort.filter(|_| supports_effort)
++		{
++			features.insert(ReasoningFeatureBits::EFFORT);
++			[
++				(ReasoningEffort::Low, &effort.low),
++				(ReasoningEffort::Medium, &effort.medium),
++				(ReasoningEffort::High, &effort.high),
++				(ReasoningEffort::Xhigh, &effort.xhigh),
++				(ReasoningEffort::Max, &effort.max),
++			]
++			.into_iter()
++			.filter_map(|(level, support)| {
++				(support.as_ref().and_then(|support| support.supported) == Some(true)).then_some(level)
++			})
++			.collect()
++		} else {
++			Box::new([])
++		};
++		Availability::Native(ReasoningCapabilities {
++			features,
++			efforts,
++			minimum_budget_tokens: None,
++			maximum_budget_tokens: None,
++		})
++	}
++}
++
++#[derive(Deserialize)]
++struct AnthropicSupport {
++	supported: Option<bool>,
++}
++
++#[derive(Deserialize)]
++struct AnthropicThinking {
++	supported: Option<bool>,
++	types:     Option<AnthropicThinkingTypes>,
++}
++
++#[derive(Deserialize)]
++struct AnthropicThinkingTypes {
++	enabled:  Option<AnthropicSupport>,
++	adaptive: Option<AnthropicSupport>,
++}
++
++#[derive(Deserialize)]
++struct AnthropicEffort {
++	supported: Option<bool>,
++	low:       Option<AnthropicSupport>,
++	medium:    Option<AnthropicSupport>,
++	high:      Option<AnthropicSupport>,
++	xhigh:     Option<AnthropicSupport>,
++	max:       Option<AnthropicSupport>,
+ }
+ 
+ fn invalid_request() -> Error {
+@@ -727,6 +919,114 @@
+ 		output.expect("discovery event")
+ 	}
+ 	#[test]
++	fn legacy_anthropic_route_migrates_to_paginated_models_api() {
++		let spec = DiscoverySpec {
++			id:            omp_catalog::DiscoverySpecId::from("fixture"),
++			kind:          DiscoveryKind::AccountModels,
++			label:         sf!("bootstrap"),
++			path:          sf!("/api/claude_cli/bootstrap?model=old-client-default"),
++			pagination:    DiscoveryPagination::SinglePage,
++			authoritative: false,
++			interval:      None,
++		};
++		let migrated = AccountModelsDiscoveryCodec::from_spec(&spec)
++			.unwrap()
++			.core
++			.spec;
++		assert_eq!(migrated.path.as_str(), "/v1/models?limit=1000");
++		assert_eq!(
++			discovery_uri(
++				"https://api.anthropic.com",
++				&migrated.path,
++				&migrated.pagination,
++				&request(Some("page-two"))
++			)
++			.unwrap()
++			.as_str(),
++			"https://api.anthropic.com/v1/models?limit=1000&after_id=page-two"
++		);
++		for auth in [AuthScheme::OAuth, AuthScheme::ApiKey] {
++			assert!(
++				discovery_headers(&ProviderId::from("anthropic"), Some(auth), &migrated.path)
++					.contains(&RequestHeader::new_static("anthropic-version", "2023-06-01"))
++			);
++		}
++		let mut custom = spec;
++		custom.path = sf!("/custom/catalog");
++		assert_eq!(
++			AccountModelsDiscoveryCodec::from_spec(&custom)
++				.unwrap()
++				.core
++				.spec
++				.path,
++			custom.path
++		);
++	}
++
++	#[test]
++	fn anthropic_models_api_discovers_future_models_with_reported_metadata() {
++		let (rows, next) = discovered_for_provider("anthropic", DiscoveryFlavor::Account,
++			DiscoveryPagination::Cursor { query_parameter: sf!("after_id") }, br#"{
++				"data":[{"id":"claude-opus-99-7","display_name":"Future Opus",
++				"max_input_tokens":1000000,"max_tokens":128000,
++				"capabilities":{"image_input":{"supported":true},"structured_outputs":{"supported":true},
++				"thinking":{"supported":true,"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}},
++				"effort":{"supported":true,"low":{"supported":true},"high":{"supported":true},"max":{"supported":false}}}}],
++				"has_more":true,"last_id":"claude-opus-99-7"
++			}"#);
++		assert_eq!(next.as_deref(), Some("claude-opus-99-7"));
++		assert_eq!(rows[0].wire_model.as_str(), "claude-opus-99-7");
++		let limits = rows[0].declared_limits.unwrap();
++		assert_eq!(limits.maximum_input_tokens, Some(1000000));
++		assert_eq!(limits.maximum_output_tokens, Some(128000));
++		let chat = rows[0]
++			.declared_capabilities
++			.as_ref()
++			.unwrap()
++			.chat
++			.as_ref()
++			.unwrap();
++		assert!(matches!(chat.tools, Availability::Native(_)));
++		assert!(matches!(chat.image_input, Availability::Native(_)));
++		let Availability::Native(reasoning) = &chat.reasoning else {
++			panic!("reasoning")
++		};
++		assert_eq!(&*reasoning.efforts, &[ReasoningEffort::Low, ReasoningEffort::High]);
++		assert!(reasoning.features.contains(ReasoningFeatureBits::ADAPTIVE));
++		assert!(!reasoning.features.contains(ReasoningFeatureBits::BUDGET));
++		assert!(rows[0].declared_pricing.is_empty());
++	}
++
++	#[test]
++	fn anthropic_nullable_metadata_stays_unknown_and_missing_page_cursor_fails() {
++		let (rows, next) = discovered_for_provider(
++			"anthropic",
++			DiscoveryFlavor::Account,
++			DiscoveryPagination::Cursor { query_parameter: sf!("after_id") },
++			br#"{"data":[{"id":"future","capabilities":null,"max_tokens":null}],"has_more":false}"#,
++		);
++		assert!(next.is_none());
++		assert!(rows[0].declared_limits.is_none());
++		let chat = rows[0]
++			.declared_capabilities
++			.as_ref()
++			.unwrap()
++			.chat
++			.as_ref()
++			.unwrap();
++		assert!(chat.reasoning.is_unknown());
++		assert!(chat.image_input.is_unknown());
++		let decoder = decoder(DiscoveryFlavor::Account, DiscoveryPagination::Cursor {
++			query_parameter: sf!("after_id"),
++		});
++		assert!(
++			decoder
++				.decode_account(br#"{"data":[{"id":"future"}],"has_more":true}"#)
++				.is_err()
++		);
++	}
++
++	#[test]
+ 	fn standalone_constructors_require_their_exact_discovery_kind() {
+ 		let mut spec = DiscoverySpec {
+ 			id:            omp_catalog::DiscoverySpecId::from("fixture"),
+@@ -759,7 +1059,11 @@
+ 
+ 	#[test]
+ 	fn anthropic_oauth_discovery_uses_claude_code_request_headers() {
+-		let headers = discovery_headers(&ProviderId::from("anthropic"), Some(AuthScheme::OAuth));
++		let headers = discovery_headers(
++			&ProviderId::from("anthropic"),
++			Some(AuthScheme::OAuth),
++			"/api/claude_cli/bootstrap",
++		);
+ 		assert_eq!(headers.as_ref(), &[
+ 			RequestHeader::new_static("accept", "application/json, text/plain, */*"),
+ 			RequestHeader::new_static("content-type", "application/json"),
+@@ -767,9 +1071,17 @@
+ 			RequestHeader::new_static("user-agent", "claude-code/2.1.258"),
+ 		]);
+ 		assert!(
+-			discovery_headers(&ProviderId::from("anthropic"), Some(AuthScheme::ApiKey)).is_empty()
+-		);
+-		assert!(discovery_headers(&ProviderId::from("openai"), Some(AuthScheme::OAuth)).is_empty());
++			discovery_headers(
++				&ProviderId::from("anthropic"),
++				Some(AuthScheme::ApiKey),
++				"/api/claude_cli/bootstrap"
++			)
++			.is_empty()
++		);
++		assert!(
++			discovery_headers(&ProviderId::from("openai"), Some(AuthScheme::OAuth), "/v1/models")
++				.is_empty()
++		);
+ 	}
+ 
+ 	#[test]
+diff --git a/crates/app/src/rpc_accounts.rs b/crates/app/src/rpc_accounts.rs
+--- a/crates/app/src/rpc_accounts.rs
++++ b/crates/app/src/rpc_accounts.rs
+@@ -9,7 +9,7 @@
+ //! owns that surface so the server loop only dispatches to it.
+ 
+ use std::{
+-	collections::{BTreeMap, HashMap, HashSet},
++	collections::BTreeMap,
+ 	path::{Path, PathBuf},
+ 	sync::Arc,
+ 	time::Duration,
+@@ -27,8 +27,10 @@
+ 	id::LoginSessionId,
+ 	operation::usage::ConsoleUsageManager,
+ };
+-use omp_catalog::{ProviderId, settings::ModelSettings};
+-use omp_core::{ExposeSecret as _, SecretString, Str};
++use omp_catalog::{
++	ProviderId, capability::OperationKind, settings::ModelSettings, snapshot::Catalog,
++};
++use omp_core::{ExposeSecret as _, FastHashMap, FastHashSet, SecretString, Str};
+ use omp_rpc::protocol::{
+ 	OAuthProvider, RpcAccount, RpcAccountState, RpcAuthAccount, RpcAuthAnswerFrame, RpcAuthEvent,
+ 	RpcAuthEventFrame, RpcAuthInputKind, RpcAuthMethod, RpcAuthPromptKind, RpcAuthTerminalFrame,
+@@ -48,10 +50,6 @@
+ /// Providers whose authenticated discovery endpoint reports account-specific
+ /// models beyond the bundled catalog.
+ const ACCOUNT_DISCOVERY_PROVIDERS: [&str; 2] = [ANTHROPIC_PROVIDER, CODEX_PROVIDER];
+-/// Claude subscription models every authenticated account can select; the
+-/// authenticated bootstrap response adds account-specific options.
+-const ANTHROPIC_SUBSCRIPTION_MODELS: [&str; 3] =
+-	["anthropic/claude-fable-5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"];
+ 
+ /// Emits one protocol frame to the connected host.
+ pub(crate) type Notify = Arc<dyn Fn(Value) + Send + Sync>;
+@@ -94,8 +92,8 @@
+ 	/// Account id pinned per provider for the live session.
+ 	pinned:           BTreeMap<String, String>,
+ 	/// Anthropic selectors the authenticated subscription can use.
+-	anthropic_models: HashSet<String>,
+-	pending_auth:     HashMap<String, PendingAuth>,
++	anthropic_models: FastHashSet<String>,
++	pending_auth:     FastHashMap<String, PendingAuth>,
+ }
+ 
+ /// Credential, account, and discovery authority shared by the RPC server
+@@ -170,7 +168,8 @@
+ 		);
+ 		let discovered =
+ 			discover_account_models(&registry, data_dir, &authenticated, false, &pins).await;
+-		let anthropic_models = anthropic_models_for(&authenticated, &discovered);
++		let mut anthropic_models = FastHashSet::default();
++		discovered.update_anthropic_models(&authenticated, &mut anthropic_models);
+ 		let providers = registry
+ 			.catalog()
+ 			.providers()
+@@ -194,7 +193,7 @@
+ 				providers,
+ 				pinned: BTreeMap::new(),
+ 				anthropic_models,
+-				pending_auth: HashMap::new(),
++				pending_auth: FastHashMap::default(),
+ 			}),
+ 		}))
+ 	}
+@@ -256,14 +255,7 @@
+ 		let discovered =
+ 			discover_account_models(&self.registry, &self.data_dir, &authenticated, true, &self.pins)
+ 				.await;
+-		let anthropic_models = anthropic_models_for(&authenticated, &discovered);
+-		self.inner.lock().anthropic_models = anthropic_models;
+-		let mut models = discovered.values().flatten().cloned().collect::<Vec<_>>();
+-		models.sort();
+-		models.dedup();
+-		let mut refreshed = discovered.keys().cloned().collect::<Vec<_>>();
+-		refreshed.sort();
+-		Ok(json!({ "models": models, "refreshed": refreshed, "restartRequired": true }))
++		discovered.into_refresh_response(&authenticated, &mut self.inner.lock().anthropic_models)
+ 	}
+ 
+ 	/// `set_account`: pins one stored account for its provider on every later
+@@ -651,7 +643,7 @@
+ 	}
+ }
+ 
+-fn active_providers(accounts: &[AccountSummary]) -> HashSet<String> {
++fn active_providers(accounts: &[AccountSummary]) -> FastHashSet<String> {
+ 	accounts
+ 		.iter()
+ 		.filter(|account| account.state == AccountState::Active)
+@@ -659,32 +651,73 @@
+ 		.collect()
+ }
+ 
+-fn anthropic_models_for(
+-	authenticated: &HashSet<String>,
+-	discovered: &HashMap<String, Vec<String>>,
+-) -> HashSet<String> {
+-	if !authenticated.contains(ANTHROPIC_PROVIDER) {
+-		return HashSet::new();
+-	}
+-	anthropic_subscription_models(
+-		discovered
+-			.get(ANTHROPIC_PROVIDER)
+-			.cloned()
+-			.unwrap_or_default(),
+-	)
++#[derive(Default)]
++struct ModelDiscoveryReport {
++	/// Successful listings, or last-known/bundled fallbacks during startup.
++	models: BTreeMap<String, Vec<String>>,
++	/// Provider failures remain visible even when startup found a fallback.
++	errors: BTreeMap<String, String>,
++}
++
++impl ModelDiscoveryReport {
++	fn update_anthropic_models(
++		&self,
++		authenticated: &FastHashSet<String>,
++		visible: &mut FastHashSet<String>,
++	) {
++		if !authenticated.contains(ANTHROPIC_PROVIDER) {
++			visible.clear();
++		} else if let Some(models) = self.models.get(ANTHROPIC_PROVIDER) {
++			// A successful response is authoritative, including models unknown
++			// to this binary. A failed refresh keeps the previous visible list.
++			*visible = models.iter().cloned().collect();
++		}
++	}
++
++	fn into_refresh_response(
++		self,
++		authenticated: &FastHashSet<String>,
++		visible: &mut FastHashSet<String>,
++	) -> Result<Value, CommandError> {
++		self.update_anthropic_models(authenticated, visible);
++		if self.models.is_empty() && !self.errors.is_empty() {
++			let errors = self
++				.errors
++				.iter()
++				.map(|(provider, error)| format!("{provider}: {error}"))
++				.collect::<Vec<_>>()
++				.join("; ");
++			return Err(CommandError::new("model_discovery_failed", errors));
++		}
++		let mut models = self.models.values().flatten().collect::<Vec<_>>();
++		models.sort();
++		models.dedup();
++		let warnings = self
++			.errors
++			.iter()
++			.map(|(provider, error)| json!({ "providerId": provider, "error": error }))
++			.collect::<Vec<_>>();
++		Ok(json!({
++			"models": models,
++			"refreshed": self.models.keys().collect::<Vec<_>>(),
++			"warnings": warnings,
++			"restartRequired": !self.models.is_empty(),
++		}))
++	}
+ }
+ 
+ /// Account-verified model selectors per provider: the fresh discovery cache
+ /// when one exists (unless `force_refresh`), otherwise one bounded live
+ /// discovery. Providers are probed concurrently so a stalled endpoint costs
+-/// one timeout, and failures degrade to no additions so startup never stalls.
++/// one timeout. Startup can reuse the same account's expired cache, then the
++/// bundled Anthropic chat catalog; explicit refresh preserves every failure.
+ async fn discover_account_models(
+ 	registry: &Registry,
+ 	data_dir: &Path,
+-	authenticated: &HashSet<String>,
++	authenticated: &FastHashSet<String>,
+ 	force_refresh: bool,
+ 	pins: &AccountPins,
+-) -> HashMap<String, Vec<String>> {
++) -> ModelDiscoveryReport {
+ 	let probes = ACCOUNT_DISCOVERY_PROVIDERS
+ 		.into_iter()
+ 		.filter(|provider_id| authenticated.contains(*provider_id))
+@@ -693,9 +726,54 @@
+ 				discover_provider_models(registry, data_dir, provider_id, force_refresh, pins).await;
+ 			(provider_id.to_owned(), models)
+ 		});
+-	futures::future::join_all(probes)
+-		.await
+-		.into_iter()
++	let mut report = ModelDiscoveryReport::default();
++	for (provider_id, result) in futures::future::join_all(probes).await {
++		match result {
++			Ok(models) => {
++				report.models.insert(provider_id, models);
++			},
++			Err(error) => {
++				eprintln!("warning: {provider_id} account model discovery failed: {error}");
++				if !force_refresh {
++					let models = fallback_provider_models(data_dir, &provider_id, pins);
++					report.models.insert(provider_id.clone(), models);
++				}
++				report.errors.insert(provider_id, error);
++			},
++		}
++	}
++	report
++}
++
++fn fallback_provider_models(data_dir: &Path, provider_id: &str, pins: &AccountPins) -> Vec<String> {
++	let provider = ProviderId::from_ref(provider_id);
++	let principal = pins
++		.snapshot()
++		.get(provider)
++		.map(|principal| principal.as_str().to_owned());
++	match crate::models_cmd::cached_provider_models(data_dir, provider, principal.as_deref()) {
++		Ok(Some(models)) => return models,
++		Ok(None) => {},
++		Err(error) => eprintln!("warning: {provider_id} model cache is unreadable: {error}"),
++	}
++	if provider_id != ANTHROPIC_PROVIDER {
++		return Vec::new();
++	}
++	Catalog::embedded()
++		.models()
++		.iter()
++		.filter(|model| {
++			model
++				.key
++				.as_str()
++				.split_once('/')
++				.is_some_and(|(provider, _)| provider == provider_id)
++				&& model
++					.capabilities
++					.operations
++					.contains_kind(OperationKind::Chat)
++		})
++		.map(|model| model.key.as_str().to_owned())
+ 		.collect()
+ }
+ 
+@@ -705,42 +783,35 @@
+ 	provider_id: &str,
+ 	force_refresh: bool,
+ 	pins: &AccountPins,
+-) -> Vec<String> {
+-	let provider = ProviderId::from(provider_id);
++) -> Result<Vec<String>, String> {
++	let provider = ProviderId::from_ref(provider_id);
+ 	let principal = pins
+ 		.snapshot()
+-		.get(&provider)
++		.get(provider)
+ 		.map(|principal| principal.as_str().to_owned());
+ 	let cached = if force_refresh {
+ 		None
+ 	} else {
+-		crate::models_cmd::fresh_provider_models(data_dir, &provider, principal.as_deref())
++		crate::models_cmd::fresh_provider_models(data_dir, provider, principal.as_deref())
+ 			.unwrap_or_else(|error| {
+ 				eprintln!("warning: {provider_id} model cache is unreadable: {error}");
+ 				None
+ 			})
+ 	};
+ 	if let Some(models) = cached {
+-		return models;
++		return Ok(models);
+ 	}
+ 	match time::timeout(
+ 		ACCOUNT_MODEL_DISCOVERY_TIMEOUT,
+-		crate::models_cmd::refresh_provider(registry, data_dir, &provider, Some(pins)),
++		crate::models_cmd::refresh_provider(registry, data_dir, provider, Some(pins)),
+ 	)
+ 	.await
+ 	{
+-		Ok(Ok(models)) => models,
+-		Ok(Err(error)) => {
+-			eprintln!("warning: {provider_id} account model discovery failed: {error}");
+-			Vec::new()
+-		},
+-		Err(_) => {
+-			eprintln!(
+-				"warning: {provider_id} account model discovery exceeded {} seconds",
+-				ACCOUNT_MODEL_DISCOVERY_TIMEOUT.as_secs()
+-			);
+-			Vec::new()
+-		},
++		Ok(result) => result.map_err(|error| error.to_string()),
++		Err(_) => Err(format!(
++			"account model discovery exceeded {} seconds",
++			ACCOUNT_MODEL_DISCOVERY_TIMEOUT.as_secs()
++		)),
+ 	}
+ }
+ 
+@@ -766,7 +837,8 @@
+ 							quantity.units as f64 / 10f64.powi(i32::from(quantity.decimal_exponent))
+ 						})
+ 					};
+-					let (used, limit) = (decimal(&window.amount.consumed), decimal(&window.amount.limit));
++					let (used, limit) =
++						(decimal(&window.amount.consumed), decimal(&window.amount.limit));
+ 					let used_percent = match window.amount.unit {
+ 						omp_ai::answer::UsageUnit::Percent => used,
+ 						_ => match (used, limit) {
+@@ -808,14 +880,6 @@
+ 		},
+ 	}
+ 	value
+-}
+-
+-fn anthropic_subscription_models(discovered: Vec<String>) -> HashSet<String> {
+-	ANTHROPIC_SUBSCRIPTION_MODELS
+-		.into_iter()
+-		.map(str::to_owned)
+-		.chain(discovered)
+-		.collect()
+ }
+ 
+ fn parse_params<P>(params: &Map<String, Value>) -> Result<P, CommandError>
+@@ -970,25 +1034,117 @@
+ 	use super::*;
+ 
+ 	#[test]
+-	fn anthropic_subscription_models_merge_the_baseline_with_discovery() {
+-		let models = anthropic_subscription_models(vec![
+-			"anthropic/claude-fable-5-1".into(),
+-			"anthropic/claude-sonnet-5".into(),
+-		]);
+-		assert!(models.contains("anthropic/claude-fable-5-1"));
+-		assert!(models.contains("anthropic/claude-opus-5"));
+-		assert_eq!(models.len(), 4);
++	fn anthropic_discovery_is_authoritative_including_unbundled_models() {
++		let discovered = ModelDiscoveryReport {
++			models: BTreeMap::from([(ANTHROPIC_PROVIDER.to_owned(), vec![
++				"anthropic/claude-future-model".to_owned(),
++			])]),
++			..Default::default()
++		};
++		let authenticated = FastHashSet::from_iter([ANTHROPIC_PROVIDER.to_owned()]);
++		let mut visible = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
++		let response = discovered
++			.into_refresh_response(&authenticated, &mut visible)
++			.expect("discovered model accepted");
++		assert_eq!(visible, FastHashSet::from_iter(["anthropic/claude-future-model".to_owned()]));
++		assert_eq!(response["models"], json!(["anthropic/claude-future-model"]));
++		assert_eq!(response["refreshed"], json!([ANTHROPIC_PROVIDER]));
++		assert_eq!(response["warnings"], json!([]));
+ 	}
+ 
+ 	#[test]
+ 	fn anthropic_models_require_an_authenticated_account() {
+-		let discovered =
+-			HashMap::from([("anthropic".to_owned(), vec!["anthropic/claude-fable-5-1".to_owned()])]);
+-		assert!(anthropic_models_for(&HashSet::new(), &discovered).is_empty());
+-		let authenticated = HashSet::from(["anthropic".to_owned()]);
+-		assert!(
+-			anthropic_models_for(&authenticated, &discovered).contains("anthropic/claude-fable-5-1")
++		let discovered = ModelDiscoveryReport {
++			models: BTreeMap::from([(ANTHROPIC_PROVIDER.to_owned(), vec![
++				"anthropic/claude-future-model".to_owned(),
++			])]),
++			..Default::default()
++		};
++		let mut visible = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
++		discovered.update_anthropic_models(&FastHashSet::default(), &mut visible);
++		assert!(visible.is_empty());
++	}
++
++	#[test]
++	fn failed_refresh_preserves_visible_models_and_reports_failure() {
++		let discovered = ModelDiscoveryReport {
++			errors: BTreeMap::from([(
++				ANTHROPIC_PROVIDER.to_owned(),
++				"discovery unavailable".to_owned(),
++			)]),
++			..Default::default()
++		};
++		let authenticated = FastHashSet::from_iter([ANTHROPIC_PROVIDER.to_owned()]);
++		let previous = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
++		let mut visible = previous.clone();
++		let error = discovered
++			.into_refresh_response(&authenticated, &mut visible)
++			.expect_err("failed refresh is not successful");
++		assert_eq!(visible, previous);
++		assert_eq!(error.code.as_str(), "model_discovery_failed");
++		assert!(error.message.contains("anthropic: discovery unavailable"));
++	}
++
++	#[test]
++	fn partial_refresh_reports_only_successes_and_preserves_failed_provider_models() {
++		let discovered = ModelDiscoveryReport {
++			models: BTreeMap::from([(CODEX_PROVIDER.to_owned(), vec![
++				"openai-codex/future-model".to_owned(),
++			])]),
++			errors: BTreeMap::from([(
++				ANTHROPIC_PROVIDER.to_owned(),
++				"discovery unavailable".to_owned(),
++			)]),
++		};
++		let authenticated =
++			FastHashSet::from_iter([ANTHROPIC_PROVIDER.to_owned(), CODEX_PROVIDER.to_owned()]);
++		let previous = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
++		let mut visible = previous.clone();
++		let response = discovered
++			.into_refresh_response(&authenticated, &mut visible)
++			.expect("partial result");
++		assert_eq!(visible, previous);
++		assert_eq!(response["refreshed"], json!([CODEX_PROVIDER]));
++		assert_eq!(response["models"], json!(["openai-codex/future-model"]));
++		assert_eq!(
++			response["warnings"],
++			json!([{ "providerId": ANTHROPIC_PROVIDER, "error": "discovery unavailable" }])
+ 		);
++		assert_eq!(response["restartRequired"], true);
++	}
++
++	#[test]
++	fn refresh_without_authenticated_providers_does_not_require_restart() {
++		let mut visible = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
++		let response = ModelDiscoveryReport::default()
++			.into_refresh_response(&FastHashSet::default(), &mut visible)
++			.expect("no providers need refresh");
++		assert!(visible.is_empty());
++		assert_eq!(response["refreshed"], json!([]));
++		assert_eq!(response["warnings"], json!([]));
++		assert_eq!(response["restartRequired"], false);
++	}
++
++	#[test]
++	fn uncached_startup_fallback_uses_bundled_anthropic_chat_models() {
++		let data_dir = tempfile::tempdir().expect("data dir");
++		let models =
++			fallback_provider_models(data_dir.path(), ANTHROPIC_PROVIDER, &AccountPins::default());
++		assert!(!models.is_empty());
++		for key in models {
++			assert_eq!(key.split_once('/').map(|(provider, _)| provider), Some(ANTHROPIC_PROVIDER));
++			let model = Catalog::embedded()
++				.models()
++				.iter()
++				.find(|model| model.key.as_str() == key)
++				.expect("bundled model");
++			assert!(
++				model
++					.capabilities
++					.operations
++					.contains_kind(OperationKind::Chat)
++			);
++		}
+ 	}
+ 
+ 	#[test]

@@ -1,0 +1,22 @@
+description = "Code reading: answer three precise behaviour questions about a ~30-file job queue (retry budget, backoff, lease clamp) past stale docs and decoy defaults; JSON answer, no edits."
+tags = ["analysis", "python", "code-reading"]
+timeout_secs = 600
+prompt = """I'm on call for `jobq` this week and need precise answers about how it behaves. Please work them \
+out from the code; the docs in docs/ may be out of date. Don't change any files.
+
+1. A job is submitted with `jobq submit <handler>` and no other options, and its handler raises \
+`TransientError` every time it runs. Workers run as `jobq worker` with no options and no `JOBQ_*` \
+environment variables set. How many times in total is the handler invoked, and what is the job's final \
+status (the `JobStatus` value string)?
+2. For that same job, how many seconds does the queue wait before each re-run, in order (before the 2nd \
+invocation, the 3rd, and so on)?
+3. If a worker is started as `JOBQ_LEASE=2m jobq worker` with nothing else set, what lease duration in \
+seconds does it actually use when it leases a job?
+
+Reply with only a JSON object with exactly these keys: `handler_invocations` (integer), `final_status` \
+(string), `retry_delays_seconds` (array of numbers), `effective_lease_seconds` (number)."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 30

@@ -1,0 +1,99 @@
+From 71e0a62c5c93c6d77d52aaa1e28cd20901f9225c Mon Sep 17 00:00:00 2001
+From: Chris Allen <cma@bitemyapp.com>
+Date: Fri, 2 Oct 2026 01:16:43 -0500
+Subject: [PATCH 2/6] Use the desktop font stack for missing UI symbols
+
+Signed-off-by: Chris Allen <cma@bitemyapp.com>
+---
+ crates/sidestep-appkit/src/text/layout.rs | 14 +++++++++----
+ crates/sidestep-appkit/src/text/tests.rs  | 25 ++++++++++++++++++++++-
+ 2 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/crates/sidestep-appkit/src/text/layout.rs b/crates/sidestep-appkit/src/text/layout.rs
+index 554aa99..b7e428b 100644
+--- a/crates/sidestep-appkit/src/text/layout.rs
++++ b/crates/sidestep-appkit/src/text/layout.rs
+@@ -1333,11 +1333,11 @@ pub(super) fn build(
+             features
+         })
+         .collect();
+-    let families: Vec<[FontFamilyName<'_>; 2]> = used
++    let families: Vec<[FontFamilyName<'_>; 3]> = used
+         .iter()
+         .map(|&(i, _, _)| {
+             let family = FontFamilyName::Named(Cow::Borrowed(&*attrs[i as usize].font.face.family));
+-            [FontFamilyName::Generic(GenericFamily::Emoji), family]
++            [FontFamilyName::Generic(GenericFamily::Emoji), family, FontFamilyName::Generic(GenericFamily::SansSerif)]
+         })
+         .collect();
+     let own_emoji = settings.own_emoji;
+@@ -1350,7 +1350,13 @@ pub(super) fn build(
+             let a = &attrs[i as usize];
+             let settings = (features.as_slice(), variations.as_slice(), settings);
+             match kind {
+-                Piece::Text => builder.push_style(text_style(a, i, FontFamily::Single(families[1].clone()), settings)),
++                // The script fallback alone is often the same font as the
++                // requested one (Latin UI text in Noto Sans, for example).
++                // Fontconfig's generic stack also covers symbols that neither
++                // font has, such as the disclosure triangles ▸ and ▾.
++                Piece::Text => {
++                    builder.push_style(text_style(a, i, FontFamily::List(Cow::Borrowed(&families[1..])), settings))
++                }
+                 // Emoji look for a color emoji face first, as on macOS,
+                 // where they'd otherwise take the text's face's plain
+                 // glyphs.
+@@ -1358,7 +1364,7 @@ pub(super) fn build(
+                     let list = if own_emoji {
+                         Cow::Owned(vec![families[1].clone(), families[0].clone()])
+                     } else {
+-                        Cow::Borrowed(&families[..])
++                        Cow::Borrowed(&families[..2])
+                     };
+                     builder.push_style(text_style(a, i, FontFamily::List(list), settings))
+                 }
+diff --git a/crates/sidestep-appkit/src/text/tests.rs b/crates/sidestep-appkit/src/text/tests.rs
+index fcce2c5..93f5e75 100644
+--- a/crates/sidestep-appkit/src/text/tests.rs
++++ b/crates/sidestep-appkit/src/text/tests.rs
+@@ -92,6 +92,21 @@ fn fallback_finds_cjk_and_emoji() {
+     }
+ }
+ 
++#[test]
++fn fallback_finds_ui_symbols() {
++    let (Some(primary), Some(_symbols)) = (font("Noto Sans", 13.0), font("DejaVu Sans", 13.0)) else { return };
++    let attrs = Attrs::new(primary);
++    let plain = lay("Mock backend", attrs.clone(), Options::UNBOUNDED);
++    for text in ["Mock backend  ▾", "Reasoning: off  ▾", "▸ ▾ ← → ✓"] {
++        let laid = lay(text, attrs.clone(), Options::UNBOUNDED);
++        assert!(glyphs(&laid).iter().all(|&g| g != 0), "missing UI symbol in {text:?}");
++        if text.starts_with("Mock backend") {
++            assert_eq!(laid.runs[0].font, plain.runs[0].font, "keep the requested font for ordinary text");
++            assert!(laid.runs.iter().any(|r| r.font != plain.runs[0].font), "another font draws the triangle");
++        }
++    }
++}
++
+ #[test]
+ fn right_to_left_runs_are_reversed() {
+     let a = Attrs::new(sans(20.0));
+@@ -281,7 +296,15 @@ fn weights_map_through_the_named_ones() {
+         assert!((fonts::css_weight(ns) - css).abs() < 0.01, "{ns}");
+     }
+     let bold = fonts::resolve(&FontSpec { weight: 700.0, ..FontSpec::system(Design::Default, 13.0) });
+-    assert!(bold.postscript_name.contains("Bold"), "{}", bold.postscript_name);
++    // A variable font keeps its base PostScript name at every weight.
++    let bold_instance = bold.variations.iter().find(|(tag, _)| *tag == skrifa::Tag::new(b"wght"));
++    assert!(
++        bold_instance
++            .map_or_else(|| bold.postscript_name.contains("Bold"), |(_, weight)| (weight - 700.0).abs() < 0.01),
++        "{} at {:?}",
++        bold.postscript_name,
++        bold.variations,
++    );
+ }
+ 
+ #[test]
+-- 
+2.56.0
+

@@ -1,0 +1,292 @@
+diff --git a/crates/driver/src/headless/kernel.rs b/crates/driver/src/headless/kernel.rs
+--- a/crates/driver/src/headless/kernel.rs
++++ b/crates/driver/src/headless/kernel.rs
+@@ -1969,6 +1969,7 @@
+ 			InferenceSessionOverrides {
+ 				provider: options.api_key.as_ref().and(options.provider.clone()),
+ 				api_key: options.api_key,
++				account_pins: options.account_pins.clone(),
+ 				con: Some(Arc::clone(&ctx)),
+ 				..InferenceSessionOverrides::default()
+ 			},
+diff --git a/crates/envd/src/search_backend.rs b/crates/envd/src/search_backend.rs
+--- a/crates/envd/src/search_backend.rs
++++ b/crates/envd/src/search_backend.rs
+@@ -151,6 +151,13 @@
+ /// The status message is deliberately discarded because it may contain
+ /// provider response bodies, account identifiers, or credential diagnostics.
+ pub fn redacted_status(status: &tonic::Status) -> BackendError {
++	if status.code() == tonic::Code::Unimplemented {
++		return BackendError {
++			kind:   BackendErrorKind::Unavailable,
++			code:   sf!("operation_unsupported_by_backend"),
++			status: None,
++		};
++	}
+ 	let kind = match status.code() {
+ 		tonic::Code::Cancelled => BackendErrorKind::Cancelled,
+ 		tonic::Code::DeadlineExceeded => BackendErrorKind::Timeout,
+@@ -210,3 +217,16 @@
+ 			.finish()
+ 	}
+ }
++
++#[cfg(test)]
++mod tests {
++	use super::*;
++
++	#[test]
++	fn unsupported_search_status_is_clear_and_does_not_expose_provider_text() {
++		let error = redacted_status(&tonic::Status::unimplemented("private provider response"));
++		assert_eq!(error.kind, BackendErrorKind::Unavailable);
++		assert_eq!(error.code, "operation_unsupported_by_backend");
++		assert_eq!(error.status, None);
++	}
++}
+diff --git a/crates/envd/src/tools.rs b/crates/envd/src/tools.rs
+--- a/crates/envd/src/tools.rs
++++ b/crates/envd/src/tools.rs
+@@ -3734,8 +3734,10 @@
+ 		register_instrumented(
+ 			registry,
+ 			omp_tools::web_search::tool(Arc::clone(&search_bridge)),
+-			long_tail_presentation(policy),
+-			long_tail_claims(policy),
++			// Search needs the session-bound inference/account bridge. Shell dyn
++			// runs in the shared daemon, whose search bridge is intentionally unbound.
++			Presentation::Slot,
++			core_claims(),
+ 		)?;
+ 	}
+ 	if tool_settings.enabled("todo") {
+@@ -5889,6 +5891,129 @@
+ mod tests {
+ 	use super::*;
+ 
++	#[derive(Default)]
++	struct SessionSearchProbe(Mutex<Vec<v1::SearchRequest>>);
++
++	#[async_trait::async_trait]
++	impl SearchInference for SessionSearchProbe {
++		async fn search(
++			&self,
++			request: v1::SearchRequest,
++		) -> Result<v1::SearchResponse, omp_tools::web_search::BackendError> {
++			self.0.lock().push(request);
++			Ok(v1::SearchResponse {
++				engine: "session-bound-probe".to_owned(),
++				answer: "Search reached the owning session".to_owned(),
++				..Default::default()
++			})
++		}
++
++		async fn generate_image(
++			&self,
++			_: v1::GenerateImageRequest,
++		) -> Result<Vec<Blob>, omp_tools::web_search::BackendError> {
++			panic!("search must not invoke image inference")
++		}
++
++		async fn speak(
++			&self,
++			_: v1::SpeakRequest,
++		) -> Result<Vec<u8>, omp_tools::web_search::BackendError> {
++			panic!("search must not invoke speech inference")
++		}
++	}
++
++	#[tokio::test]
++	async fn web_search_selection_uses_native_bound_session_and_is_not_a_dyn_device() {
++		use omp_tool::{CallOutcome, DevicePath, ErasedEv, ErasedOutcome, LoweringCaps};
++		let scratch = tempfile::tempdir().expect("search state");
++		let root = scratch.path();
++		let ctx = Ctx::new();
++		let blobs = BlobHost::open(root.join("blobs")).expect("blob host");
++		let telemetry = Arc::new(
++			TelemetryIndex::open(&root.join("sessions"), &root.join("telemetry.sqlite3"))
++				.expect("telemetry"),
++		);
++		let github = Arc::new(
++			GithubCache::open(
++				root.join("github.sqlite3"),
++				crate::tool_settings::GithubCacheSettings::from_con(&ctx).policy(),
++			)
++			.expect("github cache"),
++		);
++		let search = Arc::new(SessionSearchProbe::default());
++		let mut registry = Registry::new();
++		register_session_base(
++			&mut registry,
++			Vec::new(),
++			Vec::new(),
++			Some(search.clone()),
++			None,
++			None,
++			None,
++			&blobs,
++			root,
++			root,
++			&telemetry,
++			github,
++			&ToolSettings::default(),
++			image_config(&ctx),
++			speech_config(&ctx),
++			ToolsPolicy::Auto,
++		)
++		.expect("session tools register");
++		assert_eq!(registry.locus("web_search").unwrap(), ToolLocus::Session);
++		assert_eq!(registry.presentation("web_search").unwrap(), Presentation::Slot);
++		assert!(!environment_tool_names(&registry).contains("web_search"));
++		assert!(!registry.devices().any(|device| device.name == "web_search"));
++		assert!(
++			registry
++				.resolve_device(&DevicePath::parse("web_search").unwrap())
++				.is_err()
++		);
++		// This is the explicit --tools selection seam used by Omperor.
++		let selected = registry.restrict(["web_search"]);
++		let caps = LoweringCaps {
++			strict_schema:  false,
++			grammar:        omp_catalog::GrammarBits::empty(),
++			maximum_tools:  None,
++			maximum_strict: None,
++		};
++		let advertised = selected
++			.advertise_selected(caps, &[sf!("web_search")])
++			.unwrap();
++		assert_eq!(advertised.len(), 1);
++		assert_eq!(advertised[0].definition.name, "web_search");
++		assert_eq!(selected.advertise(caps).unwrap().len(), 1);
++		let (feed, params) = IncomingParams::channel();
++		feed
++			.args_committed(Str::new_static(r#"{"query":"session routing","provider":"codex"}"#))
++			.expect("committed search args");
++		let mut stream = selected
++			.invoke("web_search", params)
++			.expect("native search");
++		let mut completed = false;
++		while let Some(event) = stream.next().await {
++			if let ErasedEv::Done(outcome) = event.expect("search event") {
++				let ErasedOutcome::Done { verdict, .. } = outcome else {
++					panic!("search must complete with a typed verdict")
++				};
++				let outcome: CallOutcome<omp_tools::web_search::Payload, omp_tools::web_search::Fault> =
++					serde_json::from_slice(&verdict).expect("search verdict");
++				let CallOutcome::Ok(payload) = outcome else {
++					panic!("the session-bound search backend must succeed")
++				};
++				assert_eq!(payload.response.engine, "session-bound-probe");
++				completed = true;
++			}
++		}
++		assert!(completed);
++		let requests = search.0.lock();
++		assert_eq!(requests.len(), 1);
++		assert_eq!(requests[0].engine, "codex");
++		assert_eq!(requests[0].query, "session routing");
++	}
++
+ 	static EVAL_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+ 
+ 	struct EvalEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+diff --git a/crates/serve/src/inference.rs b/crates/serve/src/inference.rs
+--- a/crates/serve/src/inference.rs
++++ b/crates/serve/src/inference.rs
+@@ -1365,6 +1365,9 @@
+ 		}
+ 		let provider_chain =
+ 			(!request.engine.is_empty()).then(|| configured_search_providers(request.engine.as_str()));
++		if let Some(providers) = &provider_chain {
++			validate_search_provider_chain(self.registry.catalog(), providers)?;
++		}
+ 		let provider = provider_chain
+ 			.as_ref()
+ 			.and_then(|providers| providers.first())
+@@ -2464,6 +2467,31 @@
+ 		negotiation: NegotiationPolicy::default(),
+ 		forced_call: None,
+ 	})
++}
++
++// Validate explicit selection before constructing a client or selecting
++// credentials. Use the same provider/route operation declarations as
++// model-less routing; an installed provider may still lack standalone search.
++fn validate_search_provider_chain(
++	catalog: &omp_catalog::snapshot::Catalog,
++	providers: &[ProviderId],
++) -> Result<(), Status> {
++	if providers.iter().any(|provider| {
++		catalog.provider(provider).is_some_and(|definition| {
++			definition.routes.iter().any(|route| {
++				catalog.route(route).is_some_and(|route| {
++					route.capability_limits.operations.map_or_else(
++						|| definition.management.supports(OperationKind::Search),
++						|operations| operations.contains_kind(OperationKind::Search),
++					)
++				})
++			})
++		})
++	}) {
++		Ok(())
++	} else {
++		Err(Status::unimplemented("selected search provider is unsupported by this backend"))
++	}
+ }
+ 
+ fn configured_search_providers(name: &str) -> Vec<ProviderId> {
+@@ -3924,6 +3952,21 @@
+ 	use super::*;
+ 
+ 	#[test]
++	fn search_provider_preflight_rejects_unimplemented_codex_without_account_selection() {
++		let catalog = snapshot::Catalog::embedded();
++		let providers = configured_search_providers("codex");
++		let error = validate_search_provider_chain(&catalog, &providers).unwrap_err();
++		assert_eq!(error.code(), tonic::Code::Unimplemented);
++		assert_eq!(error.message(), "selected search provider is unsupported by this backend");
++		assert!(
++			validate_search_provider_chain(&catalog, &[ProviderId::from("openai-codex")]).is_err()
++		);
++		assert!(
++			validate_search_provider_chain(&catalog, &configured_search_providers("public")).is_ok()
++		);
++	}
++
++	#[test]
+ 	fn items_project_to_exactly_one_message_each() {
+ 		// Context revisions (`Revision.head`, `truncate_to`, `provider_heads`)
+ 		// count items and index the retained message list by that head, so the
+diff --git a/crates/tools/src/web_search.rs b/crates/tools/src/web_search.rs
+--- a/crates/tools/src/web_search.rs
++++ b/crates/tools/src/web_search.rs
+@@ -245,8 +245,10 @@
+ 			name:            sf!("web_search"),
+ 			rev:             Rev { family: Default::default(), n: 2 },
+ 			description:     sf!(
+-				"Searches the web through configured providers. Supports Google-style query \
+-				 directives, ordered automatic fallback, or an explicit provider pin."
++				"Searches the web through the session inference backend. Call web_search directly; it \
++				 is not a bash dyn device. Supports Google-style query directives, ordered automatic \
++				 fallback, or an explicit provider pin. Automatic fallback may use a different \
++				 provider; select a provider explicitly when account scope matters."
+ 			),
+ 			schema:          omp_tool::schema::<Params>(),
+ 			constraint:      Constraint::Schema {
+diff --git a/justfile b/justfile
+--- a/justfile
++++ b/justfile
+@@ -347,3 +347,14 @@
+     cargo test --doc -p omp-tools --locked
+     cargo nextest run -p omp-envd --lib --locked --run-ignored all -E 'test(browser_daemon::tests::selector_errors_) | test(browser_daemon::tests::browser_guidance_) | test(browser_daemon::tests::runtime_lifts_)'
+     cargo test --doc -p omp-envd --locked
++
++# Session-bound search is advertised natively and reaches the owning inference bridge.
++[group('test')]
++test-omperor-native-search:
++    cargo nextest run -p omp-envd --lib --locked -E 'test(tools::tests::web_search_selection_) | test(search_backend::tests::)'
++    cargo test --doc -p omp-envd --locked
++    cargo nextest run -p omp-tools --lib --locked -E 'test(web_search::tests::)'
++    cargo test --doc -p omp-tools --locked
++    cargo check -p omp-driver --locked
++    cargo nextest run -p omp-serve --lib --locked -E 'test(inference::tests::search_provider_preflight_)'
++    cargo test --doc -p omp-serve --locked

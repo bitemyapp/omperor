@@ -1,0 +1,76 @@
+--- a/crates/core/src/document_io.rs
++++ b/crates/core/src/document_io.rs
+@@ -181,7 +181,7 @@
+         let _cleanup = RemoveOnDrop { path: &temporary, armed: true };
+         write_data_without_overwriting(data, &temporary)?;
+         Self::sync_temporary_to_stable_storage(&temporary)?;
+-        if renamex(&temporary, url, libc::RENAME_EXCL) != 0 {
++        if renamex(&temporary, url, RENAME_EXCL) != 0 {
+             return Err(Self::posix_rename_error(url));
+         }
+         Ok(())
+@@ -236,7 +236,7 @@
+         // generation at the document path.
+         Self::sync_temporary_to_stable_storage(&temporary)?;
+
+-        if renamex(&temporary, url, libc::RENAME_SWAP) != 0 {
++        if renamex(&temporary, url, RENAME_SWAP) != 0 {
+             return Err(Self::posix_rename_error(url));
+         }
+         if let Some(after_swap) = after_swap {
+@@ -258,7 +258,7 @@
+             }
+             // Swap, rather than replace, so a writer that landed after our
+             // first swap is retained at `temporary` instead of being erased.
+-            if renamex(&temporary, url, libc::RENAME_SWAP) != 0 {
++            if renamex(&temporary, url, RENAME_SWAP) != 0 {
+                 return Err(Self::posix_rename_error(url));
+             }
+             let post_swap_temporary = match fs::read(&temporary) {
+@@ -277,7 +277,7 @@
+                 // Another writer replaced our payload between the two swaps.
+                 // Put that newest external generation back at the public
+                 // path; both external generations travel in the error.
+-                if renamex(&temporary, url, libc::RENAME_SWAP) != 0 {
++                if renamex(&temporary, url, RENAME_SWAP) != 0 {
+                     return Err(Self::posix_rename_error(url));
+                 }
+                 cleanup.armed = true;
+@@ -306,6 +306,7 @@
+     fn sync_temporary_to_stable_storage(url: &Path) -> Result<(), DynError> {
+         let handle = File::open(url)?;
+         let fd = handle.as_raw_fd();
++        #[cfg(target_os = "macos")]
+         if unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) } == 0 {
+             return Ok(());
+         }
+@@ -753,14 +754,29 @@
+     }
+ }
+
++#[cfg(target_os = "macos")]
++const RENAME_EXCL: libc::c_uint = libc::RENAME_EXCL;
++#[cfg(target_os = "macos")]
++const RENAME_SWAP: libc::c_uint = libc::RENAME_SWAP;
++#[cfg(target_os = "linux")]
++const RENAME_EXCL: libc::c_uint = libc::RENAME_NOREPLACE;
++#[cfg(target_os = "linux")]
++const RENAME_SWAP: libc::c_uint = libc::RENAME_EXCHANGE;
++
+ fn renamex(from: &Path, to: &Path, flags: libc::c_uint) -> libc::c_int {
+     let (Ok(from), Ok(to)) =
+         (std::ffi::CString::new(from.as_os_str().as_bytes()), std::ffi::CString::new(to.as_os_str().as_bytes()))
+     else {
++        #[cfg(target_os = "macos")]
+         unsafe { *libc::__error() = libc::EINVAL };
++        #[cfg(target_os = "linux")]
++        unsafe { *libc::__errno_location() = libc::EINVAL };
+         return -1;
+     };
++    #[cfg(target_os = "macos")]
+     unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), flags) }
++    #[cfg(target_os = "linux")]
++    unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), flags) }
+ }
+
+ fn errno() -> i32 {

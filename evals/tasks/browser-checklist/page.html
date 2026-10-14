@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Omperor browser check</title>
+<style>
+body { font: 20px system-ui; margin: 40px }
+button, input { font: inherit; margin: 8px; padding: 8px }
+li { padding: 10px }
+</style>
+<h1>Release checklist</h1>
+<label>New task <input id="task"></label><button id="add">Add task</button>
+<ul id="tasks"><li>Review release notes <button id="complete">Complete</button></li></ul>
+<p id="count">1 open task</p>
+<script>
+async function save() {
+  const items = Array.from(document.querySelectorAll('li')).map(e => e.firstChild.textContent.trim());
+  document.querySelector('#count').textContent = items.length + ' open tasks';
+  await fetch('/state', { method: 'POST', body: JSON.stringify(items) });
+}
+document.querySelector('#complete').onclick = async event => {
+  event.target.parentNode.remove();
+  await save();
+};
+document.querySelector('#add').onclick = async () => {
+  const input = document.querySelector('#task');
+  if (!input.value.trim()) return;
+  const li = document.createElement('li');
+  li.append(document.createTextNode(input.value + ' '));
+  const button = document.createElement('button');
+  button.textContent = 'Complete';
+  button.onclick = async () => { li.remove(); await save(); };
+  li.append(button);
+  document.querySelector('#tasks').append(li);
+  input.value = '';
+  await save();
+};
+</script>

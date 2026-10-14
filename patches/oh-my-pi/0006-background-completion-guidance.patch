@@ -1,0 +1,152 @@
+diff --git a/crates/agent/src/dispatch.rs b/crates/agent/src/dispatch.rs
+--- a/crates/agent/src/dispatch.rs
++++ b/crates/agent/src/dispatch.rs
+@@ -2159,7 +2159,7 @@
+ 	fn detach(&self, session: &mut Session, call: &mut PreparedCall) -> Result<(), DispatchError> {
+ 		let job = timeout_job(&call.identity);
+ 		let outcome = detached_outcome(&job)?;
+-		let prompt = vec![Part::Text { text: sf!("detached job {}", job.id) }];
++		let prompt = vec![Part::Text { text: background_notice(&job.id) }];
+ 		let mut output = std::mem::take(call.output(&self.committer.policy));
+ 		// The stream keeps flowing into the element after detachment; the
+ 		// terminal below closes nothing that is still open.
+@@ -2602,7 +2602,7 @@
+ 					session,
+ 					call,
+ 					raw,
+-					vec![Part::Text { text: sf!("detached job {}", job.id) }],
++					vec![Part::Text { text: background_notice(&job.id) }],
+ 					false,
+ 					false,
+ 					None,
+@@ -3024,6 +3024,16 @@
+ 			.and_then(|args| serde_json::from_str::<serde_json::Value>(args.get()).ok())
+ 			.unwrap_or_else(|| serde_json::json!({})),
+ 	})
++}
++
++// Native dispatch owns foreground detachment, including shell calls. Put the
++// completion guidance here so it reaches the model on either detachment path.
++fn background_notice(job_id: &str) -> Str {
++	sf!(
++		"Backgrounded as job {job_id}; its output is injected into the conversation as a follow-up \
++		 when it finishes. Do NOT poll for it (no `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log \
++		 tailing). Do other work, or end your reply; completion will wake you with the output."
++	)
+ }
+ 
+ fn detached_outcome(job: &JobRef) -> Result<Box<RawValue>, serde_json::Error> {
+diff --git a/crates/agent/tests/dispatch.rs b/crates/agent/tests/dispatch.rs
+--- a/crates/agent/tests/dispatch.rs
++++ b/crates/agent/tests/dispatch.rs
+@@ -846,6 +846,11 @@
+ 	.expect("blocking limit detaches promptly")
+ 	.expect("detachment journals a terminal");
+ 	let detached = report.detached.expect("call returns a job reference");
++	let notice = result_text(&session, "detached-1").join("");
++	assert!(notice.contains(detached.id.as_str()));
++	assert!(notice.contains("Do NOT poll"));
++	assert!(notice.contains("end your reply"));
++	assert!(notice.contains("completion will wake you"));
+ 	let jobs = dispatcher.jobs().list();
+ 	assert_eq!(jobs.len(), 1);
+ 	assert_eq!(jobs[0].id, detached.id);
+diff --git a/crates/driver/src/efficiency.rs b/crates/driver/src/efficiency.rs
+--- a/crates/driver/src/efficiency.rs
++++ b/crates/driver/src/efficiency.rs
+@@ -23,10 +23,12 @@
+ 		 across all agents; each worker has 40 calls plus a final handoff. Batch independent reads \
+ 		 and shell work. Keep tool output and coordination concise. Delegate only concrete \
+ 		 independent work; avoid overlapping assignments. Workers cannot delegate further. Read the \
+-		 actual working directory before editing. Use hub wait with timeoutMs 30000 or longer; \
+-		 completion messages wake it early. Consolidate peer messages and drain the inbox in \
+-		 batches. Do not repeatedly read unchanged files or poll statuses. Respect the shared task \
+-		 allowance; give a concise handoff when work cannot fit.";
++		 actual working directory before editing. Owned background jobs and workers deliver results \
++		 automatically: do other work or end your reply and completion will wake you. Do not poll \
++		 with sleep, process checks, or repeated log reads. Use hub wait only for explicit \
++		 coordination, with timeoutMs 30000 or longer. Consolidate peer messages and drain the \
++		 inbox in batches. Do not repeatedly read unchanged files or poll statuses. Respect the \
++		 shared task allowance; give a concise handoff when work cannot fit.";
+ 	let existing = prompt.append_prompt.take().unwrap_or_default();
+ 	prompt.append_prompt = Some(omp_core::sf!("{existing}\n\n{GUIDANCE}"));
+ 	Ok(())
+diff --git a/crates/tools/src/auto_background.rs b/crates/tools/src/auto_background.rs
+--- a/crates/tools/src/auto_background.rs
++++ b/crates/tools/src/auto_background.rs
+@@ -80,7 +80,11 @@
+ 
+ /// Formats the model-facing notice for a newly detached job.
+ pub fn format_background_notice(job_id: &str) -> Str {
+-	sf!("Backgrounded as job {job_id}; result will be delivered automatically.")
++	sf!(
++		"Backgrounded as job {job_id}; its output is injected into the conversation as a follow-up \
++		 when it finishes. Do NOT poll for it (no `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log \
++		 tailing). Do other work, or end your reply; completion will wake you with the output."
++	)
+ }
+ 
+ /// Allocates the next stable managed-job name for one tool instance.
+@@ -197,9 +201,10 @@
+ 
+ 	#[test]
+ 	fn notice_names_automatic_delivery() {
+-		assert_eq!(
+-			format_background_notice("eval-bg-7"),
+-			"Backgrounded as job eval-bg-7; result will be delivered automatically.",
+-		);
+-	}
+-}
++		let notice = format_background_notice("eval-bg-7");
++		assert!(notice.contains("Backgrounded as job eval-bg-7"));
++		assert!(notice.contains("follow-up"));
++		assert!(notice.contains("Do NOT poll"));
++		assert!(notice.contains("end your reply"));
++	}
++}
+diff --git a/crates/tools/src/shell.rs b/crates/tools/src/shell.rs
+--- a/crates/tools/src/shell.rs
++++ b/crates/tools/src/shell.rs
+@@ -424,8 +424,11 @@
+ 		let mut description = String::from(
+ 			"Execute a shell script in a persistent session, or allocate an asynchronous managed \
+ 			 job. Eligible long-running calls may auto-background at the configured foreground \
+-			 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
+-			 `timeout` is measured in seconds and does not extend foreground waiting.",
++			 threshold; its result arrives automatically as a follow-up when it finishes. NEVER poll \
++			 a backgrounded job with `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log tailing. Do \
++			 other work or end your reply; completion will wake you with the output. `timeout: 0` \
++			 disables the command deadline; otherwise `timeout` is measured in seconds and does not \
++			 extend foreground waiting.",
+ 		);
+ 		let _ = write!(
+ 			description,
+@@ -527,8 +530,11 @@
+ 		spec_described(sf!(
+ 			"Execute a shell script in a persistent session, or allocate an asynchronous managed \
+ 			 job. Eligible long-running calls may auto-background at the configured foreground \
+-			 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
+-			 `timeout` is measured in seconds and does not extend foreground waiting.",
++			 threshold; its result arrives automatically as a follow-up when it finishes. NEVER poll \
++			 a backgrounded job with `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log tailing. Do \
++			 other work or end your reply; completion will wake you with the output. `timeout: 0` \
++			 disables the command deadline; otherwise `timeout` is measured in seconds and does not \
++			 extend foreground waiting.",
+ 		)),
+ 	)
+ }
+diff --git a/justfile b/justfile
+--- a/justfile
++++ b/justfile
+@@ -288,3 +288,11 @@
+     cargo nextest run -p omp-session --test projection --locked
+     cargo nextest run -p omp-ai --lib --locked -E 'test(workflow_action_uses_the_live_response_sink_and_resumes_the_same_stream)'
+     cargo test --doc -p omp-agent -p omp-driver -p omp-session -p omp-ai --locked
++
++# Upstream anti-poll guidance and native automatic-delivery regressions; no live inference.
++[group('test')]
++test-omperor-background:
++    cargo nextest run -p omp-tools --lib --locked -E 'test(auto_background::) | test(shell::tests::)'
++    cargo nextest run -p omp-agent --test dispatch --test turn --test jobs --locked -E 'test(dispatch_timed_out_call) | test(an_adopted_job_survives) | test(settled_background_job) | binary(jobs)'
++    cargo nextest run -p omp-driver --lib --locked -E 'test(efficiency::)'
++    cargo test --doc -p omp-tools -p omp-agent -p omp-driver --locked

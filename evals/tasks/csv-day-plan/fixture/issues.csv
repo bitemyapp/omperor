@@ -1,0 +1,7 @@
+id,area,priority,status,hours
+A1,Desktop,P1,open,3
+A2,Browser,P1,open,5
+A3,Desktop,P2,done,2
+A4,Inference,P1,open,4
+A5,Inference,P2,open,2
+A6,Browser,P2,done,1

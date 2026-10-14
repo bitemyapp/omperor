@@ -1,0 +1,7 @@
+date,client,project,duration,description
+2024-09-03,Northwind,Website,90,Discovery workshop
+2024-09-05,Northwind,Website,2.5h,Information architecture
+2024-09-10,Contoso,Audit,45m,Policy review
+2024-09-12,Northwind,Support,30m,DNS cutover support
+2024-09-19,Northwind,Website,1.25h,Design review
+2024-09-26,Northwind,Website,75,Stakeholder demo

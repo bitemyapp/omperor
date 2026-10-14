@@ -1,0 +1,35 @@
+description = "SQLite + Python: write a weekly CSV sales report with time-zone week boundaries across DST, refund rules and gap weeks; graded on a hidden export too."
+tags = ["coding", "python", "sql", "data"]
+timeout_secs = 900
+prompt = """Finance wants a weekly sales summary from the shop database. The current export is `shop.db` here \
+(SQLite; the schema and the data it was built from are in `db/`). Please write `report.py` so that \
+`python3 report.py PATH_TO_DB` prints the summary as CSV on stdout. Their rules:
+
+- Weeks run from Monday 00:00 to Sunday 23:59:59 New York time (America/New_York, so daylight saving \
+applies). Timestamps in the database are UTC. An order belongs to the week it was created in.
+- Only `paid` orders count, and orders from internal test accounts (`customers.is_test = 1`) never count.
+- If an order's refunds add up to its full total or more, leave that order out completely. Partially \
+refunded orders stay in, and their refunded amount is subtracted in the order's week, even when the refund \
+itself happened later.
+- Columns, with exactly this header: `week_start,orders,customers,gross,refunds,net`. That's the Monday's \
+date as YYYY-MM-DD, the number of orders, the number of distinct customers, the total of those orders, the \
+amount refunded on them, and gross minus refunds. Money in dollars with exactly two decimals (`1234.50`), no \
+currency symbol or thousands separators.
+- One row per week from the first to the last week that has a counted order, oldest first, including weeks \
+in between with nothing in them (all zeros).
+
+It has to work on other exports with the same schema, not just this one. Standard library only, don't \
+modify the database, and don't commit."""
+
+[workspace]
+# shop.db is built from the committed SQL so no binary is checked in; it
+# becomes part of the baseline commit.
+setup = [[
+    "python3", "-c",
+    "import sqlite3; c = sqlite3.connect('shop.db'); c.executescript(open('db/schema.sql').read() + open('db/seed.sql').read()); c.commit(); c.close()",
+]]
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 120

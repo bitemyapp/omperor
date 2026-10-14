@@ -1,0 +1,48 @@
+diff --git a/crates/app/src/rpc_mode.rs b/crates/app/src/rpc_mode.rs
+index 6edb270697..1bc9f41075 100644
+--- a/crates/app/src/rpc_mode.rs
++++ b/crates/app/src/rpc_mode.rs
+@@ -2411,7 +2411,12 @@ where
+ 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+ 							},
+ 							"interrupt" | "abort" => {
+-								let _ = mailbox.send(Up::Interrupt);
++								// With no turn running there is nothing to stop; an
++								// interrupt left in the mailbox would instead cancel the
++								// next prompt at its first request.
++								if turn_running {
++									let _ = mailbox.send(Up::Interrupt);
++								}
+ 								let response = RpcResponse::success_empty(id, command.as_str());
+ 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+ 							},
+diff --git a/crates/app/tests/rpc_spine.rs b/crates/app/tests/rpc_spine.rs
+index f5b17982db..d23a36db42 100755
+--- a/crates/app/tests/rpc_spine.rs
++++ b/crates/app/tests/rpc_spine.rs
+@@ -355,6 +355,25 @@ async fn rpc_abort_and_prompt_interrupts_then_starts_the_new_turn() {
+ 	assert_eq!(ends[1]["cancelled"], false);
+ }
+ 
++/// An abort with no turn running has nothing to interrupt. It must not stay
++/// queued in the kernel's mailbox and cancel the next prompt.
++#[tokio::test]
++async fn rpc_abort_while_idle_does_not_cancel_the_next_prompt() {
++	let temp = tempfile::tempdir().expect("tempdir");
++	let frames = converse(
++		&temp,
++		VecDeque::from([completed_script("pong")]),
++		"{\"id\":\"stop\",\"type\":\"abort\"}\n{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"ping\"}\n",
++		&["{\"id\":\"quit\",\"type\":\"quit\"}\n"],
++	)
++	.await;
++	assert_eq!(response(&frames, "stop")["success"], true);
++	let ends = agent_ends(&frames);
++	assert_eq!(ends.len(), 1, "{frames:#?}");
++	assert_eq!(ends[0]["cancelled"], false, "{frames:#?}");
++	assert_eq!(ends[0]["text"], "pong");
++}
++
+ /// `get_state` works while streaming; the actor's replica serves the
+ /// tree even though the running turn owns the session.
+ #[tokio::test]

@@ -1,0 +1,42 @@
+diff --git a/crates/driver/src/headless/kernel.rs b/crates/driver/src/headless/kernel.rs
+index 46e13303c6..beacc576ac 100644
+--- a/crates/driver/src/headless/kernel.rs
++++ b/crates/driver/src/headless/kernel.rs
+@@ -1883,7 +1883,7 @@ pub async fn compose_kernel(
+ 			contributed_values: options.extensions.contributed.clone(),
+ 			con: Arc::clone(&ctx),
+ 			bridges,
+-			spawn_idle_timeout: options.spawn_idle_timeout,
++			spawn_idle_timeout: isolated_daemon_idle_timeout(&project_root, options.spawn_idle_timeout),
+ 		})
+ 		.await?;
+ 	let admission_gate = environment.admission_gate();
+@@ -2938,8 +2938,28 @@ fn install_prompt_facts(
+ 	Ok(())
+ }
+ 
++/// The idle timeout for the environment daemon a kernel attaches to. A child
++/// kernel on an isolated copy of the workspace inherits no host options, so
++/// its daemon was spawned with none and outlived the child, its copy, and the
++/// host process. A daemon for an isolated root exits as soon as nothing is
++/// attached to it.
++fn isolated_daemon_idle_timeout(project_root: &Path, configured: Option<u64>) -> Option<u64> {
++	configured.or_else(|| project_root.join(omp_walker::ISOLATION_ROOT_MARKER).is_file().then_some(1))
++}
++
+ #[cfg(test)]
+ mod tests {
++
++	#[test]
++	fn a_daemon_for_an_isolated_copy_exits_once_idle() {
++		let directory = tempfile::tempdir().expect("tempdir");
++		assert_eq!(super::isolated_daemon_idle_timeout(directory.path(), None), None);
++		assert_eq!(super::isolated_daemon_idle_timeout(directory.path(), Some(30)), Some(30));
++		std::fs::write(directory.path().join(omp_walker::ISOLATION_ROOT_MARKER), "{}").expect("marker");
++		assert_eq!(super::isolated_daemon_idle_timeout(directory.path(), None), Some(1));
++		assert_eq!(super::isolated_daemon_idle_timeout(directory.path(), Some(30)), Some(30));
++	}
++
+ 	use std::sync::Arc;
+ 
+ 	use omp_ai::{

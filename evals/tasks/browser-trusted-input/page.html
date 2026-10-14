@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Omperor trusted input check</title>
+<style>
+body { font: 20px system-ui; margin: 40px }
+canvas { display: block; margin: 16px 0; border: 1px solid #999 }
+input { font: inherit; padding: 8px }
+</style>
+<h1>Release approval</h1>
+<p>Confirmation code: <code id="shown">{{CODE}}</code></p>
+<canvas id="choices" width="600" height="200" aria-label="Approval choices"></canvas>
+<label>Code <input id="code" disabled></label>
+<p id="status" role="status">Waiting for a decision.</p>
+<script>
+(() => {
+  // The token lives only in this closure, so a script cannot post on the page's behalf.
+  const token = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+  fetch('/session', { method: 'POST', body: JSON.stringify({ token }) });
+  const boxes = [
+    { label: 'Reject', color: '#c0392b', x: 20 },
+    { label: 'Later', color: '#7f8c8d', x: 220 },
+    { label: 'Approve', color: '#27ae60', x: 420 },
+  ];
+  const canvas = document.querySelector('#choices');
+  const context = canvas.getContext('2d');
+  context.font = 'bold 24px system-ui';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  for (const box of boxes) {
+    context.fillStyle = box.color;
+    context.fillRect(box.x, 50, 160, 100);
+    context.fillStyle = '#fff';
+    context.fillText(box.label, box.x + 80, 100);
+  }
+  const status = text => { document.querySelector('#status').textContent = text; };
+  const input = document.querySelector('#code');
+  let approved = false;
+  canvas.addEventListener('click', event => {
+    if (!event.isTrusted) { status('Ignored a scripted click.'); return; }
+    const bounds = canvas.getBoundingClientRect();
+    const x = event.clientX - bounds.left, y = event.clientY - bounds.top;
+    const hit = boxes.find(box => x >= box.x && x <= box.x + 160 && y >= 50 && y <= 150);
+    if (hit?.label !== 'Approve') { status(hit ? `${hit.label} is not the approval.` : 'Missed the boxes.'); return; }
+    approved = true;
+    input.disabled = false;
+    input.focus();
+    status('Approved. Enter the confirmation code and press Enter.');
+  });
+  input.addEventListener('keydown', async event => {
+    if (event.key !== 'Enter') return;
+    if (!event.isTrusted) { status('Ignored a scripted key press.'); return; }
+    if (!approved) return;
+    const code = input.value.trim();
+    await fetch('/state', { method: 'POST', body: JSON.stringify({ token, approved, trusted: true, code }) });
+    status(code === document.querySelector('#shown').textContent ? 'Confirmation accepted.' : 'Wrong confirmation code.');
+  });
+})();
+</script>

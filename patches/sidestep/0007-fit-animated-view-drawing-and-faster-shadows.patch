@@ -1,0 +1,1113 @@
+From b6b8984fbf091b455d1fdaf4ae7834cf8bc6a4fc Mon Sep 17 00:00:00 2001
+From: Chris Allen <cma@bitemyapp.com>
+Date: Fri, 2 Oct 2026 22:39:02 -0500
+Subject: [PATCH] Animate view drawing in its presented bounds, and draw soft
+ shadows faster
+
+A view-backed layer's drawing showed at the rect it was drawn for, the
+model's bounds, whatever bounds the layer presented. While an animation
+changed a view's frame (through animator), its new drawing showed whole
+from the animated origin: a sliver meant to sweep a segment showed full
+width at once, past the top of what held it, and since frame damage
+follows the presented bounds, what it drew outside them stayed on
+screen as a trail. A canvas now shows in the presented bounds, placed by
+the layer's gravity as an image of the bounds it was drawn for would be,
+so it resizes with the layer as AppKit's drawing does.
+
+A group's shadow was worked out over its whole clip (a window's worth
+for a composited layer tree) though it reaches only as far as what the
+group draws, moved by the offset and spread by the blur; that is all it
+covers now, inside the clip, here and when sizing an enclosing group.
+The coverage of a group's shadow is its layer's alpha, taken as it is
+rather than drawn again. The box blurs run down columns a row at a time,
+with each mean an exact multiply rather than a division. An image whose
+pixels land one to one on whole device pixels, as a view's drawing
+composited where it was drawn does, is sampled without filtering. Each
+change leaves the same pixels: switching an application's surfaces, which
+redrew a window with a lifted card in it, went from about 200 ms of
+rasterizing to about 25.
+
+The null render thread can show windows at a scale other than 1
+(testing::use_null_backend_scale), so captured pixels test 2x drawing;
+testing::request_composite_at asks for a frame without waiting, for code
+that can't run the loop. A test drives a segmented switch's press and
+release at 1x and 2x and fails on any trail; others check that a group's
+shadow doesn't depend on its clip and costs what it covers, and that the
+blur is the exact mean. SIDESTEP_TRACE_FRAMES=tiles also reports the
+window surface's damage and the slowest operations of slow paints.
+
+Signed-off-by: Chris Allen <cma@bitemyapp.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/sidestep-appkit/src/backend/mod.rs     |   6 +-
+ crates/sidestep-appkit/src/backend/null.rs    |  26 +-
+ crates/sidestep-appkit/src/layers.rs          |  14 +-
+ .../sidestep-appkit/src/quartzcore/render.rs  |  14 ++
+ crates/sidestep-appkit/src/quartzcore/tree.rs |   6 +-
+ crates/sidestep-appkit/src/raster.rs          |  72 ++++++
+ crates/sidestep-appkit/src/raster/effects.rs  | 227 ++++++++++++++----
+ crates/sidestep-appkit/src/raster/images.rs   |  18 ++
+ crates/sidestep-appkit/src/raster/ops.rs      | 172 ++++++++++++-
+ crates/sidestep-appkit/src/testing.rs         |  20 +-
+ crates/sidestep-appkit/tests/linux_layers.rs  | 160 ++++++++++++
+ docs/architecture.md                          |  27 ++-
+ 12 files changed, 689 insertions(+), 73 deletions(-)
+
+diff --git a/crates/sidestep-appkit/src/backend/mod.rs b/crates/sidestep-appkit/src/backend/mod.rs
+index de96e46..b16ae15 100644
+--- a/crates/sidestep-appkit/src/backend/mod.rs
++++ b/crates/sidestep-appkit/src/backend/mod.rs
+@@ -961,7 +961,11 @@ impl State {
+         }
+         let scale = win.scale;
+         let mut canvas = Canvas::new(&mut win.canvas, win.px_width, win.px_height, 0.0, scale as f32);
+-        raster::paint(&mut canvas, &mut self.glyphs, &rects, &ops);
++        if crate::layers::tracing_tiles() {
++            raster::paint_timed(&mut canvas, &mut self.glyphs, &rects, &ops, window);
++        } else {
++            raster::paint(&mut canvas, &mut self.glyphs, &rects, &ops);
++        }
+         win.damage.extend(rects.iter().map(|r| to_px(r, scale)));
+     }
+ 
+diff --git a/crates/sidestep-appkit/src/backend/null.rs b/crates/sidestep-appkit/src/backend/null.rs
+index 9a604a3..70e2776 100644
+--- a/crates/sidestep-appkit/src/backend/null.rs
++++ b/crates/sidestep-appkit/src/backend/null.rs
+@@ -63,6 +63,21 @@ pub(crate) static PIXELS: Mutex<Option<HashMap<WindowId, Captured>>> = Mutex::ne
+ /// A window's captured width, height and pixels.
+ pub(crate) type Captured = (u32, u32, Vec<u32>);
+ 
++/// The scale this render thread tells windows they show at (1 unless a
++/// test asks for another, `testing::use_null_backend_scale`): what the main
++/// thread draws at, and the captured pixels' scale.
++pub(crate) static SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
++
++fn scale() -> u32 {
++    SCALE.load(Ordering::Relaxed).max(1)
++}
++
++/// Captured pixels for a window `width` × `height` points.
++fn captured(width: u32, height: u32) -> Captured {
++    let (w, h) = (width * scale(), height * scale());
++    (w, h, vec![0; w as usize * h as usize])
++}
++
+ fn with_ca<R>(f: impl FnOnce(&mut crate::quartzcore::tree::Compositor) -> R) -> R {
+     let mut ca = CA.lock().unwrap_or_else(|e| e.into_inner());
+     f(ca.get_or_insert_with(Default::default))
+@@ -73,7 +88,7 @@ fn capture(window: WindowId, rects: &[crate::protocol::Rect], ops: &[Op], glyphs
+     let mut pixels = PIXELS.lock().unwrap_or_else(|e| e.into_inner());
+     let Some(all) = pixels.as_mut() else { return };
+     let Some((w, h, px)) = all.get_mut(&window) else { return };
+-    let mut canvas = crate::raster::Canvas::new(px, *w, *h, 0.0, 1.0);
++    let mut canvas = crate::raster::Canvas::new(px, *w, *h, 0.0, scale() as f32);
+     crate::raster::paint(&mut canvas, glyphs, rects, ops);
+ }
+ 
+@@ -134,7 +149,7 @@ fn run(channel: Channel<ToRender>, to_main: MainSender) {
+         window,
+         width: win.width,
+         height: win.height,
+-        scale: 1.0,
++        scale: f64::from(scale()),
+         titlebar: win.bar,
+         state: win.state,
+     };
+@@ -154,7 +169,7 @@ fn run(channel: Channel<ToRender>, to_main: MainSender) {
+         match msg {
+             ToRender::CreateWindow { window, width, height, popup, sheet_of, .. } => {
+                 if let Some(all) = PIXELS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+-                    all.insert(window, (width, height, vec![0; width as usize * height as usize]));
++                    all.insert(window, captured(width, height));
+                 }
+                 let win = Win { width, height, state: WindowState::default(), bar: 0 };
+                 send(configure(window, &win));
+@@ -198,10 +213,7 @@ fn run(channel: Channel<ToRender>, to_main: MainSender) {
+                     WindowRequest::Resize(w, h) => {
+                         (win.width, win.height) = (w.max(1), h.max(1));
+                         if let Some(all) = PIXELS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+-                            all.insert(
+-                                window,
+-                                (win.width, win.height, vec![0; win.width as usize * win.height as usize]),
+-                            );
++                            all.insert(window, captured(win.width, win.height));
+                         }
+                         send(configure(window, win));
+                     }
+diff --git a/crates/sidestep-appkit/src/layers.rs b/crates/sidestep-appkit/src/layers.rs
+index f21c266..8054b72 100644
+--- a/crates/sidestep-appkit/src/layers.rs
++++ b/crates/sidestep-appkit/src/layers.rs
+@@ -957,7 +957,19 @@ fn draw_root(window: &NSWindowImpl, damage: &[Rect], scale: f64, ring: Option<&N
+     let base = Xf { tx: 0.0, a: -1.0, ty: height };
+     let size = window.content_size();
+     let all = Rect::new(0.0, 0.0, size.width as f32, size.height as f32);
+-    for area in coalesce(damage.to_vec()) {
++    let areas = coalesce(damage.to_vec());
++    if tracing_tiles() {
++        let size = |r: &Rect| f64::from((r.x1 - r.x0) * (r.y1 - r.y0));
++        eprintln!(
++            "sidestep @{:.1} ms window damage: {} rects, {:.0} points squared, drawn as {} areas, {:.0} points squared",
++            trace_ms(),
++            damage.len(),
++            damage.iter().map(size).sum::<f64>(),
++            areas.len(),
++            areas.iter().map(size).sum::<f64>()
++        );
++    }
++    for area in areas {
+         crate::context::begin_recording(base, scale);
+         graphics::push(Op::Fill { rect: area, color });
+         if let Some(content) = &content {
+diff --git a/crates/sidestep-appkit/src/quartzcore/render.rs b/crates/sidestep-appkit/src/quartzcore/render.rs
+index 6bd86d8..0324099 100644
+--- a/crates/sidestep-appkit/src/quartzcore/render.rs
++++ b/crates/sidestep-appkit/src/quartzcore/render.rs
+@@ -428,6 +428,20 @@ fn shadow_of(p: &Props, parent: &[f64; 6]) -> Option<Arc<ShadowSpec>> {
+ /// way it shows (so `top` is the far y end even in a flipped layer, as
+ /// measured: the layer's `contentsAreFlipped` turns the contents over, not
+ /// their place).
++/// Where a view's canvas, drawn for `rect` of the layer's bounds when they
++/// were `drawn_for`, shows in the bounds the layer presents now, `bounds`:
++/// the canvas is the layer's contents, placed by its gravity as an image
++/// of the bounds it was drawn for would be (by default resized with them,
++/// as a view's layer shows while an animation changes its frame).
++pub(crate) fn fit_canvas(rect: [f64; 4], drawn_for: [f64; 4], bounds: [f64; 4], gravity: Gravity) -> [f64; 4] {
++    if drawn_for == bounds || drawn_for[2] <= 0.0 || drawn_for[3] <= 0.0 {
++        return rect;
++    }
++    let [dx, dy, dw, dh] = place(gravity, bounds, [drawn_for[2], drawn_for[3]]);
++    let (sx, sy) = (dw / drawn_for[2], dh / drawn_for[3]);
++    [dx + (rect[0] - drawn_for[0]) * sx, dy + (rect[1] - drawn_for[1]) * sy, rect[2] * sx, rect[3] * sy]
++}
++
+ fn place(gravity: Gravity, bounds: [f64; 4], size: [f64; 2]) -> [f64; 4] {
+     let [x, y, w, h] = bounds;
+     let [iw, ih] = size;
+diff --git a/crates/sidestep-appkit/src/quartzcore/tree.rs b/crates/sidestep-appkit/src/quartzcore/tree.rs
+index e2ad1c1..3da1e62 100644
+--- a/crates/sidestep-appkit/src/quartzcore/tree.rs
++++ b/crates/sidestep-appkit/src/quartzcore/tree.rs
+@@ -539,7 +539,11 @@ impl Compositor {
+         let content = match &l.content {
+             Content::None => NodeContent::None,
+             Content::Image(image, size) => NodeContent::Image { image: image.clone(), size: *size },
+-            Content::Canvas(c) => NodeContent::Canvas { image: c.image(), rect: c.rect },
++            // Drawn for the model's bounds; shown in the presented ones.
++            Content::Canvas(c) => NodeContent::Canvas {
++                image: c.image(),
++                rect: super::render::fit_canvas(c.rect, l.props.bounds, props.bounds, props.gravity),
++            },
+         };
+         let children = l
+             .sublayers
+diff --git a/crates/sidestep-appkit/src/raster.rs b/crates/sidestep-appkit/src/raster.rs
+index e86d75b..3095633 100644
+--- a/crates/sidestep-appkit/src/raster.rs
++++ b/crates/sidestep-appkit/src/raster.rs
+@@ -155,6 +155,78 @@ pub(crate) fn paint(canvas: &mut Canvas, glyphs: &mut Glyphs, rects: &[Rect], op
+     }
+ }
+ 
++/// `paint`, timing each op (a group as one) for `SIDESTEP_TRACE_FRAMES=tiles`:
++/// a slow paint names the ops that made it slow.
++pub(crate) fn paint_timed(canvas: &mut Canvas, glyphs: &mut Glyphs, rects: &[Rect], ops: &[Op], window: u32) {
++    let started = std::time::Instant::now();
++    let mut slow: Vec<(f64, String)> = Vec::new();
++    for rect in rects {
++        let mut i = 0;
++        while i < ops.len() {
++            let mut end = i + 1;
++            if matches!(ops[i], Op::BeginGroup { .. }) {
++                let mut depth = 0;
++                for (j, op) in ops[i..].iter().enumerate() {
++                    match op {
++                        Op::BeginGroup { .. } => depth += 1,
++                        Op::EndGroup => depth -= 1,
++                        _ => {}
++                    }
++                    if depth == 0 {
++                        end = i + j + 1;
++                        break;
++                    }
++                }
++            }
++            let t = std::time::Instant::now();
++            ops::run(canvas, glyphs, rect, &ops[i..end]);
++            let ms = t.elapsed().as_secs_f64() * 1000.0;
++            if ms > 0.5 {
++                slow.push((ms, describe(&ops[i], end - i)));
++            }
++            i = end;
++        }
++    }
++    let total = started.elapsed().as_secs_f64() * 1000.0;
++    if total > 4.0 {
++        slow.sort_by(|a, b| b.0.total_cmp(&a.0));
++        eprintln!(
++            "sidestep @{:.1} ms window paint: window {window} {total:.2} ms, {} ops over {:?}",
++            crate::layers::trace_ms(),
++            ops.len(),
++            rects
++        );
++        for (ms, what) in slow.iter().take(8) {
++            eprintln!("    {ms:7.2} ms  {what}");
++        }
++    }
++}
++
++fn describe(op: &Op, count: usize) -> String {
++    let shadow = |d: &crate::protocol::Draw| if d.shadow.is_some() { " with a shadow" } else { "" };
++    match op {
++        Op::Fill { rect, .. } => format!("fill {rect:?}"),
++        Op::FillWith { rect, blend, .. } => format!("fill {blend:?} {rect:?}"),
++        Op::FillPath { path, draw, paint, .. } => format!(
++            "path fill {:?}{} {}, clip {:?}",
++            path.bounds(),
++            shadow(draw),
++            if matches!(paint, crate::protocol::Paint::Gradient(_)) { "gradient" } else { "solid" },
++            draw.clip
++        ),
++        Op::StrokePath { path, draw, .. } => {
++            format!("path stroke {:?}{}, clip {:?}", path.bounds(), shadow(draw), draw.clip)
++        }
++        Op::Image { dst, src, draw, .. } => format!("image {src:?} into {dst:?}{}, clip {:?}", shadow(draw), draw.clip),
++        Op::BeginGroup { alpha, draw } => {
++            format!("group of {count} ops, alpha {alpha}{}, clip {:?}", shadow(draw), draw.clip)
++        }
++        Op::EndGroup => "end group".into(),
++        Op::Glyphs(run) => format!("glyphs at ({}, {})", run.x, run.y),
++        Op::Composite(_) => "composite".into(),
++    }
++}
++
+ /// A rectangle filled over what's there.
+ pub(crate) fn fill(canvas: &mut Canvas, r: &Rect, color: Color) {
+     let a = (color[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+diff --git a/crates/sidestep-appkit/src/raster/effects.rs b/crates/sidestep-appkit/src/raster/effects.rs
+index 3013193..1378f02 100644
+--- a/crates/sidestep-appkit/src/raster/effects.rs
++++ b/crates/sidestep-appkit/src/raster/effects.rs
+@@ -15,17 +15,18 @@
+ 
+ use std::cell::RefCell;
+ 
+-use tiny_skia::{Mask, PixmapMut, Transform};
++use tiny_skia::{Mask, PixmapMut, PixmapRef, Transform};
+ 
+ use crate::protocol::{GradientSpec, ShadowSpec};
+ 
+-/// A thread's shadow buffers, reused: the coverage, its alpha, and a
+-/// spare for the blur.
++/// A thread's shadow buffers, reused: the coverage, its alpha, a spare
++/// for the blur, and its columns' running sums.
+ #[derive(Default)]
+ struct Scratch {
+     cover: Vec<u32>,
+     alpha: Vec<u8>,
+     tmp: Vec<u8>,
++    sums: Vec<u32>,
+ }
+ 
+ thread_local!(static SCRATCH: RefCell<Scratch> = RefCell::default());
+@@ -51,35 +52,65 @@ fn boxes(sigma: f32) -> [usize; 3] {
+     [0, 1, 2].map(|i| if i < m { lower } else { upper })
+ }
+ 
+-/// Blur `a` (`w` × `h` coverage) in place with a box of `size` pixels,
+-/// along rows, then along columns.
+-fn box_blur(a: &mut [u8], tmp: &mut Vec<u8>, w: usize, h: usize, size: usize) {
+-    if size <= 1 {
++/// Blur `a` (`w` × `h` coverage) in place with a box of `size` pixels (odd),
++/// along rows, then along columns: each pixel the rounded mean of the
++/// `size` around it, zeros outside. The columns go a row at a time with a
++/// running sum per column, so both passes read memory in order.
++fn box_blur(a: &mut [u8], tmp: &mut Vec<u8>, sums: &mut Vec<u32>, w: usize, h: usize, size: usize) {
++    if size <= 1 || w == 0 || h == 0 {
+         return;
+     }
+     let r = size / 2;
++    let mean = Mean::new(size as u32);
+     tmp.clear();
+     tmp.resize(a.len(), 0);
+-    let pass = |src: &[u8], dst: &mut [u8], len: usize, lines: usize, at: &dyn Fn(usize, usize) -> usize| {
+-        for line in 0..lines {
+-            let mut sum: u32 = 0;
+-            // The window [i - r, i + r], zeros outside.
+-            for i in 0..=r.min(len - 1) {
+-                sum += u32::from(src[at(line, i)]);
++    for (src, dst) in a.chunks_exact(w).zip(tmp.chunks_exact_mut(w)) {
++        let mut sum: u32 = src[..=r.min(w - 1)].iter().map(|&v| u32::from(v)).sum();
++        for (i, out) in dst.iter_mut().enumerate() {
++            *out = mean.of(sum);
++            if i + r + 1 < w {
++                sum += u32::from(src[i + r + 1]);
+             }
+-            for i in 0..len {
+-                dst[at(line, i)] = ((sum + size as u32 / 2) / size as u32) as u8;
+-                if i + r + 1 < len {
+-                    sum += u32::from(src[at(line, i + r + 1)]);
+-                }
+-                if i >= r {
+-                    sum -= u32::from(src[at(line, i - r)]);
+-                }
++            if i >= r {
++                sum -= u32::from(src[i - r]);
+             }
+         }
+-    };
+-    pass(a, tmp, w, h, &|line, i| line * w + i);
+-    pass(tmp, a, h, w, &|line, i| i * w + line);
++    }
++    sums.clear();
++    sums.resize(w, 0);
++    for row in tmp.chunks_exact(w).take(r + 1) {
++        sums.iter_mut().zip(row).for_each(|(s, &v)| *s += u32::from(v));
++    }
++    for y in 0..h {
++        a[y * w..(y + 1) * w].iter_mut().zip(sums.iter()).for_each(|(out, &s)| *out = mean.of(s));
++        if y + r + 1 < h {
++            sums.iter_mut().zip(&tmp[(y + r + 1) * w..(y + r + 2) * w]).for_each(|(s, &v)| *s += u32::from(v));
++        }
++        if y >= r {
++            sums.iter_mut().zip(&tmp[(y - r) * w..(y - r + 1) * w]).for_each(|(s, &v)| *s -= u32::from(v));
++        }
++    }
++}
++
++/// The rounded mean of `n` coverages from their sum, `(sum + n / 2) / n`,
++/// as a multiply and a shift: exact for every sum `n` bytes can make, as
++/// the error `m · n − 2⁴⁰` (at most `n`) times a sum (under `256 · n`) stays
++/// under 2⁴⁰ for any box narrower than 65,536 pixels.
++#[derive(Clone, Copy)]
++struct Mean {
++    half: u32,
++    m: u64,
++}
++
++impl Mean {
++    fn new(n: u32) -> Mean {
++        Mean { half: n / 2, m: (1u64 << 40) / u64::from(n) + 1 }
++    }
++
++    #[inline]
++    fn of(self, sum: u32) -> u8 {
++        ((u64::from(sum + self.half) * self.m) >> 40) as u8
++    }
+ }
+ 
+ /// Draw `spec`'s shadow of a shape under what `pm` (a region of the
+@@ -93,6 +124,61 @@ pub(crate) fn shadow(
+     scale: f32,
+     mask: Option<&Mask>,
+     coverage: impl FnOnce(&mut PixmapMut, Transform),
++) {
++    cast(pm, spec, scale, mask, |s, (ww, wh), (ox, oy)| {
++        s.cover.clear();
++        s.cover.resize(ww * wh, 0);
++        let Some(mut target) = PixmapMut::from_bytes(super::as_bytes(&mut s.cover), ww as u32, wh as u32) else {
++            return false;
++        };
++        coverage(&mut target, Transform::from_translate(ox as f32, oy as f32));
++        s.alpha.clear();
++        s.alpha.extend(s.cover.iter().map(|p| p.to_ne_bytes()[3]));
++        true
++    });
++}
++
++/// As [`shadow`], cast by premultiplied pixels (a group's) whose top left
++/// is at `at` in the region: their alpha is the coverage, taken as it is
++/// rather than drawn again.
++pub(crate) fn shadow_of(
++    pm: &mut PixmapMut,
++    spec: &ShadowSpec,
++    scale: f32,
++    mask: Option<&Mask>,
++    src: PixmapRef,
++    at: (i32, i32),
++) {
++    cast(pm, spec, scale, mask, |s, (ww, wh), (ox, oy)| {
++        s.alpha.clear();
++        s.alpha.resize(ww * wh, 0);
++        let (sw, sh) = (src.width() as isize, src.height() as isize);
++        // Source pixel (x, y) is the window's (x + dx, y + dy).
++        let (dx, dy) = (at.0 as isize + ox, at.1 as isize + oy);
++        let (x0, x1) = (0.max(-dx), sw.min(ww as isize - dx));
++        if x0 >= x1 {
++            return true;
++        }
++        let data = src.data();
++        for y in 0.max(-dy)..sh.min(wh as isize - dy) {
++            let from = &data[((y * sw + x0) * 4) as usize..((y * sw + x1) * 4) as usize];
++            let to = (y + dy) as usize * ww + (x0 + dx) as usize;
++            for (a, p) in s.alpha[to..to + (x1 - x0) as usize].iter_mut().zip(from.as_chunks::<4>().0) {
++                *a = p[3];
++            }
++        }
++        true
++    });
++}
++
++/// The shadow, from `coverage`, which fills the scratch's alpha (a window
++/// the size it is given) with what casts it, offset as it is given.
++fn cast(
++    pm: &mut PixmapMut,
++    spec: &ShadowSpec,
++    scale: f32,
++    mask: Option<&Mask>,
++    coverage: impl FnOnce(&mut Scratch, (usize, usize), (isize, isize)) -> bool,
+ ) {
+     let (w, h) = (pm.width() as usize, pm.height() as usize);
+     let blur = spec.blur * scale;
+@@ -110,34 +196,33 @@ pub(crate) fn shadow(
+             Ok(s) => s,
+             Err(_) => &mut fresh,
+         };
+-        s.cover.clear();
+-        s.cover.resize(ww * wh, 0);
+-        let Some(mut target) = PixmapMut::from_bytes(super::as_bytes(&mut s.cover), ww as u32, wh as u32) else {
++        if !coverage(s, (ww, wh), (r as isize + dx, r as isize + dy)) {
+             return;
+-        };
+-        coverage(&mut target, Transform::from_translate((r as isize + dx) as f32, (r as isize + dy) as f32));
+-        s.alpha.clear();
+-        s.alpha.extend(s.cover.iter().map(|p| p.to_ne_bytes()[3]));
++        }
+         if blur > 0.0 {
+             for size in boxes(blur / 2.0) {
+-                box_blur(&mut s.alpha, &mut s.tmp, ww, wh, size);
++                box_blur(&mut s.alpha, &mut s.tmp, &mut s.sums, ww, wh, size);
+             }
+         }
+         let c = spec.color.map(|v| v.clamp(0.0, 1.0));
+-        let mask = mask.map(Mask::data);
+-        for (i, px) in pm.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
+-            let (x, y) = (i % w, i / w);
+-            let mut cov = u32::from(s.alpha[(y + r) * ww + x + r]);
+-            if let Some(m) = mask {
+-                cov = (cov * u32::from(m[i]) + 127) / 255;
+-            }
+-            if cov == 0 {
+-                continue;
+-            }
++        // The shadow's pixel at each coverage, worked out once.
++        let shades: [u32; 256] = std::array::from_fn(|cov| {
+             let a = cov as f32 / 255.0 * c[3];
+             let ch = |v: f32| (v * a * 255.0 + 0.5) as u8;
+-            let shade = u32::from_ne_bytes([ch(c[0]), ch(c[1]), ch(c[2]), (a * 255.0 + 0.5) as u8]);
+-            *px = super::over(u32::from_ne_bytes(*px), shade).to_ne_bytes();
++            u32::from_ne_bytes([ch(c[0]), ch(c[1]), ch(c[2]), (a * 255.0 + 0.5) as u8])
++        });
++        let mask = mask.map(Mask::data);
++        for (y, row) in pm.data_mut().as_chunks_mut::<4>().0.chunks_exact_mut(w).enumerate() {
++            let covs = &s.alpha[(y + r) * ww + r..(y + r) * ww + r + w];
++            for (x, (px, &cov)) in row.iter_mut().zip(covs).enumerate() {
++                let mut cov = u32::from(cov);
++                if let Some(m) = mask {
++                    cov = (cov * u32::from(m[y * w + x]) + 127) / 255;
++                }
++                if cov != 0 {
++                    *px = super::over(u32::from_ne_bytes(*px), shades[cov as usize]).to_ne_bytes();
++                }
++            }
+         }
+     });
+ }
+@@ -169,14 +254,64 @@ mod tests {
+     fn three_boxes_blur_like_a_gaussian() {
+         // A lit bar spreads symmetrically, fading with distance.
+         let (w, h) = (41, 41);
+-        let mut tmp = Vec::new();
++        let (mut tmp, mut sums) = (Vec::new(), Vec::new());
+         let mut spread = vec![0u8; w * h];
+         spread[20 * w + 18..20 * w + 23].fill(255);
+         for size in boxes(2.0) {
+-            box_blur(&mut spread, &mut tmp, w, h, size);
++            box_blur(&mut spread, &mut tmp, &mut sums, w, h, size);
+         }
+         assert_eq!(spread[20 * w + 10], spread[20 * w + 30], "symmetric");
+         assert!(spread[20 * w + 20] > spread[20 * w + 24] && spread[20 * w + 24] > spread[20 * w + 27]);
+         assert_eq!(spread[20 * w + 38], 0, "and bounded");
+     }
++
++    /// The blur as defined: each pixel the rounded mean of the `size` around
++    /// it along a row, then along a column, zeros outside.
++    fn plain_blur(a: &mut [u8], w: usize, h: usize, size: usize) {
++        let r = size as isize / 2;
++        let mean = |sum: u32| ((sum + size as u32 / 2) / size as u32) as u8;
++        let at = |a: &[u8], x: isize, y: isize| {
++            if x < 0 || y < 0 || x >= w as isize || y >= h as isize {
++                0
++            } else {
++                u32::from(a[y as usize * w + x as usize])
++            }
++        };
++        let rows: Vec<u8> =
++            (0..w * h).map(|i| mean((-r..=r).map(|d| at(a, (i % w) as isize + d, (i / w) as isize)).sum())).collect();
++        for (i, out) in a.iter_mut().enumerate() {
++            *out = mean((-r..=r).map(|d| at(&rows, (i % w) as isize, (i / w) as isize + d)).sum());
++        }
++    }
++
++    #[test]
++    fn box_blurs_are_exact_means() {
++        let mut seed = 0x2545_f491_4f6c_dd1du64;
++        let mut next = move || {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            seed
++        };
++        let (mut tmp, mut sums) = (Vec::new(), Vec::new());
++        for (w, h) in [(1, 1), (3, 70), (61, 5), (97, 43), (128, 128)] {
++            for size in [1, 3, 5, 9, 33, 129, 201] {
++                // Coverage as shadows see it: runs of solid, edges, nothing.
++                let mut a: Vec<u8> =
++                    (0..w * h).map(|_| if next() % 3 == 0 { 0 } else { (next() % 256) as u8 }).collect();
++                a.iter_mut().take(w * h / 3).for_each(|v| *v = 255);
++                let mut want = a.clone();
++                plain_blur(&mut want, w, h, size);
++                box_blur(&mut a, &mut tmp, &mut sums, w, h, size);
++                assert!(a == want, "{w}x{h}, box of {size}");
++            }
++        }
++        // The means are exact for every sum, at every width a box can be.
++        for n in [1u32, 3, 7, 63, 255, 1023, 4095, 65_535] {
++            let m = Mean::new(n);
++            for sum in (0..=255 * n).step_by((n as usize / 64).max(1)).chain([255 * n]) {
++                assert_eq!(u32::from(m.of(sum)), (sum + n / 2) / n, "sum {sum} of {n}");
++            }
++        }
++    }
+ }
+diff --git a/crates/sidestep-appkit/src/raster/images.rs b/crates/sidestep-appkit/src/raster/images.rs
+index 694f33d..6c02230 100644
+--- a/crates/sidestep-appkit/src/raster/images.rs
++++ b/crates/sidestep-appkit/src/raster/images.rs
+@@ -337,6 +337,12 @@ pub(crate) fn draw(
+         };
+         let to_level = Transform::from_scale(w0 / pixmap.width() as f32, h0 / pixmap.height() as f32);
+         let pattern_xf = placed.pre_concat(to_level);
++        // An image whose pixels land one to one on whole device pixels (a
++        // view's drawing composited where it was drawn) samples each at its
++        // center, where the filter takes that pixel alone: nearest
++        // neighbour leaves the same pixels, for a fraction of the work.
++        let quality =
++            if quality != Quality::High && one_to_one(&base.pre_concat(pattern_xf)) { Quality::None } else { quality };
+         with_region(canvas, st, region, |pm, spare, masks, origin| {
+             // The region's pixels, from the canvas's (the origin is on the
+             // layer's grid, for masks).
+@@ -384,6 +390,18 @@ pub(crate) fn draw(
+     });
+ }
+ 
++/// Whether `m` takes image pixels to device pixels one to one: a whole
++/// number of pixels across and down, mirrored or not, without scaling.
++fn one_to_one(m: &Transform) -> bool {
++    let whole = |v: f32| (v - v.round()).abs() < 1e-3;
++    (m.sx.abs() - 1.0).abs() < 1e-5
++        && (m.sy.abs() - 1.0).abs() < 1e-5
++        && m.kx.abs() < 1e-5
++        && m.ky.abs() < 1e-5
++        && whole(m.tx)
++        && whole(m.ty)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/sidestep-appkit/src/raster/ops.rs b/crates/sidestep-appkit/src/raster/ops.rs
+index f80f8b8..ae783a9 100644
+--- a/crates/sidestep-appkit/src/raster/ops.rs
++++ b/crates/sidestep-appkit/src/raster/ops.rs
+@@ -172,11 +172,14 @@ fn close_group(base: &mut Canvas, layers: &mut [Layer], st: &mut State, mut laye
+             };
+             let (lx, ly) = ((layer.x0 - target.x0) as usize, (layer.y0 - target.y0) as usize);
+             let mut region = (lx, ly, lx + layer.width as usize, ly + layer.height as usize);
+-            // A shadow reaches anywhere in the group's clip.
+-            if layer.draw.shadow.is_some()
++            // A shadow reaches as far as what the group drew, moved by its
++            // offset and spread by its blur, within the group's clip:
++            // nowhere else does it leave any coverage.
++            if let Some(s) = &layer.draw.shadow
+                 && let Some(c) = target.clip_pixels(&layer.draw, damage)
++                && let Some(cast) = shadow_reach(region, s, target.scale, c)
+             {
+-                region = union_region(region, c);
++                region = union_region(region, cast);
+             }
+             let (at_x, at_y) = ((lx - region.0) as i32, (ly - region.1) as i32);
+             let paint = PixmapPaint {
+@@ -192,9 +195,7 @@ fn close_group(base: &mut Canvas, layers: &mut [Layer], st: &mut State, mut laye
+                         color: [shadow.color[0], shadow.color[1], shadow.color[2], shadow.color[3] * paint.opacity],
+                         ..(**shadow).clone()
+                     };
+-                    super::effects::shadow(pm, &faded, origin.2, mask, |target, moved| {
+-                        target.draw_pixmap(at_x, at_y, src, &PixmapPaint::default(), moved, None)
+-                    });
++                    super::effects::shadow_of(pm, &faded, origin.2, mask, src, (at_x, at_y));
+                 }
+                 masked(pm, spare, mask, layer.draw.blend, |pm, mask| {
+                     pm.draw_pixmap(at_x, at_y, src, &paint, Transform::identity(), mask)
+@@ -252,20 +253,43 @@ fn union_region(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)
+     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+ }
+ 
++/// The pixels the shadow `s` of what covers `caster` can reach, at `scale`
++/// pixels a point, within `clip`: the caster moved by the offset and spread
++/// by the blur. `None` if that leaves the clip.
++fn shadow_reach(
++    caster: (usize, usize, usize, usize),
++    s: &ShadowSpec,
++    scale: f32,
++    clip: (usize, usize, usize, usize),
++) -> Option<(usize, usize, usize, usize)> {
++    let (dx, dy) = ((s.dx * scale).round(), (s.dy * scale).round());
++    let spread = super::effects::reach(s.blur * scale).ceil() + 1.0;
++    let at = |v: usize, by: f32, out: f32| (v as f32 + by + out).max(0.0) as usize;
++    let r = (
++        at(caster.0, dx, -spread).max(clip.0),
++        at(caster.1, dy, -spread).max(clip.1),
++        at(caster.2, dx, spread).min(clip.2),
++        at(caster.3, dy, spread).min(clip.3),
++    );
++    (r.0 < r.2 && r.1 < r.3).then_some(r)
++}
++
+ /// The pixels (of `canvas`) ops can reach within `damage`, up to the end
+ /// of the group they're in (or all of them), groups and all: x0, y0, x1,
+ /// y1; `None` for none.
+ pub(crate) fn contents(canvas: &Canvas, damage: &Rect, ops: &[Op]) -> Option<(usize, usize, usize, usize)> {
+     let mut depth = 0;
+     let mut all: Option<(usize, usize, usize, usize)> = None;
+-    // Groups casting shadows reach as far as their clips let the shadows.
++    // Groups casting shadows reach as far as their shadows do.
+     let mut shadowed: Option<(usize, usize, usize, usize)> = None;
+-    for op in ops {
++    for (i, op) in ops.iter().enumerate() {
+         let reach = match op {
+             Op::BeginGroup { draw, .. } => {
+                 if depth == 0
+-                    && draw.shadow.is_some()
+-                    && let Some(r) = canvas.clip_pixels(draw, damage)
++                    && let Some(s) = &draw.shadow
++                    && let Some(c) = canvas.clip_pixels(draw, damage)
++                    && let Some(within) = contents(canvas, damage, &ops[i + 1..])
++                    && let Some(r) = shadow_reach(within, s, canvas.scale, c)
+                 {
+                     shadowed = Some(shadowed.map_or(r, |a| union_region(a, r)));
+                 }
+@@ -914,6 +938,134 @@ mod tests {
+         assert_eq!(at(16, 11), [0; 4]);
+     }
+ 
++    /// A group's shadow is the same whatever its clip lets it reach, a
++    /// window's worth or just around the group, and nested in a group too;
++    /// and it is drawn without blurring the whole clip.
++    #[test]
++    fn group_shadows_reach_only_around_the_group() {
++        let shadow = Arc::new(ShadowSpec { dx: 3.0, dy: 4.0, blur: 8.0, color: [0.0, 0.0, 0.0, 0.6], only: false });
++        let group = |clip: Rect, nested: bool| {
++            let d = draw(clip);
++            let shadowed = Draw { shadow: Some(shadow.clone()), ..d.clone() };
++            let mut ops =
++                vec![Op::FillWith { rect: Rect::new(0.0, 0.0, 400.0, 300.0), color: [1.0; 4], blend: Blend::Copy }];
++            if nested {
++                ops.push(Op::BeginGroup { alpha: 0.9, draw: d.clone() });
++            }
++            ops.extend([
++                Op::BeginGroup { alpha: 1.0, draw: shadowed },
++                Op::FillPath {
++                    path: square(150.0, 100.0, 210.0, 140.0),
++                    even_odd: false,
++                    paint: Paint::Solid(RED),
++                    draw: d.clone(),
++                },
++                Op::Fill { rect: Rect::new(160.0, 110.0, 170.0, 120.0), color: BLUE },
++                Op::EndGroup,
++            ]);
++            if nested {
++                ops.push(Op::EndGroup);
++            }
++            ops
++        };
++        for nested in [false, true] {
++            for scale in [1.0, 2.0] {
++                let near = render(400, 300, scale, &group(Rect::new(120.0, 70.0, 250.0, 180.0), nested));
++                let wide = render(400, 300, scale, &group(Rect::new(0.0, 0.0, 400.0, 300.0), nested));
++                assert!(near == wide, "nested {nested}, {scale}×: the clip's size changed the shadow");
++                // The shadow is there, below and right of the group.
++                let w = (400.0 * scale) as usize;
++                let at = |x: f32, y: f32| channels(wide[(y * scale) as usize * w + (x * scale) as usize]);
++                assert!(at(212.0, 143.0)[0] < 250, "a shadow beside the group");
++                assert_eq!(at(380.0, 280.0), [255; 4], "and none far from it");
++            }
++        }
++        // A window-sized clip costs what the group needs, not the window.
++        let big = group(Rect::new(0.0, 0.0, 3000.0, 2000.0), false);
++        let started = std::time::Instant::now();
++        let (w, h) = (3000usize, 2000usize);
++        let mut px = vec![0u32; w * h];
++        let mut canvas = Canvas::new(&mut px, w as u32, h as u32, 0.0, 1.0);
++        paint(&mut canvas, &mut Glyphs::default(), &[Rect::new(0.0, 0.0, 3000.0, 2000.0)], &big[1..]);
++        let shadowed = started.elapsed();
++        let started = std::time::Instant::now();
++        let mut canvas = Canvas::new(&mut px, w as u32, h as u32, 0.0, 1.0);
++        paint(&mut canvas, &mut Glyphs::default(), &[Rect::new(0.0, 0.0, 3000.0, 2000.0)], &big[2..4]);
++        let plain = started.elapsed();
++        assert!(shadowed < plain * 20 + std::time::Duration::from_millis(20), "{shadowed:?} against {plain:?}");
++    }
++
++    /// A window's worth of drawing that a switch between an application's
++    /// surfaces redraws at 2×: a card's rounded fill 1,133 × 626 points, and
++    /// a composer card 753 × 123 points lifted on a soft shadow (blur 32).
++    #[test]
++    #[ignore = "a benchmark; run in release mode"]
++    fn timing_big_cards() {
++        use kurbo::Shape;
++        let (w, h, scale) = (1440.0f32, 874.0f32, 2.0f32);
++        let (pw, ph) = ((w * scale) as u32, (h * scale) as u32);
++        let mut px = vec![0u32; (pw * ph) as usize];
++        let all = Rect::new(0.0, 0.0, w, h);
++        let d = draw(all);
++        let card = |x0: f64, y0: f64, x1: f64, y1: f64, r: f64| {
++            crate::path::to_skia(&kurbo::RoundedRect::new(x0, y0, x1, y1, r).to_path(0.1)).unwrap()
++        };
++        let fill = [Op::FillPath {
++            path: card(272.0, 204.0, 1405.0, 830.0, 12.0),
++            even_odd: false,
++            paint: Paint::Solid(BLUE),
++            draw: d.clone(),
++        }];
++        let shadow = Arc::new(ShadowSpec { dx: 0.0, dy: 5.0, blur: 32.0, color: [0.1, 0.03, 0.1, 0.16], only: false });
++        let lifted = [
++            Op::BeginGroup { alpha: 1.0, draw: Draw { shadow: Some(shadow), ..d.clone() } },
++            Op::FillPath {
++                path: card(290.0, 700.0, 1043.0, 823.0, 16.0),
++                even_odd: false,
++                paint: Paint::Solid(RED),
++                draw: d.clone(),
++            },
++            Op::Fill { rect: Rect::new(300.0, 710.0, 1030.0, 812.0), color: BLUE },
++            Op::EndGroup,
++        ];
++        // The card as Core Animation composites a view: its drawing, an
++        // image as many pixels as it covers, in a group casting the shadow.
++        use crate::raster::images::{ImageData, Pixels};
++        let (iw, ih) = (1506u32, 246u32);
++        let data: Vec<u8> = (0..iw * ih).flat_map(|i| [200, (i % 251) as u8, 90, 255]).collect();
++        let image =
++            Arc::new(ImageData { key: 7, generation: 0, width: iw, height: ih, pixels: Pixels::Rgba(data.into()) });
++        let shadow2 = Arc::new(ShadowSpec { dx: 0.0, dy: 5.0, blur: 32.0, color: [0.1, 0.03, 0.1, 0.16], only: false });
++        let composited = [
++            Op::BeginGroup { alpha: 1.0, draw: Draw { shadow: Some(shadow2), ..d.clone() } },
++            Op::Image {
++                image: image.clone(),
++                src: Rect::new(0.0, 0.0, iw as f32, ih as f32),
++                dst: Rect::new(290.0, 823.0, 1043.0, 700.0),
++                alpha: 1.0,
++                quality: crate::protocol::Quality::Medium,
++                tint: None,
++                tiled: false,
++                draw: d.clone(),
++            },
++            Op::EndGroup,
++        ];
++        let plain_image = [composited[1].clone()];
++        let mut glyphs = Glyphs::default();
++        for (name, ops) in [
++            ("big rounded fill", &fill[..]),
++            ("lifted card", &lifted[..]),
++            ("view's drawing, 1:1", &plain_image[..]),
++            ("composited lifted view", &composited[..]),
++        ] {
++            let ms = crate::backend::median(|| {
++                let mut canvas = Canvas::new(&mut px, pw, ph, 0.0, scale);
++                paint(&mut canvas, &mut glyphs, &[all], ops);
++            });
++            eprintln!("{name}: {ms:.2} ms at {scale}x");
++        }
++    }
++
+     /// The drawing gallery's bench frame (2,000 rounded-rect fills, 1,000
+     /// strokes, 300 images, half of them downscaled 8 times) as ops, and
+     /// how long rasterizing it takes at 1× and 2×.
+diff --git a/crates/sidestep-appkit/src/testing.rs b/crates/sidestep-appkit/src/testing.rs
+index 75f78b0..f4fafbc 100644
+--- a/crates/sidestep-appkit/src/testing.rs
++++ b/crates/sidestep-appkit/src/testing.rs
+@@ -402,8 +402,16 @@ pub fn render_layer_count() -> usize {
+     null::CA.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |ca| ca.layer_count())
+ }
+ 
+-/// Keep the pixels of windows shown from now on (at scale 1) as the null
+-/// render thread would draw them, composites included, or stop.
++/// Have the null render thread show windows at `scale` (whole: 1, 2, 3),
++/// so the main thread draws at it and captured pixels have it. Call before
++/// the first window is shown.
++pub fn use_null_backend_scale(scale: u32) {
++    null::SCALE.store(scale.max(1), std::sync::atomic::Ordering::Relaxed);
++}
++
++/// Keep the pixels of windows shown from now on (at the null render
++/// thread's scale, 1 unless asked) as it would draw them, composites
++/// included, or stop.
+ pub fn capture_pixels(on: bool) {
+     *null::PIXELS.lock().unwrap_or_else(|e| e.into_inner()) = on.then(Default::default);
+ }
+@@ -424,6 +432,14 @@ pub fn composite_at(window: &NSWindow, t: f64) {
+     settle();
+ }
+ 
++/// Ask the null render thread to draw `window`'s layer trees as they show
++/// at `t`, without waiting: the pixels have it once it gets to it. For
++/// code that can't run the loop to wait, as a timer inside a tracking
++/// loop can't.
++pub fn request_composite_at(window: &NSWindow, t: f64) {
++    crate::app::send(crate::protocol::ToRender::Composite { window: showing_id(window), at: Some(t) });
++}
++
+ /// `CACurrentMediaTime()`.
+ pub fn media_time() -> f64 {
+     crate::quartzcore::math::media_now()
+diff --git a/crates/sidestep-appkit/tests/linux_layers.rs b/crates/sidestep-appkit/tests/linux_layers.rs
+index 00346d0..99e0215 100644
+--- a/crates/sidestep-appkit/tests/linux_layers.rs
++++ b/crates/sidestep-appkit/tests/linux_layers.rs
+@@ -348,6 +348,165 @@ mod linux {
+         testing::settle();
+     }
+ 
++    /// A segmented switch drawn under a control, as an application draws
++    /// its own: a track, a pill behind the chosen segment that slides to
++    /// the next on an animation of its translation, a wash and a seed shown
++    /// on the press, and the seed sweeping the segment through `animator`
++    /// as it fades out, while the window's content is drawn again around
++    /// it. A view's drawing shows in the bounds its layer presents, so the
++    /// seed grows from its sliver rather than showing whole at its old
++    /// origin: nothing is drawn outside the track, the seed and the wash
++    /// stay in their segment, the pill is never taller than one, and once
++    /// it settles the window holds what drawing it still would.
++    fn switch_moves_without_trails(mtm: MainThreadMarker) {
++        // At 2× too, as most displays now are.
++        for scale in [1, 2] {
++            testing::use_null_backend_scale(scale);
++            switch_at_scale(mtm, scale);
++        }
++        testing::use_null_backend_scale(1);
++    }
++
++    fn switch_at_scale(mtm: MainThreadMarker, scale: u32) {
++        // SAFETY: a plain window.
++        let w = unsafe {
++            NSWindow::initWithContentRect_styleMask_backing_defer(
++                NSWindow::alloc(mtm),
++                rect(0.0, 0.0, 400.0, 100.0),
++                NSWindowStyleMask::Titled,
++                NSBackingStoreType::Buffered,
++                false,
++            )
++        };
++        // SAFETY: Rust owns the window, so closing it mustn't release it.
++        unsafe { w.setReleasedWhenClosed(false) };
++        let page = Painter::new(mtm, rect(0.0, 0.0, 400.0, 100.0), [0.0, 0.0, 0.0]);
++        w.setContentView(Some(&page));
++        let container = NSView::initWithFrame(NSView::alloc(mtm), rect(20.0, 30.0, 260.0, 30.0));
++        container.setWantsLayer(true);
++        page.addSubview(&container);
++        // Parts as applications make them: boxes filled with a color, with
++        // round corners.
++        let part = |frame: NSRect, color: [f64; 3], radius: f64| {
++            let b = objc2_app_kit::NSBox::initWithFrame(objc2_app_kit::NSBox::alloc(mtm), frame);
++            b.setBoxType(objc2_app_kit::NSBoxType::Custom);
++            b.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
++            b.setContentViewMargins(NSSize::new(0.0, 0.0));
++            b.setBorderWidth(0.0);
++            b.setCornerRadius(radius);
++            b.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(color[0], color[1], color[2], 1.0));
++            b.setWantsLayer(true);
++            container.addSubview(&b);
++            let view: Retained<NSView> = Retained::into_super(b);
++            view
++        };
++        let segment = |i: f64| rect(3.0 + 127.0 * i, 3.0, 127.0, 24.0);
++        let seed_frame = |r: NSRect| rect(r.origin.x, r.origin.y + 4.0, 3.0, r.size.height - 8.0);
++        let _track = part(rect(0.0, 0.0, 260.0, 30.0), [0.5, 0.5, 0.5], 15.0);
++        let wash = part(segment(0.0), [0.0, 0.0, 1.0], 12.0);
++        wash.setAlphaValue(0.0);
++        let pill = part(segment(1.0), [1.0, 0.0, 0.0], 12.0);
++        // Made the segment's height, as the application makes it, then given
++        // its seed's frame at the press.
++        let seed: Retained<NSView> = part(rect(0.0, 0.0, 3.0, 24.0), [0.0, 1.0, 0.0], 1.5);
++        seed.setAlphaValue(0.0);
++        w.makeKeyAndOrderFront(None);
++        testing::settle_first_frames();
++        show(&w);
++        let group = |changes: &dyn Fn()| {
++            let changes = block2::RcBlock::new(move |context: std::ptr::NonNull<NSAnimationContext>| {
++                // SAFETY: the group hands its live context to the block.
++                let context = unsafe { context.as_ref() };
++                context.setDuration(LONG);
++                context.setTimingFunction(Some(&linear()));
++                changes();
++            });
++            NSAnimationContext::runAnimationGroup(&changes);
++        };
++        // The press on the first segment: the wash and the seed are in by the
++        // time the button comes up, as a quick fade-in is by a click's end.
++        wash.setFrame(segment(0.0));
++        seed.setFrame(seed_frame(segment(0.0)));
++        wash.setAlphaValue(0.38);
++        seed.setAlphaValue(1.0);
++        show(&w);
++        // The release: the window's content changes all over (the switch's
++        // action shows another surface), the pill slides over, the seed
++        // sweeps and fades.
++        page.setNeedsDisplay(true);
++        pill.setFrame(segment(0.0));
++        let slide = CABasicAnimation::animationWithKeyPath(Some(&NSString::from_str("transform.translation.x")));
++        // SAFETY: numbers are what a translation animates between.
++        unsafe {
++            slide.setFromValue(Some(&objc2_foundation::NSNumber::new_f64(127.0)));
++            slide.setToValue(Some(&objc2_foundation::NSNumber::new_f64(0.0)));
++        }
++        slide.setDuration(LONG);
++        slide.setTimingFunction(Some(&linear()));
++        pill.layer().unwrap().addAnimation_forKey(&slide, Some(&NSString::from_str("slide")));
++        group(&|| {
++            seed.animator().setFrame(segment(0.0));
++            seed.animator().setAlphaValue(0.0);
++            wash.animator().setAlphaValue(0.0);
++        });
++        show(&w);
++        let seed_layer = seed.layer().unwrap();
++        let begin = unsafe { seed_layer.animationForKey(&NSString::from_str("position")) }
++            .or_else(|| unsafe { seed_layer.animationForKey(&NSString::from_str("bounds")) })
++            .expect("the seed's frame animates")
++            .beginTime();
++        // The track's pixels, from the window content's top left, and the
++        // first segment's (where the seed sweeps and the wash tints).
++        let track = (20 * scale, 40 * scale, 280 * scale, 70 * scale);
++        let first = (23 * scale, 43 * scale, 150 * scale, 67 * scale);
++        let check = |t: f64, at: &str| {
++            testing::composite_at(&w, t);
++            let (width, height, pixels) = testing::window_pixels(&w).expect("captured pixels");
++            assert_eq!((width, height), (400 * scale, 100 * scale), "captured at {scale}×");
++            let (mut red_top, mut red_bottom) = (u32::MAX, 0);
++            for y in 0..height {
++                for x in 0..width {
++                    let [r, g, b, _] = pixels[(y * width + x) as usize];
++                    let inside = x >= track.0 && x < track.2 && y >= track.1 && y < track.3;
++                    assert!(inside || (r, g, b) == (0, 0, 0), "{at}: ({r}, {g}, {b}) at ({x}, {y}), outside the track");
++                    if r > 200 && g < 60 && b < 60 {
++                        red_top = red_top.min(y);
++                        red_bottom = red_bottom.max(y + 1);
++                    }
++                    let in_first = x >= first.0 && x < first.2 && y >= first.1 && y < first.3;
++                    // The seed (green) and the wash (blue) stay in the
++                    // segment they sweep and tint.
++                    let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
++                    assert!(in_first || g <= r.max(b) + 24, "{at}: the seed at ({x}, {y}), outside its segment");
++                    assert!(in_first || b <= r.max(g) + 24, "{at}: the wash at ({x}, {y}), outside its segment");
++                }
++            }
++            assert!(red_bottom > red_top, "{at}: the pill shows");
++            assert!(
++                red_bottom - red_top <= 24 * scale,
++                "{at}: the pill spans rows {red_top}..{red_bottom}, more than a segment"
++            );
++            pixels
++        };
++        for step in 0..=20 {
++            let t = begin + LONG * f64::from(step) / 20.0;
++            check(t, &format!("{scale}×, at {step}/20"));
++        }
++        // Settled: what drawing the switch still would.
++        let settled = check(begin + LONG * 2.0, &format!("{scale}×, settled"));
++        for layer in [pill.layer().unwrap(), seed_layer.clone(), wash.layer().unwrap()] {
++            layer.removeAllAnimations();
++        }
++        page.setNeedsDisplay(true);
++        container.setNeedsDisplay(true);
++        show(&w);
++        testing::composite_at(&w, begin + LONG * 2.0);
++        let (_, _, still) = testing::window_pixels(&w).expect("captured pixels");
++        assert!(settled == still, "{scale}×: the settled switch differs from drawing it still");
++        w.close();
++        testing::settle();
++    }
++
+     fn opacity_and_transitions(mtm: MainThreadMarker) {
+         let (w, painter) = shown(mtm);
+         let root = painter.layer().expect("a layer");
+@@ -610,6 +769,7 @@ mod linux {
+                 animator_interpolates_without_enabling_implicit_changes,
+             ),
+             ("animator_resizes_and_completes_while_tracking", animator_resizes_and_completes_while_tracking),
++            ("switch_moves_without_trails", switch_moves_without_trails),
+             ("opacity_and_transitions", opacity_and_transitions),
+             ("masks_hide_what_they_leave_out", masks_hide_what_they_leave_out),
+             ("views_update_their_layers", views_update_their_layers),
+diff --git a/docs/architecture.md b/docs/architecture.md
+index b5fcd3e..79528cb 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -988,7 +988,9 @@ one `frame` reports. A name another live window holds can't be taken.
+ **Testing without a display.** `SIDESTEP_BACKEND=null` (or
+ `sidestep_appkit::testing::use_null_backend`) starts a render thread that
+ answers as a compositor would, at once and always the same way, draws
+-nothing, and writes down what it was asked; the `testing` module plays
++nothing (unless asked to keep windows' pixels, `testing::capture_pixels`,
++at the scale `testing::use_null_backend_scale` gives windows, 1 unless
++asked), and writes down what it was asked; the `testing` module plays
+ the compositor's part for input, adding messages to the main thread's
+ inbox, and runs the loop until everything was answered and handled.
+ `crates/sidestep-appkit/tests/linux_events.rs` uses it.
+@@ -1312,7 +1314,15 @@ compositor.
+   box blurs (a Gaussian of half the radius), moved by the offset in base
+   coordinates (up is up, flipped or not) and drawn under it; the coverage
+   is taken wherever it can reach the pixels being drawn, so a shadow
+-  doesn't change with how the damage was cut or crosses tiles. Gradients are
++  doesn't change with how the damage was cut or crosses tiles. It is
++  worked out only as far as it reaches (what casts it, moved by the
++  offset and spread by the blur, within the clip), not over the whole
++  clip; a group's coverage is its layer's alpha, taken as it is; and the
++  blurs run along rows and then down columns a row at a time, with an
++  exact multiply for each mean, so a window-wide group with a soft shadow
++  costs what its shadow covers. An image whose pixels land one to one on
++  whole device pixels (a view's drawing, composited where it was drawn) is
++  sampled without filtering, which leaves the same pixels. Gradients are
+   tiny-skia shaders, two-point conical for the radial ones; where the
+   options don't extend them, the filled shape is the band they cover.
+ - **Images.** An `NSImage` holds representations and draws the smallest
+@@ -2237,8 +2247,10 @@ committed. `SIDESTEP_TRACE_FRAMES=tiles` adds a line for each tile paint
+ (where it is, whether it was drawn ahead, and how many operations and
+ glyph runs it holds, which shows a view leaving a tile blank), for each
+ tile a present had to finish (how many paints and operations, over what),
+-and for each text view that damages itself after laying out (where), which
+-show what a slow present was redrawing.
++for each text view that damages itself after laying out (where), and for
++each slow paint of the window's surface its damage and its slowest
++operations (what they are, how long each took), which show what a slow
++present was redrawing.
+ 
+ ### Core Animation
+ 
+@@ -2341,7 +2353,12 @@ belongs in paint order, and each layer-backed view's `drawRect:` goes into
+ its layer's canvas on the render thread (`Target::Content` paints, redrawn
+ where the view was invalidated; a canvas more than 4096 pixels a side
+ holds a window of that size placed on a 512-point grid around what's
+-visible, moved only when what's visible leaves it). A view that
++visible, moved only when what's visible leaves it). A canvas shows in the
++bounds the layer presents, placed by its gravity as an image of the
++bounds it was drawn for would be: while an animation changes a view's
++frame, its drawing resizes with the layer (as AppKit's does by default)
++rather than showing whole from the animated origin, past the bounds the
++frame's damage covers. A view that
+ `wantsUpdateLayer` (a plain view does; one that draws doesn't) gets
+ `updateLayer` when its layer displays at a commit, as on macOS: at the
+ first commit that finds it in a window, and after each time it or its
+-- 
+2.56.0
+

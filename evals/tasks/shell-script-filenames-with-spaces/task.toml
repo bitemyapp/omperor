@@ -1,0 +1,23 @@
+description = "Bash: make a backup/rotate script safe for any file name (spaces, newlines, globs, leading dashes) under bash 3.2, with strict rotation and clean failure."
+tags = ["coding", "shell"]
+timeout_secs = 900
+prompt = """`backup.sh` here is our nightly snapshot script, and it falls over as soon as a file or directory \
+name has a space in it. The upload folders it backs up also have names with glob characters (`*`, `?`, \
+`[`), leading dashes, quotes, tabs and even the odd newline. Please make it work for any legal file name, \
+and for SOURCE and DEST paths with spaces, without changing what it does (the header comment documents \
+the behaviour; `tests/smoke.sh` is a quick check).
+
+Two more things while you're in there:
+
+- If SOURCE is missing or any copy fails, exit non-zero without rotating anything and without leaving a \
+half-made snapshot behind.
+- Rotation must only ever count and delete directories named exactly `backup-YYYYMMDD-HHMMSS`; nothing \
+else in DEST is to be touched. We lost a hand-made `backup-2019` folder that way.
+
+It has to keep running under the stock `/bin/bash` on our Macs, which is bash 3.2, so no bash 4 features \
+like `mapfile` or associative arrays. Don't commit."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 120

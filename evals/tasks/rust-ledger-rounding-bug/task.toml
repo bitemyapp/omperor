@@ -1,0 +1,18 @@
+description = "Rust: find and fix two sign-dependent cent-rounding bugs behind a customer's refund report; add a regression test."
+tags = ["coding", "rust", "debugging"]
+timeout_secs = 900
+prompt = """Support escalated this from a customer, can you take a look?
+
+> We refunded order #1042 in full (one desk lamp at $12.35, 10% sales tax, so $13.59 charged, paid on two \
+cards). After the refund the customer's ledger still shows a balance of $0.01, and the two card refunds we \
+issued only add up to -$13.58. Smaller refunds seem to be off by a cent now and then too.
+
+This is the `ledger` crate in this directory. Please find the root cause (not just a patch for this one \
+order), fix it, and add a regression test that would have caught it. Keep the public API exactly as it is, \
+don't add dependencies, and make sure `cargo test` passes. Don't commit. When you're done, tell me in a \
+couple of sentences what was wrong."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 180

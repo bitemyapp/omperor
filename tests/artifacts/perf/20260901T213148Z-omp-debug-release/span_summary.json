@@ -1,0 +1,63 @@
+{
+  "schema": "omperor.perf.summary.v1",
+  "sample_count_per_build": 1,
+  "unit": "microseconds",
+  "debug": {
+    "window_visible": 215916,
+    "startup_ready": 13313291,
+    "omp_spawn": 12976921,
+    "session_discovery": 2231872,
+    "workspace_inspect": 93772,
+    "new_chat_action": 40777,
+    "new_session_rpc": 958,
+    "prompt_rpc": 829,
+    "prompt_to_agent_start": 1623,
+    "prompt_to_first_content": 1587482,
+    "agent_turn": 2811716,
+    "prompt_to_turn_ui": 2831471,
+    "rpc_shutdown": 15304,
+    "gui_shutdown": 32039,
+    "total_scenario": 17160655,
+    "omp_to_gui_queue": {
+      "samples": 9,
+      "p50": 18112,
+      "p95": 33725,
+      "max": 45293
+    },
+    "transcript_render": {
+      "samples": 6,
+      "cold": 31764,
+      "warm_p50": 616,
+      "warm_max": 760
+    }
+  },
+  "release": {
+    "window_visible": 203466,
+    "startup_ready": 4597034,
+    "omp_spawn": 4266424,
+    "session_discovery": 2166752,
+    "workspace_inspect": 63565,
+    "new_chat_action": 38506,
+    "new_session_rpc": 694,
+    "prompt_rpc": 407,
+    "prompt_to_agent_start": 971,
+    "prompt_to_first_content": 1234379,
+    "agent_turn": 1560616,
+    "prompt_to_turn_ui": 1587658,
+    "rpc_shutdown": 8985,
+    "gui_shutdown": 22434,
+    "total_scenario": 7100460,
+    "omp_to_gui_queue": {
+      "samples": 9,
+      "p50": 26103,
+      "p95": 34364,
+      "max": 45006
+    },
+    "transcript_render": {
+      "samples": 6,
+      "cold": 30572,
+      "warm_p50": 601,
+      "warm_max": 773
+    }
+  }
+}

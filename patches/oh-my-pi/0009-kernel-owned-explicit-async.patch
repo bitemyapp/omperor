@@ -1,0 +1,179 @@
+--- a/crates/tools/src/shell.rs
++++ b/crates/tools/src/shell.rs
+@@ -716,7 +716,9 @@
+ 			let environment = args.env;
+ 			let (timeout_ms, adjustments) = self.timeout(args.timeout);
+ 
+-			if args.asynchronous {
++			// A lifetime-owning client also owns explicit backgrounding. Keep
++			// this stream alive so its job board receives the terminal result.
++			if args.asynchronous && !client_owns_lifetime() {
+ 				let name = next_background_name("bash", &self.next_background_name);
+ 				let options = SessionOptions {
+ 					cwd,
+--- a/crates/tools/tests/it/shell.rs
++++ b/crates/tools/tests/it/shell.rs
+@@ -646,6 +646,28 @@
+ 	assert!(exec.state.lock().detaches.is_empty());
+ }
+ 
++#[tokio::test]
++async fn explicit_async_keeps_the_stream_when_the_client_owns_its_lifetime() {
++	// The kernel detaches a long call into a job at its own blocking limit
++	// and keeps the invocation running; the shell must not end that
++	// invocation on its own threshold, or the kernel's job dies with it.
++	let exec = FakeExec::default();
++	let tool = shell::shell(exec.clone()).with_auto_background(true, Duration::ZERO);
++	let (feed, params) = IncomingParams::channel();
++	feed
++		.args_committed(sf!(r#"{{"command":"wait","async":true}}"#))
++		.expect("shell invocation remains live");
++	let next = omp_tools::auto_background::with_client_owned_lifetime(true, async {
++		let mut events = Box::pin(tool.call(params));
++		let started = events.next().await.expect("the command starts");
++		assert!(matches!(started, Ev::Update(Update { started: true, .. })), "{started:?}");
++		tokio::time::timeout(Duration::from_millis(200), events.next()).await
++	})
++	.await;
++	assert!(next.is_err(), "the shell detached a command whose lifetime its client owns: {next:?}");
++	assert!(exec.state.lock().detaches.is_empty());
++}
++
+ #[test]
+ fn interrupt_during_async_setup_reports_effect_uncertainty() {
+ 	let exec = FakeExec::default();
+--- a/crates/agent/src/dispatch.rs
++++ b/crates/agent/src/dispatch.rs
+@@ -1206,6 +1206,22 @@
+ }
+ 
+ impl PreparedCall {
++	fn foreground_deadline(&self, blocking_limit: Duration) -> Option<Instant> {
++		let started = self.started?;
++		// Native shell detachment is already handled by its registry. Remote
++		// shells retain the invocation stream; the kernel owns their jobs.
++		let immediate = matches!(&self.unit, Unit::External { .. })
++			&& self.identity.name == "bash"
++			&& self.args.as_ref().is_some_and(|args| {
++				serde_json::from_str::<serde_json::Value>(args.get())
++					.ok()
++					.is_some_and(|args| {
++						args.get("async").and_then(serde_json::Value::as_bool) == Some(true)
++					})
++			});
++		Some(started + if immediate { Duration::ZERO } else { blocking_limit })
++	}
++
+ 	/// Journal identity of the `tool.call@1`.
+ 	#[must_use]
+ 	pub const fn entry(&self) -> EntryId {
+@@ -1569,8 +1585,7 @@
+ 			let deadline = calls
+ 				.iter()
+ 				.filter(|call| call.phase == Phase::Running)
+-				.filter_map(|call| call.started)
+-				.map(|started| started + policy.blocking_limit)
++				.filter_map(|call| call.foreground_deadline(policy.blocking_limit))
+ 				.min();
+ 			let grace = calls
+ 				.iter()
+@@ -1790,8 +1805,8 @@
+ 							call.report = Some(report);
+ 						} else if call.phase == Phase::Running
+ 							&& call
+-								.started
+-								.is_some_and(|started| started + policy.blocking_limit <= now)
++								.foreground_deadline(policy.blocking_limit)
++								.is_some_and(|deadline| deadline <= now)
+ 						{
+ 							self.detach(session, call)?;
+ 						}
+--- a/crates/agent/tests/dispatch.rs
++++ b/crates/agent/tests/dispatch.rs
+@@ -865,6 +865,73 @@
+ }
+ 
+ #[tokio::test]
++async fn explicit_async_shell_detaches_into_a_kernel_owned_job_immediately() {
++	let directory = tempfile::tempdir().expect("temporary directory");
++	let mut tools = omp_tool::Registry::new();
++	let mut shell_spec = tool_spec("bash", 1);
++	shell_spec.schema = bytes::Bytes::from_static(
++		br#"{"type":"object","properties":{"async":{"type":"boolean"}},"additionalProperties":false}"#,
++	);
++	tools
++		.register_worker(shell_spec, Presentation::Slot, Claims {
++			precedence: Precedence::CORE,
++			claimant:   Str::new_static("omp-agent/tests"),
++			replaces:   None,
++		})
++		.expect("shell registers");
++	let tools = Arc::new(tools);
++	let identity = tools.resolved_identity("bash").expect("worker identity");
++	let started = Arc::new(tokio::sync::Notify::new());
++	let dispatcher = Dispatcher::new(
++		Arc::clone(&tools),
++		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")).with_limits(
++			64 * 1024,
++			512,
++			Duration::from_secs(30),
++		),
++	)
++	.with_external_executor(Arc::new(StuckExternal { honors_cancel: true, started }));
++	let mut session = session(&directory.path().join("detached.oms"));
++	let args = serde_json::value::to_raw_value(&serde_json::json!({"async": true})).unwrap();
++	let entry = session
++		.call(identity.name.clone(), u32::from(identity.rev.n), "detached-1", None, Some(args.clone()), None)
++		.unwrap();
++	let report = tokio::time::timeout(
++		Duration::from_secs(1),
++		dispatcher.dispatch(
++			&mut session,
++			request(
++				entry,
++				identity,
++				args,
++				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
++				false,
++			),
++		),
++	)
++	.await
++	.expect("blocking limit detaches promptly")
++	.expect("detachment journals a terminal");
++	let detached = report.detached.expect("call returns a job reference");
++	let notice = result_text(&session, "detached-1").join("");
++	assert!(notice.contains(detached.id.as_str()));
++	assert!(notice.contains("Do NOT poll"));
++	assert!(notice.contains("end your reply"));
++	assert!(notice.contains("completion will wake you"));
++	let jobs = dispatcher.jobs().list();
++	assert_eq!(jobs.len(), 1);
++	assert_eq!(jobs[0].id, detached.id);
++	assert!(
++		dispatcher
++			.jobs()
++			.terminate(&mut session, jobs[0].handle)
++			.await
++			.expect("cancel journals")
++	);
++	assert_eq!(dispatcher.jobs().list()[0].status, "cancelled");
++}
++
++#[tokio::test]
+ async fn an_adopted_job_survives_the_board_rebuild_a_later_tool_call_runs() {
+ 	// The next session tool the model calls (`hub jobs`, say) rebuilds the
+ 	// board from the DOM. A detached call adopted moments earlier must come
+--- a/justfile
++++ b/justfile
+@@ -308,3 +308,10 @@
+ test-omperor-background-progress:
+     cargo nextest run -p omp-agent --test turn --test jobs --locked -E 'not test(tool_call_round_settles_in_the_dom_then_runs_second_inference)'
+     cargo test --doc -p omp-agent --locked
++
++# Explicit async shell requests keep the kernel's completion-delivery stream.
++[group('test')]
++test-omperor-explicit-async:
++    cargo nextest run -p omp-tools --test it --locked -E 'test(shell::)'
++    cargo nextest run -p omp-agent --test dispatch --locked -E 'not test(central_truncation_spills_and_notrunc_explicitly_opts_out)'
++    cargo test --doc -p omp-tools -p omp-agent --locked

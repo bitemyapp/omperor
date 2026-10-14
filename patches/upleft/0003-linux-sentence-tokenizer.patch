@@ -1,0 +1,108 @@
+--- a/crates/core/src/metrics.rs
++++ b/crates/core/src/metrics.rs
+@@ -6,9 +6,13 @@
+
+ use std::sync::Arc;
+
++#[cfg(target_os = "macos")]
+ use objc2::AnyThread;
++#[cfg(target_os = "macos")]
+ use objc2::rc::Retained;
++#[cfg(target_os = "macos")]
+ use objc2_foundation::{NSRange as FRange, NSString};
++#[cfg(target_os = "macos")]
+ use objc2_natural_language::{NLTokenUnit, NLTokenizer};
+
+ use crate::contracts::{ParseOptions, ReadingMetrics};
+@@ -188,6 +192,7 @@
+
+ /// `NLTokenizer(unit: .sentence)`.
+ pub struct SentenceTokenizer {
++    #[cfg(target_os = "macos")]
+     tokenizer: Retained<NLTokenizer>,
+ }
+
+@@ -199,12 +204,18 @@
+
+ impl SentenceTokenizer {
+     pub fn new() -> SentenceTokenizer {
+-        let tokenizer = unsafe { NLTokenizer::initWithUnit(NLTokenizer::alloc(), NLTokenUnit::Sentence) };
+-        SentenceTokenizer { tokenizer }
++        #[cfg(target_os = "macos")]
++        {
++            let tokenizer = unsafe { NLTokenizer::initWithUnit(NLTokenizer::alloc(), NLTokenUnit::Sentence) };
++            SentenceTokenizer { tokenizer }
++        }
++        #[cfg(target_os = "linux")]
++        SentenceTokenizer {}
+     }
+
+     /// Sets `string` and enumerates the sentence ranges (UTF-16) over the
+     /// whole string; `visit` returns `false` to stop.
++    #[cfg(target_os = "macos")]
+     pub fn enumerate(&self, source: &str, visit: impl FnMut(NSRange) -> bool) {
+         objc2::rc::autoreleasepool(|_| self.enumerate_string(&NSString::from_str(source), visit));
+     }
+@@ -212,6 +223,7 @@
+     /// `enumerate` over UTF-16 units already in hand, without transcoding.
+     /// Lone surrogates take the `String` round trip Swift's substring does
+     /// (each becomes U+FFFD, still one unit).
++    #[cfg(target_os = "macos")]
+     pub fn enumerate_utf16(&self, units: &[u16], visit: impl FnMut(NSRange) -> bool) {
+         let has_surrogate = units.iter().any(|&u| (0xD800..0xE000).contains(&u));
+         objc2::rc::autoreleasepool(|_| {
+@@ -223,6 +235,7 @@
+         });
+     }
+
++    #[cfg(target_os = "macos")]
+     fn enumerate_string(&self, string: &NSString, visit: impl FnMut(NSRange) -> bool) {
+         let visit = std::cell::RefCell::new(visit);
+         {
+@@ -238,6 +251,29 @@
+             unsafe { self.tokenizer.enumerateTokensInRange_usingBlock(FRange::new(0, length), &block) };
+         }
+     }
++
++    #[cfg(target_os = "linux")]
++    pub fn enumerate(&self, source: &str, visit: impl FnMut(NSRange) -> bool) {
++        self.enumerate_utf16(&source.encode_utf16().collect::<Vec<_>>(), visit);
++    }
++
++    #[cfg(target_os = "linux")]
++    pub fn enumerate_utf16(&self, units: &[u16], mut visit: impl FnMut(NSRange) -> bool) {
++        // ICU supplies Unicode sentence boundaries without Apple's
++        // NaturalLanguage framework. Ranges still count UTF-16 code units.
++        let units = swift_text::ns::string_from_utf16(units).encode_utf16().collect::<Vec<_>>();
++        let segmenter = icu_segmenter::SentenceSegmenter::new(Default::default());
++        let mut start = 0;
++        for end in segmenter.segment_utf16(&units).skip(1) {
++            if !String::from_utf16_lossy(&units[start..end]).trim().is_empty()
++                && !visit(NSRange::new(start as isize, (end - start) as isize))
++            {
++                break;
++            }
++            start = end;
++        }
++    }
++
+ }
+
+ // MARK: - Reading metadata (§9.6)
+--- a/crates/core/Cargo.toml
++++ b/crates/core/Cargo.toml
+@@ -11,8 +11,13 @@
+ upleft-swift-text.workspace = true
+ objc2.workspace = true
+ objc2-foundation = { workspace = true, features = ["NSString", "NSRegularExpression", "NSTextCheckingResult", "NSArray", "NSEnumerator", "NSRange", "NSObjCRuntime", "NSLocale", "NSData", "NSURL"] }
+-objc2-natural-language = { version = "0.3.2", default-features = false, features = ["std", "NLTokenizer", "NLLanguage", "block2"] }
+ block2.workspace = true
+ uuid = { version = "1", features = ["v4"] }
+ sha2 = "0.10"
+ libc = "0.2"
++
++[target.'cfg(target_os = "macos")'.dependencies]
++objc2-natural-language = { version = "0.3.2", default-features = false, features = ["std", "NLTokenizer", "NLLanguage", "block2"] }
++
++[target.'cfg(target_os = "linux")'.dependencies]
++icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }

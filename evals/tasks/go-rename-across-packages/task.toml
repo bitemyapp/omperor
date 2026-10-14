@@ -1,0 +1,23 @@
+description = "Go: rename an exported method and error variable across five packages, interfaces, test fakes, comments and README, without touching look-alike names or the wire protocol."
+tags = ["coding", "go", "refactor"]
+timeout_secs = 900
+prompt = """Small cleanup in this Go module before the review on Thursday: we're standardizing names.
+
+1. Rename the `(*store.Store).GetItem` method to `FetchItem`.
+2. Rename `store.ItemNotFoundErr` to `store.ErrItemNotFound` (the usual Go `ErrXxx` convention).
+
+Update everything that goes with them: all call sites, the interfaces that `*store.Store` satisfies and the \
+other types that implement them (including the fakes in tests), doc comments, and the README. It's an \
+internal module, so no deprecated aliases: there should be no `GetItem` or `ItemNotFoundErr` identifiers \
+left anywhere.
+
+Careful with two things: `GetItems` and `GetItemCount` keep their names, and the JSON-RPC method names the \
+scanners send (`Inventory.GetItem` etc.) must not change, since scanner firmware in the field depends on \
+them. Error messages stay the same too.
+
+`go build ./...`, `go vet ./...`, `go test ./...` and `gofmt -l .` should all come out clean. Don't commit."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 180

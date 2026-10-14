@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Omperor eval result v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "app_version",
+    "id",
+    "backend",
+    "requested_model",
+    "actual_model",
+    "requested_account",
+    "account",
+    "requested_thinking_level",
+    "thinking_level",
+    "workspace",
+    "started_at_ms",
+    "elapsed_ms",
+    "status",
+    "error",
+    "success",
+    "shutdown_complete",
+    "session_id",
+    "session_file",
+    "tool_calls",
+    "tool_errors",
+    "usage",
+    "changes",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "backend": {
+      "const": "omp"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "timed_out",
+        "authentication_required",
+        "error",
+        "interrupted"
+      ]
+    },
+    "success": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "shutdown_complete": {
+      "type": "boolean"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "index",
+          "passed",
+          "detail"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "description": "The desktop usage Card: disjoint token classes and provenance, including model and child-session breakdowns.",
+      "required": [
+        "requests",
+        "reported_requests",
+        "estimated_requests",
+        "unknown_requests",
+        "input",
+        "output",
+        "cache_read",
+        "cache_write",
+        "warnings"
+      ]
+    },
+    "app_version": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "requested_model": {
+      "type": "string"
+    },
+    "workspace": {
+      "type": "string"
+    },
+    "actual_model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requested_account": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "account": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requested_thinking_level": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "thinking_level": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tool_calls": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tool_errors": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "changes": {
+      "description": "The workspace's changes against the request's diff_baseline, captured before graders ran; null without a baseline or outside git.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "files",
+            "insertions",
+            "deletions"
+          ],
+          "properties": {
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "insertions": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "deletions": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    }
+  }
+}

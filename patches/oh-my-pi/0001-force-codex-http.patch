@@ -1,0 +1,263 @@
+diff --git a/crates/ai/src/codec/openai_codex.rs b/crates/ai/src/codec/openai_codex.rs
+index d4522ea303..d01423ee2b 100644
+--- a/crates/ai/src/codec/openai_codex.rs
++++ b/crates/ai/src/codec/openai_codex.rs
+@@ -11,6 +11,6 @@ use super::{
+-		OpenAiResponsesCodec, OpenAiResponsesDecoder, OpenAiResponsesOptions, ResponsesInputContent,
+-		ResponsesInputItem, ResponsesInputItemKind, ResponsesMetadata, ResponsesMetadataValue,
+-		ResponsesNamedToolKind, ResponsesOutputItem, ResponsesOutputItemKind, ResponsesReasoning,
+-		ResponsesRequest, ResponsesRole, ResponsesStreamEvent, ResponsesStreamEventKind,
+-		ResponsesStreamOptions, ResponsesTool, ResponsesToolChoice, ResponsesToolChoiceMode,
+-		ResponsesToolKind, hosted_image_body,
++		OpenAiResponsesCodec, OpenAiResponsesDecoder, OpenAiResponsesOptions, ResponsesContentKind,
++		ResponsesEncodeError, ResponsesInputContent, ResponsesInputItem, ResponsesInputItemKind,
++		ResponsesMetadata, ResponsesMetadataValue, ResponsesNamedToolKind, ResponsesOutputItem,
++		ResponsesOutputItemKind, ResponsesReasoning, ResponsesRequest, ResponsesRole,
++		ResponsesStreamEvent, ResponsesStreamEventKind, ResponsesStreamOptions, ResponsesTool,
++		ResponsesToolChoice, ResponsesToolChoiceMode, ResponsesToolKind, hosted_image_body,
+@@ -128,0 +129,17 @@ pub fn transform_codex_request(
++	for item in &mut request.input {
++		if item.role != Some(ResponsesRole::Assistant) {
++			continue;
++		}
++		if let Some(parts) = item.content.parts_mut() {
++			for content in parts {
++				if content.kind == ResponsesContentKind::InputText {
++					content.kind = ResponsesContentKind::OutputText;
++				}
++			}
++		}
++	}
++	for tool in &mut request.tools {
++		if tool.kind == ResponsesToolKind::Function {
++			tool.strict = Some(false);
++		}
++	}
+@@ -216 +233 @@ pub fn transform_codex_request(
+-			summary: Vec::new(),
++			summary: None,
+@@ -1069 +1086,32 @@ impl Codec for OpenAiCodexCodec {
+-			.map_err(|_| fail("codex_responses_encoding"))?;
++			.map_err(|error| match error {
++				ResponsesEncodeError::MismatchedProviderProof => {
++					fail("codex_mismatched_responses_provider_proof")
++				},
++				ResponsesEncodeError::UnreplayableProviderProof => {
++					fail("codex_unreplayable_responses_provider_proof")
++				},
++				ResponsesEncodeError::MissingWireTarget => fail("codex_missing_responses_wire_target"),
++				ResponsesEncodeError::MissingCallIdentity => {
++					fail("codex_missing_responses_call_identity")
++				},
++				ResponsesEncodeError::UnresolvedStoredMedia => fail("codex_unresolved_responses_media"),
++				ResponsesEncodeError::UnsupportedOutputFormat => {
++					fail("codex_unsupported_responses_output_format")
++				},
++				ResponsesEncodeError::UnsupportedComputerUse => {
++					fail("codex_unsupported_responses_computer_use")
++				},
++				ResponsesEncodeError::UnsupportedComputerUseConfig => {
++					fail("codex_unsupported_responses_computer_use_config")
++				},
++				ResponsesEncodeError::MalformedServerState => {
++					fail("codex_malformed_responses_server_state")
++				},
++				ResponsesEncodeError::MismatchedServerState => {
++					fail("codex_mismatched_responses_server_state")
++				},
++				ResponsesEncodeError::UnreplayableImageFileReference { .. } => {
++					fail("codex_unreplayable_responses_image_file_reference")
++				},
++				_ => fail("codex_responses_encoding"),
++			})?;
+@@ -1090 +1138 @@ impl Codec for OpenAiCodexCodec {
+-				CodexTransportPreference::WebsocketPreferred => CodexWireTransport::WebSocket,
++				CodexTransportPreference::WebsocketPreferred => CodexWireTransport::Http,
+@@ -1268,0 +1317,55 @@ mod tests {
++	#[test]
++	fn assistant_history_uses_codex_output_content() {
++		let original: ResponsesRequest = serde_json::from_value(serde_json::json!({
++			"model": "gpt-5.6-luna",
++			"input": [
++				{
++					"role": "assistant",
++					"content": [{"type": "input_text", "text": "prior answer"}]
++				},
++				{
++					"role": "user",
++					"content": [{"type": "input_text", "text": "next question"}]
++				}
++			]
++		}))
++		.expect("typed request");
++
++		for responses_lite in [false, true] {
++			let mut request = original.clone();
++			transform_codex_request(&mut request, responses_lite, false)
++				.expect("Codex request rewrite");
++			let encoded = serde_json::to_value(request).expect("request JSON");
++			assert_eq!(encoded["input"][0]["content"][0]["type"], "output_text");
++			assert_eq!(encoded["input"][1]["content"][0]["type"], "input_text");
++		}
++	}
++	#[test]
++	fn function_tools_use_permissive_codex_schemas() {
++		let original: ResponsesRequest = serde_json::from_value(serde_json::json!({
++			"model": "gpt-5.6-luna",
++			"input": [],
++			"tools": [{
++				"type": "function",
++				"name": "ask",
++				"parameters": {
++					"type": "object",
++					"properties": {"optional": {"type": "string"}}
++				},
++				"strict": true
++			}]
++		}))
++		.expect("typed request");
++
++		for responses_lite in [false, true] {
++			let mut request = original.clone();
++			transform_codex_request(&mut request, responses_lite, false)
++				.expect("Codex request rewrite");
++			let tool = if responses_lite {
++				&request.input[0].tools[0]
++			} else {
++				&request.tools[0]
++			};
++			assert_eq!(tool.strict, Some(false));
++		}
++	}
+diff --git a/crates/ai/src/codec/openai_responses.rs b/crates/ai/src/codec/openai_responses.rs
+index 60db4c89d7..7dceb7b065 100644
+--- a/crates/ai/src/codec/openai_responses.rs
++++ b/crates/ai/src/codec/openai_responses.rs
+@@ -391,2 +391,2 @@ pub struct ResponsesInputItem {
+-	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+-	pub summary: Vec<ResponsesSummaryPart>,
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub summary: Option<Vec<ResponsesSummaryPart>>,
+@@ -433 +433 @@ impl ResponsesInputItem {
+-			summary: Vec::new(),
++			summary: None,
+@@ -2572 +2572 @@ impl OpenAiResponsesCodec {
+-						summary: Vec::new(),
++						summary: None,
+@@ -2690 +2690 @@ impl OpenAiResponsesCodec {
+-							summary: if text.is_empty() {
++							summary: Some(if text.is_empty() {
+@@ -2694 +2694 @@ impl OpenAiResponsesCodec {
+-							},
++							}),
+@@ -2774 +2774 @@ impl OpenAiResponsesCodec {
+-								summary: Vec::new(),
++								summary: None,
+@@ -2817 +2817 @@ impl OpenAiResponsesCodec {
+-							summary: Vec::new(),
++							summary: None,
+@@ -3734,0 +3735,6 @@ impl ResponsesDecoderAdapter {
++				let proof = encode_provider_proof(&ResponsesProviderProof {
++					call_id: Some(Str::new(id.as_str())),
++					custom_tool: custom,
++					..ResponsesProviderProof::default()
++				})
++				.map_or_else(|_| Bytes::new(), |value| value);
+@@ -3747,0 +3754,4 @@ impl ResponsesDecoderAdapter {
++				emit(RawEvent::ProviderState(ProviderStateEvent::ToolCallProof {
++					index,
++					value: proof,
++				}));
+@@ -3753,2 +3763,5 @@ impl ResponsesDecoderAdapter {
+-				if let Some(id) = item_id {
+-					emit(RawEvent::ProviderState(ProviderStateEvent::OutputItem { index, id }));
++				if let Some(id) = item_id.as_ref() {
++					emit(RawEvent::ProviderState(ProviderStateEvent::OutputItem {
++						index,
++						id: id.clone(),
++					}));
+@@ -3755,0 +3769,7 @@ impl ResponsesDecoderAdapter {
++				let proof = encode_provider_proof(&ResponsesProviderProof {
++					item_id,
++					encrypted_reasoning: (!signature.is_empty())
++						.then(|| Str::from_utf8_lossy(&signature)),
++					..ResponsesProviderProof::default()
++				})
++				.map_or_else(|_| Bytes::new(), |value| value);
+@@ -3758 +3778 @@ impl ResponsesDecoderAdapter {
+-					signature,
++					signature: proof,
+@@ -4315 +4335 @@ mod tests {
+-		encode_provider_proof, hoist_interleaved_tool_batch_messages,
++		decode_provider_proof, encode_provider_proof, hoist_interleaved_tool_batch_messages,
+@@ -4327 +4347 @@ mod tests {
+-		codec::{Codec as _, Decoder as _, EncodeContext, RawEvent},
++		codec::{Codec as _, Decoder as _, EncodeContext, ProviderStateEvent, RawEvent},
+@@ -6018,0 +6039,60 @@ mod tests {
++
++	#[test]
++	fn decoder_adapter_emits_replayable_reasoning_and_tool_proofs() {
++		let adapter = ResponsesDecoderAdapter {
++			inner: OpenAiResponsesDecoder::default(),
++			request_id: RequestId::new("request"),
++			provider: ProviderId::from("openai-codex"),
++			route: RouteId::from("openai-codex/primary"),
++			wire_model: Some(sf!("gpt-5.6-luna")),
++			thinking_close_max_retries: None,
++		};
++		let mut events = Vec::new();
++		adapter.emit_projection(
++			ResponsesProjection::ReasoningSignature {
++				index:     0,
++				item_id:   Some(sf!("rs_1")),
++				signature: Bytes::from_static(b"enc_reasoning"),
++			},
++			&mut |event| events.push(event),
++		);
++		adapter.emit_projection(
++			ResponsesProjection::ToolCallComplete {
++				index:     1,
++				id:        ToolCallId::new("call_1"),
++				name:      sf!("read"),
++				arguments: Bytes::from_static(br#"{"path":"README.md"}"#),
++				custom:    false,
++			},
++			&mut |event| events.push(event),
++		);
++
++		let reasoning = events.iter().find_map(|event| match event {
++			RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature { signature, .. }) => {
++				decode_provider_proof(signature).ok()
++			},
++			_ => None,
++		});
++		assert_eq!(
++			reasoning,
++			Some(ResponsesProviderProof {
++				item_id: Some(sf!("rs_1")),
++				encrypted_reasoning: Some(sf!("enc_reasoning")),
++				..ResponsesProviderProof::default()
++			})
++		);
++		let tool = events.iter().find_map(|event| match event {
++			RawEvent::ProviderState(ProviderStateEvent::ToolCallProof { value, .. }) => {
++				decode_provider_proof(value).ok()
++			},
++			_ => None,
++		});
++		assert_eq!(
++			tool,
++			Some(ResponsesProviderProof {
++				call_id: Some(sf!("call_1")),
++				..ResponsesProviderProof::default()
++			})
++		);
++	}
++
+diff --git a/fixtures/llm-oracle/openai/codex/expect.responses_lite.json b/fixtures/llm-oracle/openai/codex/expect.responses_lite.json
+index 4d55aa1483..ec6a3a3a0f 100644
+--- a/fixtures/llm-oracle/openai/codex/expect.responses_lite.json
++++ b/fixtures/llm-oracle/openai/codex/expect.responses_lite.json
+@@ -8 +8 @@
+-        { "type": "function", "name": "read", "description": "Read a file", "parameters": { "type": "object" } }
++        { "type": "function", "name": "read", "description": "Read a file", "parameters": { "type": "object" }, "strict": false }

@@ -1,0 +1,932 @@
+diff --git a/crates/env/src/project_state.rs b/crates/env/src/project_state.rs
+index f46cf46af0..4434b4f9b1 100644
+--- a/crates/env/src/project_state.rs
++++ b/crates/env/src/project_state.rs
+@@ -201,6 +201,23 @@ mod tests {
+ 
+ 	use super::{document_socket, environment_socket, extension_socket};
+ 
++	#[test]
++	fn isolated_data_roots_keep_every_runtime_socket_separate() {
++		let project = tempfile::tempdir().expect("project");
++		let owners = tempfile::tempdir().expect("owner data roots");
++		let production = super::directory(&owners.path().join("production"), project.path())
++			.expect("production state");
++		let development = super::directory(&owners.path().join("development"), project.path())
++			.expect("development state");
++		assert_ne!(production, development);
++		assert_ne!(environment_socket(&production), environment_socket(&development));
++		assert_ne!(document_socket(&production), document_socket(&development));
++		assert_ne!(
++			extension_socket(&production, "workspace", "trusted", "extension", "session", 1),
++			extension_socket(&development, "workspace", "trusted", "extension", "session", 1),
++		);
++	}
++
+ 	#[test]
+ 	fn socket_paths_fit_the_platform_address_limit() {
+ 		let state_dir = PathBuf::from("/").join("long-project-state-segment".repeat(32));
+diff --git a/crates/envd/src/docserver/fs.rs b/crates/envd/src/docserver/fs.rs
+index cfa9541de8..a9ece570ba 100644
+--- a/crates/envd/src/docserver/fs.rs
++++ b/crates/envd/src/docserver/fs.rs
+@@ -16,9 +16,7 @@ use cap_std::{
+ 	fs,
+ 	fs::{Dir, Metadata, OpenOptions},
+ };
+-#[cfg(test)]
+-use omp_core::Hash32;
+-use omp_core::{Str, sf};
++use omp_core::{Hash32, Str, sf};
+ #[cfg(test)]
+ use parking_lot::Mutex;
+ #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+@@ -329,6 +327,7 @@ type MutationHook = Box<dyn FnMut(MutationStage, &Path) + Send>;
+ struct LocalFsInner {
+ 	root:               Dir,
+ 	root_path:          PathBuf,
++	project_key:        Hash32,
+ 	max_document_bytes: u64,
+ 	temp_sequence:      AtomicU64,
+ 	#[cfg(test)]
+@@ -500,6 +499,7 @@ impl LocalFs {
+ 			inner: Arc::new(LocalFsInner {
+ 				root,
+ 				root_path,
++				project_key: *config.project_key(),
+ 				max_document_bytes: config.max_document_bytes().get(),
+ 				temp_sequence: AtomicU64::new(0),
+ 				#[cfg(test)]
+@@ -508,6 +508,24 @@ impl LocalFs {
+ 		})
+ 	}
+ 
++	// Callers already run these synchronous filesystem operations on workers.
++	// A fresh open gives each operation an independent OS lock description,
++	// including clones and separate document authorities in the same process.
++	fn lock_disk(&self, shared: bool) -> Result<std::fs::File> {
++		let file = super::locks::open("mutation", &self.inner.project_key).map_err(|source| {
++			Self::io_error("open project mutation lock", &self.inner.root_path, source)
++		})?;
++		let locked = if shared {
++			file.lock_shared()
++		} else {
++			file.lock()
++		};
++		locked.map_err(|source| {
++			Self::io_error("lock project mutation", &self.inner.root_path, source)
++		})?;
++		Ok(file)
++	}
++
+ 	/// Returns the canonical ambient identity of the capability root.
+ 	pub fn root_path(&self) -> &Path {
+ 		&self.inner.root_path
+@@ -537,6 +555,7 @@ impl LocalFs {
+ 
+ 	/// Reads exact document bytes and verifies two matching observations.
+ 	pub fn stable_read(&self, path: impl AsRef<Path>) -> Result<DiskState> {
++		let _disk = self.lock_disk(true)?;
+ 		let path = path.as_ref();
+ 		let resolved = self.resolve_target(path)?;
+ 		let (parent, name) = self.open_parent(&resolved)?;
+@@ -679,7 +698,16 @@ impl LocalFs {
+ 	///
+ 	/// The document actor is the intended sole caller of this synchronous final
+ 	/// commit operation.
+-	pub fn commit_prepared(&self, mut prepared: PreparedWrite) -> Result<DiskState> {
++	pub fn commit_prepared(&self, prepared: PreparedWrite) -> Result<DiskState> {
++		let disk = self.lock_disk(false)?;
++		self.commit_prepared_locked(prepared, &disk)
++	}
++
++	fn commit_prepared_locked(
++		&self,
++		mut prepared: PreparedWrite,
++		_disk: &std::fs::File,
++	) -> Result<DiskState> {
+ 		if !Arc::ptr_eq(&self.inner, &prepared.owner) {
+ 			return Err(Error::InvalidTarget {
+ 				target: Str::new(prepared.destination_path.to_string_lossy()),
+@@ -769,6 +797,7 @@ impl LocalFs {
+ 	/// Deletes a prepared file only while its parent and exact state remain
+ 	/// current.
+ 	pub fn commit_prepared_delete(&self, prepared: PreparedDelete) -> Result<DiskState> {
++		let _disk = self.lock_disk(false)?;
+ 		self.verify_prepared_owner(&prepared.owner, &prepared.target.path, "delete")?;
+ 		if !self.prepared_entry_parent_is_current(&prepared.target)? {
+ 			return Err(Self::stale_entry(&prepared.target));
+@@ -894,6 +923,7 @@ impl LocalFs {
+ 	/// Moves a prepared file only while both parents and exact states remain
+ 	/// current.
+ 	pub fn commit_prepared_move(&self, mut prepared: PreparedMove) -> Result<DiskState> {
++		let disk = self.lock_disk(false)?;
+ 		self.verify_prepared_owner(&prepared.owner, &prepared.source.path, "move")?;
+ 		if !self.prepared_entry_parent_is_current(&prepared.source)?
+ 			|| !self.prepared_entry_parent_is_current(&prepared.destination)?
+@@ -951,7 +981,7 @@ impl LocalFs {
+ 					),
+ 				)
+ 			})?;
+-			let installed = match self.commit_prepared(content) {
++			let installed = match self.commit_prepared_locked(content, &disk) {
+ 				Ok(installed) => installed,
+ 				Err(error) => {
+ 					if Self::rename_noreplace(
+@@ -1125,6 +1155,7 @@ impl LocalFs {
+ 		recursive: bool,
+ 		existing: ExistingDirectoryPolicy,
+ 	) -> Result<PathMetadata> {
++		let _disk = self.lock_disk(false)?;
+ 		let path = path.as_ref();
+ 		let requested_relative = self.lexical_relative(path)?;
+ 		let relative = if recursive {
+@@ -1173,6 +1204,7 @@ impl LocalFs {
+ 		expected_present: bool,
+ 		recursive: bool,
+ 	) -> Result<DiskState> {
++		let _disk = self.lock_disk(false)?;
+ 		let resolved = self.resolve_entry(path.as_ref())?;
+ 		Self::reject_root_entry(&resolved, "remove")?;
+ 		let (parent_relative, _) = Self::split_relative(&resolved.relative)
+@@ -1233,6 +1265,7 @@ impl LocalFs {
+ 
+ 	/// Removes a file, link, empty directory, or recursively a directory tree.
+ 	pub fn remove(&self, path: impl AsRef<Path>, recursive: bool) -> Result<()> {
++		let _disk = self.lock_disk(false)?;
+ 		let resolved = self.resolve_entry(path.as_ref())?;
+ 		Self::reject_root_entry(&resolved, "remove")?;
+ 		let metadata = self
+@@ -1259,6 +1292,7 @@ impl LocalFs {
+ 		destination: impl AsRef<Path>,
+ 		overwrite: DestinationOverwritePolicy,
+ 	) -> Result<PathMetadata> {
++		let _disk = self.lock_disk(false)?;
+ 		let source = self.resolve_entry(source.as_ref())?;
+ 		let destination = self.resolve_entry(destination.as_ref())?;
+ 		Self::reject_root_entry(&source, "rename")?;
+@@ -1287,6 +1321,7 @@ impl LocalFs {
+ 		follow_source: FollowSymlinks,
+ 		overwrite: DestinationOverwritePolicy,
+ 	) -> Result<CopyOutcome> {
++		let _disk = self.lock_disk(false)?;
+ 		if overwrite == DestinationOverwritePolicy::ReplaceEmptyDirectory {
+ 			return Err(Self::invalid_argument(
+ 				destination.as_ref(),
+@@ -1418,6 +1453,7 @@ impl LocalFs {
+ 		target_kind: SymlinkTargetKind,
+ 		overwrite: DestinationOverwritePolicy,
+ 	) -> Result<PathMetadata> {
++		let _disk = self.lock_disk(false)?;
+ 		if overwrite == DestinationOverwritePolicy::ReplaceEmptyDirectory {
+ 			return Err(Self::invalid_argument(
+ 				link.as_ref(),
+@@ -1458,6 +1494,7 @@ impl LocalFs {
+ 		follow_source: FollowSymlinks,
+ 		overwrite: DestinationOverwritePolicy,
+ 	) -> Result<PathMetadata> {
++		let _disk = self.lock_disk(false)?;
+ 		if overwrite == DestinationOverwritePolicy::ReplaceEmptyDirectory {
+ 			return Err(Self::invalid_argument(
+ 				link.as_ref(),
+@@ -1504,6 +1541,7 @@ impl LocalFs {
+ 		changes: PortablePermissions,
+ 		follow: FollowSymlinks,
+ 	) -> Result<PathMetadata> {
++		let _disk = self.lock_disk(false)?;
+ 		let path = path.as_ref();
+ 		if changes.read_only.is_none() && changes.executable.is_none() {
+ 			return Err(Self::invalid_argument(path, "at least one permission property is required"));
+@@ -1572,6 +1610,7 @@ impl LocalFs {
+ 		changes: PortablePermissions,
+ 		follow: FollowSymlinks,
+ 	) -> Result<PathMetadata> {
++		let _disk = self.lock_disk(false)?;
+ 		let path = path.as_ref();
+ 		if changes.read_only.is_none() && changes.executable.is_none() {
+ 			return Err(Self::invalid_argument(path, "at least one permission property is required"));
+@@ -2919,6 +2958,195 @@ mod tests {
+ 		}
+ 	}
+ 
++	// The child is the actual unit-test executable, so these assertions exercise
++	// independently opened OS locks across processes rather than a shared mutex.
++	#[test]
++	fn isolated_authority_child_probe() {
++		let Some(root) = std::env::var_os("OMP_TEST_AUTHORITY_ROOT") else {
++			return;
++		};
++		let mode = std::env::var("OMP_TEST_AUTHORITY_MODE").expect("child operation");
++		let config = ServerConfig::new(root).expect("child config from OMP_DATA_DIR");
++		if mode == "same-owner" {
++			assert!(config.try_lock_authority().is_err());
++			return;
++		}
++		let _authority = config
++			.try_lock_authority()
++			.expect("independent child authority");
++		if mode == "mutation-contended" {
++			let lock = super::super::locks::open("mutation", config.project_key())
++				.expect("child mutation lock");
++			assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
++			return;
++		}
++		assert_eq!(mode, "commit");
++		let filesystem = LocalFs::new(&config).expect("child filesystem");
++		let path = filesystem.root_path().join("document");
++		let prepared = filesystem
++			.prepare_write(
++				&path,
++				Bytes::from_static(b"child"),
++				present_expectation(&filesystem, &path),
++			)
++			.expect("child preparation");
++		filesystem.commit_prepared(prepared).expect("child commit");
++	}
++
++	fn authority_child(root: &Path, namespace: &Path, mode: &str) {
++		use std::{
++			process::{Child, Command, Stdio},
++			thread,
++			time::{Duration, Instant},
++		};
++		struct ChildGuard(Child);
++		impl Drop for ChildGuard {
++			fn drop(&mut self) {
++				let _ = self.0.kill();
++				let _ = self.0.wait();
++			}
++		}
++		let mut child = ChildGuard(
++			Command::new(std::env::current_exe().expect("test executable"))
++				.args([
++					"--exact",
++					"docserver::fs::tests::isolated_authority_child_probe",
++					"--nocapture",
++				])
++				.env("OMP_TEST_AUTHORITY_ROOT", root)
++				.env("OMP_DATA_DIR", namespace)
++				.env("OMP_PROFILE", "default")
++				.env("OMP_TEST_AUTHORITY_MODE", mode)
++				.stdout(Stdio::null())
++				.spawn()
++				.expect("spawn authority child"),
++		);
++		let deadline = Instant::now() + Duration::from_secs(10);
++		loop {
++			if let Some(status) = child.0.try_wait().expect("poll child") {
++				assert!(status.success(), "authority child failed: {status}");
++				break;
++			}
++			assert!(Instant::now() < deadline, "authority child did not finish");
++			thread::sleep(Duration::from_millis(10));
++		}
++	}
++
++	#[test]
++	fn isolated_processes_share_commit_locks_and_reject_stale_writes() {
++		let root = tempfile::tempdir().expect("project");
++		let owners = tempfile::tempdir().expect("owner namespaces");
++		let production = owners.path().join("production");
++		let development = owners.path().join("development");
++		let config = ServerConfig::new(root.path())
++			.expect("config")
++			.with_authority_namespace(&production)
++			.expect("production namespace");
++		let _authority = config.try_lock_authority().expect("production authority");
++		let filesystem = LocalFs::new(&config).expect("filesystem");
++		let path = filesystem.root_path().join("document");
++		fs::write(&path, b"original").expect("fixture");
++		let prepared = filesystem
++			.prepare_write(
++				&path,
++				Bytes::from_static(b"stale"),
++				present_expectation(&filesystem, &path),
++			)
++			.expect("parent preparation");
++		authority_child(root.path(), &production, "same-owner");
++		let mutation = filesystem.lock_disk(false).expect("parent mutation lock");
++		authority_child(root.path(), &development, "mutation-contended");
++		drop(mutation);
++		authority_child(root.path(), &development, "commit");
++		assert!(matches!(filesystem.commit_prepared(prepared), Err(Error::StaleDiskState { .. })));
++		assert_eq!(fs::read(path).expect("final contents"), b"child");
++	}
++
++	#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
++	#[test]
++	fn isolated_commit_waits_for_stale_exchange_rollback() {
++		use std::{thread, time::Duration};
++		let (root, first) = create_filesystem();
++		let config = ServerConfig::new(root.path()).expect("second config");
++		let second = LocalFs::new(&config).expect("second filesystem");
++		let path = first.root_path().join("document");
++		fs::write(&path, b"original").expect("fixture");
++		let stale = first
++			.prepare_write(&path, Bytes::from_static(b"stale"), present_expectation(&first, &path))
++			.expect("stale preparation");
++		// Change only after preparation, forcing the atomic exchange to roll back.
++		fs::write(&path, b"external").expect("external update");
++		let current = second
++			.prepare_write(&path, Bytes::from_static(b"second"), present_expectation(&second, &path))
++			.expect("current preparation");
++		let (entered_tx, entered_rx) = flume::bounded(1);
++		let (release_tx, release_rx) = flume::bounded(1);
++		first.set_mutation_hook(move |stage, _| {
++			if stage == MutationStage::AfterWrite {
++				entered_tx.send(()).expect("exchange notification");
++				release_rx
++					.recv_timeout(Duration::from_secs(5))
++					.expect("release exchange");
++			}
++		});
++		let first_thread = thread::spawn(move || first.commit_prepared(stale));
++		entered_rx
++			.recv_timeout(Duration::from_secs(5))
++			.expect("first exchange");
++		let reader = LocalFs::new(&config).expect("reader filesystem");
++		let read_path = path.clone();
++		let (read_started_tx, read_started_rx) = flume::bounded(1);
++		let (read_tx, read_rx) = flume::bounded(1);
++		let read_thread = thread::spawn(move || {
++			read_started_tx.send(()).expect("reader start");
++			read_tx
++				.send(reader.stable_read(read_path))
++				.expect("reader result");
++		});
++		read_started_rx
++			.recv_timeout(Duration::from_secs(5))
++			.expect("reader starts");
++		assert!(matches!(
++			read_rx.recv_timeout(Duration::from_millis(50)),
++			Err(flume::RecvTimeoutError::Timeout)
++		));
++		let (started_tx, started_rx) = flume::bounded(1);
++		let (finished_tx, finished_rx) = flume::bounded(1);
++		let second_thread = thread::spawn(move || {
++			started_tx.send(()).expect("second start");
++			let result = second.commit_prepared(current);
++			finished_tx.send(result).expect("second result");
++		});
++		started_rx
++			.recv_timeout(Duration::from_secs(5))
++			.expect("second starts");
++		assert!(matches!(
++			finished_rx.recv_timeout(Duration::from_millis(50)),
++			Err(flume::RecvTimeoutError::Timeout)
++		));
++		release_tx.send(()).expect("release rollback");
++		assert!(matches!(
++			first_thread.join().expect("first worker"),
++			Err(Error::StaleDiskState { .. })
++		));
++		finished_rx
++			.recv_timeout(Duration::from_secs(5))
++			.expect("second finishes")
++			.expect("second commit");
++		second_thread.join().expect("second worker");
++		let read = read_rx
++			.recv_timeout(Duration::from_secs(5))
++			.expect("reader finishes")
++			.expect("consistent read");
++		read_thread.join().expect("reader worker");
++		let content = read.content().expect("present document");
++		assert!(
++			content.as_ref() == b"external" || content.as_ref() == b"second",
++			"reader must never observe the provisional stale exchange"
++		);
++		assert_eq!(fs::read(path).expect("final contents"), b"second");
++	}
++
+ 	#[test]
+ 	fn stable_read_preserves_exact_bytes_and_missing_state() {
+ 		let (_root, filesystem) = create_filesystem();
+diff --git a/crates/envd/src/docserver/locks.rs b/crates/envd/src/docserver/locks.rs
+new file mode 100644
+index 0000000000..3e28dd7e4e
+--- /dev/null
++++ b/crates/envd/src/docserver/locks.rs
+@@ -0,0 +1,124 @@
++//! Owner-private process locks shared across isolated document authorities.
++
++use std::{
++	fs, io,
++	path::{Path, PathBuf},
++};
++
++use omp_core::Hash32;
++
++/// Physical directory identity, unaffected by path aliases or a root rename.
++pub(super) fn project_key(root: &fs::Metadata, path: &Path) -> io::Result<Hash32> {
++	#[cfg(unix)]
++	{
++		use std::os::unix::fs::MetadataExt;
++		let mut digest = Hash32::hasher();
++		digest.update(root.dev().to_le_bytes());
++		digest.update(root.ino().to_le_bytes());
++		let _ = path;
++		Ok(digest.finalize())
++	}
++	#[cfg(windows)]
++	{
++		use std::os::windows::fs::MetadataExt;
++		let volume = root
++			.volume_serial_number()
++			.ok_or_else(|| io::Error::other("missing root volume identity"))?;
++		let index = root
++			.file_index()
++			.ok_or_else(|| io::Error::other("missing root file identity"))?;
++		let mut digest = Hash32::hasher();
++		digest.update(volume.to_le_bytes());
++		digest.update(index.to_le_bytes());
++		let _ = path;
++		Ok(digest.finalize())
++	}
++	#[cfg(not(any(unix, windows)))]
++	{
++		let _ = root;
++		Ok(Hash32::sum(path.as_os_str().as_encoded_bytes()))
++	}
++}
++
++/// Canonical owner namespace; data-directory aliases identify the same owner.
++pub(super) fn namespace_key(path: &Path) -> io::Result<Hash32> {
++	let path = match fs::canonicalize(path) {
++		Ok(path) => path,
++		Err(error) if error.kind() == io::ErrorKind::NotFound => std::path::absolute(path)?,
++		Err(error) => return Err(error),
++	};
++	Ok(Hash32::sum(path.as_os_str().as_encoded_bytes()))
++}
++
++/// Opens a stable lock inode outside the tool-writable project. Never unlink
++/// lock files: replacement would let concurrent processes lock different
++/// inodes.
++pub(super) fn open(kind: &str, key: &Hash32) -> io::Result<fs::File> {
++	let directory = directory()?;
++	let path = directory.join(format!("{kind}-{}.lock", key.to_hex()));
++	let mut options = fs::OpenOptions::new();
++	options.read(true).write(true).create(true).truncate(false);
++	#[cfg(unix)]
++	{
++		use std::os::unix::fs::OpenOptionsExt;
++		options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
++	}
++	let file = options.open(path)?;
++	let metadata = file.metadata()?;
++	if !metadata.is_file() {
++		return Err(io::Error::new(
++			io::ErrorKind::InvalidData,
++			"document lock is not a regular file",
++		));
++	}
++	#[cfg(unix)]
++	{
++		use std::os::unix::fs::MetadataExt;
++		if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
++			return Err(io::Error::new(
++				io::ErrorKind::PermissionDenied,
++				"document lock must be owner-only",
++			));
++		}
++	}
++	Ok(file)
++}
++
++fn directory() -> io::Result<PathBuf> {
++	// Unix socket paths already use /tmp. Do not let app-specific TMPDIR or
++	// OMP_* state overrides split the physical-project mutation lock domain.
++	#[cfg(unix)]
++	let directory = PathBuf::from("/tmp")
++		.join(format!("omp-envd-authorities-{}", rustix::process::geteuid().as_raw()));
++	#[cfg(not(unix))]
++	let directory = std::env::temp_dir().join("omp-envd-authorities");
++	let mut builder = fs::DirBuilder::new();
++	#[cfg(unix)]
++	{
++		use std::os::unix::fs::DirBuilderExt;
++		builder.mode(0o700);
++	}
++	match builder.create(&directory) {
++		Ok(()) => {},
++		Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
++		Err(error) => return Err(error),
++	}
++	let metadata = fs::symlink_metadata(&directory)?;
++	if !metadata.is_dir() {
++		return Err(io::Error::new(
++			io::ErrorKind::InvalidData,
++			"document lock root is not a directory",
++		));
++	}
++	#[cfg(unix)]
++	{
++		use std::os::unix::fs::MetadataExt;
++		if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
++			return Err(io::Error::new(
++				io::ErrorKind::PermissionDenied,
++				"document lock root must be owner-only",
++			));
++		}
++	}
++	Ok(directory)
++}
+diff --git a/crates/envd/src/docserver/mod.rs b/crates/envd/src/docserver/mod.rs
+index 771c7ba5b5..ce9c315f07 100644
+--- a/crates/envd/src/docserver/mod.rs
++++ b/crates/envd/src/docserver/mod.rs
+@@ -32,6 +32,7 @@ mod error;
+ pub mod format_options;
+ /// Portable Environment filesystem value types.
+ pub mod fs;
++mod locks;
+ /// Ordered LSP lifecycle, synchronization, and passthrough primitives.
+ pub mod lsp;
+ /// Transactional lowering for server-initiated workspace edit requests.
+diff --git a/crates/envd/src/docserver/path_ops.rs b/crates/envd/src/docserver/path_ops.rs
+index ee10cc1bad..b0bc44b500 100644
+--- a/crates/envd/src/docserver/path_ops.rs
++++ b/crates/envd/src/docserver/path_ops.rs
+@@ -18,7 +18,7 @@ use crate::docserver::{
+ 	environment::WorkspaceMutationGuard,
+ 	fs::{
+ 		CopyOutcome, DestinationOverwritePolicy, DirectoryEntry, DiskState, ExistingDirectoryPolicy,
+-		FileKind, FollowSymlinks, PathMetadata, PortablePermissions, SymlinkTarget,
++		FileKind, FollowSymlinks, LocalFs, PathMetadata, PortablePermissions, SymlinkTarget,
+ 		SymlinkTargetKind,
+ 	},
+ 	lsp_registry::LspRegistry,
+@@ -135,9 +135,8 @@ impl PathService {
+ 		self.reject_active_at_or_below(&path, cancellation).await?;
+ 		ensure_not_cancelled(cancellation, &path, "create directory")?;
+ 		let metadata = self
+-			.store
+-			.local_fs()
+-			.create_directory(path, recursive, existing)?;
++			.filesystem(move |filesystem| filesystem.create_directory(path, recursive, existing))
++			.await?;
+ 		Ok(PathMutationResult::Completed(metadata))
+ 	}
+ 
+@@ -186,7 +185,9 @@ impl PathService {
+ 			self.reject_active_exact(&metadata.path, cancellation)?;
+ 		}
+ 		ensure_not_cancelled(cancellation, &metadata.path, "remove path")?;
+-		self.store.local_fs().remove(path, recursive)?;
++		self
++			.filesystem(move |filesystem| filesystem.remove(path, recursive))
++			.await?;
+ 		Ok(PathMutationResult::Completed(()))
+ 	}
+ 
+@@ -263,9 +264,8 @@ impl PathService {
+ 			.await?;
+ 		ensure_not_cancelled(cancellation, &source_metadata.path, "rename path")?;
+ 		let metadata = self
+-			.store
+-			.local_fs()
+-			.rename(source, destination, overwrite)?;
++			.filesystem(move |filesystem| filesystem.rename(source, destination, overwrite))
++			.await?;
+ 		Ok(PathMutationResult::Completed(metadata))
+ 	}
+ 
+@@ -370,9 +370,10 @@ impl PathService {
+ 			.await?;
+ 		ensure_not_cancelled(cancellation, &destination, "copy path")?;
+ 		let outcome = self
+-			.store
+-			.local_fs()
+-			.copy(source, destination, follow_source, overwrite)?;
++			.filesystem(move |filesystem| {
++				filesystem.copy(source, destination, follow_source, overwrite)
++			})
++			.await?;
+ 		Ok(PathMutationResult::Completed(outcome))
+ 	}
+ 
+@@ -405,10 +406,12 @@ impl PathService {
+ 		ensure_not_cancelled(cancellation, &link, "create symlink")?;
+ 		self.reject_active_at_or_below(&link, cancellation).await?;
+ 		ensure_not_cancelled(cancellation, &link, "create symlink")?;
++		let target = target.clone();
+ 		let metadata = self
+-			.store
+-			.local_fs()
+-			.create_symlink(target, link, target_kind, overwrite)?;
++			.filesystem(move |filesystem| {
++				filesystem.create_symlink(&target, link, target_kind, overwrite)
++			})
++			.await?;
+ 		Ok(PathMutationResult::Completed(metadata))
+ 	}
+ 
+@@ -450,11 +453,11 @@ impl PathService {
+ 		}
+ 		self.reject_active_at_or_below(&link, cancellation).await?;
+ 		ensure_not_cancelled(cancellation, &link, "create hard link")?;
+-		let metadata =
+-			self
+-				.store
+-				.local_fs()
+-				.create_hard_link(source, link, follow_source, overwrite)?;
++		let metadata = self
++			.filesystem(move |filesystem| {
++				filesystem.create_hard_link(source, link, follow_source, overwrite)
++			})
++			.await?;
+ 		Ok(PathMutationResult::Completed(metadata))
+ 	}
+ 
+@@ -495,12 +498,23 @@ impl PathService {
+ 		}
+ 		ensure_not_cancelled(cancellation, &path, "set path permissions")?;
+ 		let metadata = self
+-			.store
+-			.local_fs()
+-			.set_permissions(path, permissions, follow)?;
++			.filesystem(move |filesystem| filesystem.set_permissions(path, permissions, follow))
++			.await?;
+ 		Ok(PathMutationResult::Completed(metadata))
+ 	}
+ 
++	// Filesystem commits can wait for another application's short mutation lock.
++	// Keep that wait and the following disk operation off the async runtime.
++	async fn filesystem<T: Send + 'static>(
++		&self,
++		operation: impl FnOnce(LocalFs) -> Result<T> + Send + 'static,
++	) -> Result<T> {
++		let filesystem = self.store.local_fs();
++		tokio::task::spawn_blocking(move || operation(filesystem))
++			.await
++			.map_err(|source| Error::Worker { source })?
++	}
++
+ 	async fn active_regular(
+ 		&self,
+ 		path: &Path,
+@@ -558,7 +572,11 @@ impl PathService {
+ 			return Ok(content.clone());
+ 		}
+ 		ensure_not_cancelled(cancellation, source, "copy path")?;
+-		match self.store.local_fs().stable_read(source)? {
++		let source_path = source.to_path_buf();
++		match self
++			.filesystem(move |filesystem| filesystem.stable_read(source_path))
++			.await?
++		{
+ 			DiskState::Present { content, .. } => Ok(content),
+ 			DiskState::Missing => Err(path_io_error(
+ 				source,
+diff --git a/crates/envd/src/docserver/types.rs b/crates/envd/src/docserver/types.rs
+index 319339fd16..01f323d34a 100644
+--- a/crates/envd/src/docserver/types.rs
++++ b/crates/envd/src/docserver/types.rs
+@@ -560,12 +560,14 @@ half_open_range!(LineRange, RangeKind::Line, "line count", "A zero-based half-op
+ /// operation.
+ #[derive(Clone)]
+ pub struct ServerConfig {
+-	environment_root:   PathBuf,
+-	server_build:       Str,
+-	root:               Arc<Dir>,
+-	authority_held:     Arc<AtomicBool>,
+-	revision_capacity:  NonZeroUsize,
+-	max_document_bytes: NonZeroU64,
++	environment_root:    PathBuf,
++	server_build:        Str,
++	root:                Arc<Dir>,
++	authority_held:      Arc<AtomicBool>,
++	project_key:         Hash32,
++	authority_namespace: Hash32,
++	revision_capacity:   NonZeroUsize,
++	max_document_bytes:  NonZeroU64,
+ }
+ 
+ impl fmt::Debug for ServerConfig {
+@@ -583,6 +585,7 @@ impl fmt::Debug for ServerConfig {
+ impl PartialEq for ServerConfig {
+ 	fn eq(&self, other: &Self) -> bool {
+ 		self.environment_root == other.environment_root
++			&& self.authority_namespace == other.authority_namespace
+ 			&& self.server_build == other.server_build
+ 			&& self.revision_capacity == other.revision_capacity
+ 			&& self.max_document_bytes == other.max_document_bytes
+@@ -591,12 +594,14 @@ impl PartialEq for ServerConfig {
+ 
+ impl Eq for ServerConfig {}
+ 
+-/// Exclusive daemon authority held on the stable project directory itself.
++/// Exclusive authority in one owner namespace, plus a shared project lock
++/// preventing an older, globally exclusive authority from running concurrently.
+ #[derive(Debug)]
+ #[must_use]
+ pub struct AuthorityLock {
+-	root: fs::File,
+-	held: Arc<AtomicBool>,
++	root:       fs::File,
++	_namespace: fs::File,
++	held:       Arc<AtomicBool>,
+ }
+ 
+ impl Drop for AuthorityLock {
+@@ -646,18 +651,53 @@ impl ServerConfig {
+ 				reason: sf!("Environment root changed while it was opened"),
+ 			});
+ 		}
++		let data_dir = omp_core::dirs::data_dir(None).map_err(|source| Error::Io {
++			operation: sf!("resolve Environment authority namespace"),
++			path:      canonical.clone(),
++			source:    io::Error::other(source),
++		})?;
++		let authority_namespace =
++			super::locks::namespace_key(&data_dir).map_err(|source| Error::Io {
++				operation: sf!("identify Environment authority namespace"),
++				path: data_dir,
++				source,
++			})?;
++		let project_key =
++			super::locks::project_key(&opened, &canonical).map_err(|source| Error::Io {
++				operation: sf!("identify Environment authority root"),
++				path: canonical.clone(),
++				source,
++			})?;
+ 		Ok(Self {
+-			environment_root:   canonical,
+-			server_build:       Str::default(),
+-			root:               Arc::new(root),
+-			authority_held:     Arc::new(AtomicBool::new(false)),
+-			revision_capacity:  NonZeroUsize::new(DEFAULT_REVISION_CAPACITY)
++			project_key,
++			authority_namespace,
++			environment_root: canonical,
++			server_build: Str::default(),
++			root: Arc::new(root),
++			authority_held: Arc::new(AtomicBool::new(false)),
++			revision_capacity: NonZeroUsize::new(DEFAULT_REVISION_CAPACITY)
+ 				.expect("default revision capacity is nonzero"),
+ 			max_document_bytes: NonZeroU64::new(DEFAULT_MAX_DOCUMENT_BYTES)
+ 				.expect("default document limit is nonzero"),
+ 		})
+ 	}
+ 
++	/// Selects the data namespace whose document authority this server owns.
++	/// The default follows `OMP_DATA_DIR` and the selected OMP profile.
++	pub fn with_authority_namespace(mut self, namespace: &Path) -> Result<Self> {
++		self.authority_namespace =
++			super::locks::namespace_key(namespace).map_err(|source| Error::Io {
++				operation: sf!("identify Environment authority namespace"),
++				path: namespace.to_path_buf(),
++				source,
++			})?;
++		Ok(self)
++	}
++
++	pub(super) const fn project_key(&self) -> &Hash32 {
++		&self.project_key
++	}
++
+ 	/// Sets the executable-generation identity advertised to document clients.
+ 	pub fn with_server_build(mut self, build: impl Into<Str>) -> Self {
+ 		self.server_build = build.into();
+@@ -675,7 +715,9 @@ impl ServerConfig {
+ 		&self.environment_root
+ 	}
+ 
+-	/// Acquires process authority on the opened project directory.
++	/// Acquires one authority per physical project and owner data namespace.
++	/// Other namespaces may observe the same project; final disk mutations
++	/// still serialize on a separate physical-project lock.
+ 	pub fn try_lock_authority(&self) -> Result<AuthorityLock> {
+ 		use cap_std::fs;
+ 
+@@ -696,22 +738,40 @@ impl ServerConfig {
+ 		let result = (|| {
+ 			let root = self
+ 				.root
+-				.try_clone()
++				.open_dir(".")
+ 				.map(fs::Dir::into_std_file)
+ 				.map_err(|source| Error::Io {
+-					operation: sf!("clone Environment authority handle"),
++					operation: sf!("open Environment authority handle"),
++					path: self.environment_root.clone(),
++					source,
++				})?;
++			root.try_lock_shared().map_err(|source| Error::Io {
++				operation: sf!("lock Environment authority"),
++				path:      self.environment_root.clone(),
++				source:    source.into(),
++			})?;
++			let mut digest = Hash32::hasher();
++			digest.update(self.project_key.as_bytes());
++			digest.update(self.authority_namespace.as_bytes());
++			let namespace =
++				super::locks::open("authority", &digest.finalize()).map_err(|source| Error::Io {
++					operation: sf!("open Environment authority lock"),
+ 					path: self.environment_root.clone(),
+ 					source,
+ 				})?;
+-			root.try_lock().map_err(|source| Error::Io {
++			namespace.try_lock().map_err(|source| Error::Io {
+ 				operation: sf!("lock Environment authority"),
+ 				path:      self.environment_root.clone(),
+ 				source:    source.into(),
+ 			})?;
+-			Ok(root)
++			Ok((root, namespace))
+ 		})();
+ 		match result {
+-			Ok(root) => Ok(AuthorityLock { root, held: Arc::clone(&self.authority_held) }),
++			Ok((root, namespace)) => Ok(AuthorityLock {
++				root,
++				_namespace: namespace,
++				held: Arc::clone(&self.authority_held),
++			}),
+ 			Err(error) => {
+ 				self.authority_held.store(false, Ordering::Release);
+ 				Err(error)
+@@ -941,6 +1001,69 @@ mod tests {
+ 		let _reacquired_authority = config.try_lock_authority().expect("released authority");
+ 	}
+ 
++	#[test]
++	fn authority_is_exclusive_within_each_data_namespace() {
++		let root = TempDir::new().expect("project");
++		let owners = TempDir::new().expect("owner namespaces");
++		let config = |name: &str| {
++			ServerConfig::new(root.path())
++				.expect("config")
++				.with_authority_namespace(&owners.path().join(name))
++				.expect("namespace")
++		};
++		let production = config("production");
++		let development = config("development");
++		let production_lock = production
++			.try_lock_authority()
++			.expect("production authority");
++		let _development_lock = development
++			.try_lock_authority()
++			.expect("independent development authority");
++		assert!(config("production").try_lock_authority().is_err());
++		drop(production_lock);
++		let _replacement = config("production")
++			.try_lock_authority()
++			.expect("released production authority");
++	}
++
++	#[cfg(unix)]
++	#[test]
++	fn namespace_aliases_do_not_create_a_second_authority() {
++		let root = TempDir::new().expect("project");
++		let owners = TempDir::new().expect("owner namespaces");
++		let owner = owners.path().join("owner");
++		let alias = owners.path().join("alias");
++		fs::create_dir(&owner).expect("owner directory");
++		std::os::unix::fs::symlink(&owner, &alias).expect("owner alias");
++		let first = ServerConfig::new(root.path())
++			.expect("config")
++			.with_authority_namespace(&owner)
++			.expect("namespace");
++		let second = ServerConfig::new(root.path())
++			.expect("config")
++			.with_authority_namespace(&alias)
++			.expect("namespace alias");
++		let _authority = first.try_lock_authority().expect("first authority");
++		assert!(second.try_lock_authority().is_err());
++	}
++
++	#[cfg(unix)]
++	#[test]
++	fn legacy_physical_authority_and_scoped_authority_exclude_each_other() {
++		let root = TempDir::new().expect("project");
++		let legacy = fs::File::open(root.path()).expect("legacy root handle");
++		legacy.try_lock().expect("legacy exclusive authority");
++		let config = ServerConfig::new(root.path()).expect("config");
++		assert!(config.try_lock_authority().is_err());
++		legacy.unlock().expect("release legacy authority");
++		let scoped = config.try_lock_authority().expect("scoped authority");
++		assert!(matches!(legacy.try_lock(), Err(fs::TryLockError::WouldBlock)));
++		drop(scoped);
++		legacy
++			.try_lock()
++			.expect("legacy authority after scoped shutdown");
++	}
++
+ 	#[cfg(unix)]
+ 	#[test]
+ 	fn authority_follows_the_open_directory_across_rename() {
+diff --git a/justfile b/justfile
+index 4300e78668..585e104de4 100644
+--- a/justfile
++++ b/justfile
+@@ -389,3 +389,10 @@ test-omperor-cache-timer:
+     cargo nextest run -p omp-journal --lib --locked -E 'test(receipt_observation)'
+     cargo nextest run -p omp-app --lib --locked -E 'test(receipt_rpc_preserves)'
+     cargo test --doc -p omp-ai -p omp-agent -p omp-journal -p omp-app --locked
++
++# Isolated app owners share workspaces without sharing runtime state or unsafe disk commits.
++[group('test')]
++test-omperor-isolated-state:
++    cargo nextest run -p omp-env --lib --locked -E 'test(project_state::)'
++    cargo nextest run -p omp-envd --lib --locked -E 'test(docserver::types::tests::) | test(docserver::fs::tests::) | test(docserver::path_ops::tests::) | test(docserver::daemon::tests::) | test(docserver::actor::tests::) | test(docserver::transaction::tests::) | test(document_authority) | test(stale_daemon_does_not_rehost) | test(new_build_attach_waits)'
++    cargo test --doc -p omp-env -p omp-envd --locked

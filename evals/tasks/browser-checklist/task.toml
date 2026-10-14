@@ -1,0 +1,22 @@
+description = "Drive the native browser tool: add and complete checklist items, screenshot, close the tab."
+tags = ["browser"]
+timeout_secs = 240
+prompt = """Use the native browser tool to open http://127.0.0.1:{port:web} in a new tab owned by this task. \
+Inspect the page, add a task named "Check keyboard navigation" using the textbox and button, then complete the \
+existing "Review release notes" task. Verify there is one open task and its name is "Check keyboard navigation". \
+Capture a browser screenshot to inspect the final page. Close only the tab created for this task. Do not fetch or \
+alter the page through shell, HTTP libraries, filesystem edits, or web search; browser actions only. Report the \
+final task name and count, or the actual tool failure."""
+
+[[services]]
+name = "web"
+argv = ["python3", "{task}/server.py", "--port", "{port:web}", "--state", "{attempt}/browser-state.json"]
+
+[[checks]]
+type = "answer_contains"
+text = "Check keyboard navigation"
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py", "{attempt}/browser-state.json"]
+timeout_secs = 30

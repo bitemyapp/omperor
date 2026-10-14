@@ -1,0 +1,8 @@
+/target/
+/target-*/
+target-dev/
+.DS_Store
+/.omp/*.lock
+/.objc2-overlay/
+__pycache__/
+/.ruff_cache/

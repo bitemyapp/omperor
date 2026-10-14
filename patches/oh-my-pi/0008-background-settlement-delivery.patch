@@ -1,0 +1,292 @@
+diff --git a/crates/agent/src/loop.rs b/crates/agent/src/loop.rs
+--- a/crates/agent/src/loop.rs
++++ b/crates/agent/src/loop.rs
+@@ -1723,7 +1723,10 @@
+ 			// settlement (or steering / an
+ 			// interrupt) and re-enters with the async-result follow-up.
+ 			if crate::jobs::pending_wake(session.dom()) {
+-				match self.await_settlement(session, turn_cancel, control).await? {
++				match self
++					.await_settlement(session, turn, turn_cancel, control)
++					.await?
++				{
+ 					Awaited::Settled => continue,
+ 					Awaited::Steering => {
+ 						was_steered = true;
+@@ -1908,6 +1911,7 @@
+ 	async fn await_settlement(
+ 		&mut self,
+ 		session: &mut Session,
++		turn: Handle,
+ 		turn_cancel: &crate::TurnCancellation,
+ 		control: &RunControl,
+ 	) -> Result<Awaited, KernelError> {
+@@ -1931,7 +1935,17 @@
+ 					turn_cancel.cancel_turn();
+ 					return Ok(Awaited::Cancelled);
+ 				},
+-				AwaitSignal::Finished => return Ok(Awaited::Settled),
++				AwaitSignal::Finished => {
++					// Detached tools signal on progress as well as completion. Drain
++					// their updates, but resume inference only after a terminal result
++					// has been journaled as a user follow-up. Otherwise the next
++					// request both wastes tokens and ends in assistant prefill.
++					let delivered = self.deliver_settlements(session, turn)?;
++					self.apply_live_components(session)?;
++					if delivered {
++						return Ok(Awaited::Settled);
++					}
++				},
+ 				AwaitSignal::Control(message) => match call_control.handle(session, message)? {
+ 					Received::ToolScopedAbort(_) => {},
+ 					Received::Cancelled => return Ok(Awaited::Cancelled),
+diff --git a/crates/agent/src/jobs.rs b/crates/agent/src/jobs.rs
+--- a/crates/agent/src/jobs.rs
++++ b/crates/agent/src/jobs.rs
+@@ -523,9 +523,9 @@
+ 		})
+ 	}
+ 
+-	/// Whether any owned execution unit has finished but not yet been
+-	/// committed to its DOM node (a cheap check the turn loop makes before
+-	/// deciding whether to poll).
++	/// Whether any owned execution unit has progress or completion to commit
++	/// to its DOM node (a cheap check before polling). Progress alone does not
++	/// mean a result is ready for inference.
+ 	#[must_use]
+ 	pub fn has_finished_units(&self) -> bool {
+ 		self.jobs.lock().values().any(|job| {
+@@ -540,8 +540,9 @@
+ 		})
+ 	}
+ 
+-	/// Resolves once any owned execution unit finishes (never when none is
+-	/// live); used by hosts idling between turns.
++	/// Resolves when an owned execution unit has progress or completion
++	/// (never when none is live). Callers must poll and check for an actual
++	/// settlement before resuming inference.
+ 	pub async fn any_finished(&self) {
+ 		loop {
+ 			if self.has_finished_units() {
+@@ -874,7 +875,14 @@
+ 			.and_then(|child| prop(child, PropId::Text))
+ 			.map_or_else(|| Str::new_static("detached tool failed"), Str::new)
+ 	});
+-	Some(RecoveredSettlement { is_error, status: None, artifact, output: None, error })
++	// Inline terminals have no artifact. Recover their latest payload too;
++	// otherwise the job retains its original "detached/running" data.
++	let output = if artifact.is_none() {
++		call_outcome(dom, handle).map(ToOwned::to_owned)
++	} else {
++		None
++	};
++	Some(RecoveredSettlement { is_error, status: None, artifact, output, error })
+ }
+ 
+ fn find_call(dom: &Dom, parent: Handle, call: EntryId) -> Option<Handle> {
+@@ -903,26 +911,30 @@
+ 	{
+ 		return BlobRef::parse_hex(hash, size).ok();
+ 	}
+-	let details = dom.children(call).iter().rev().find_map(|handle| {
+-		let child = dom.get(*handle)?;
+-		match child.tag {
+-			Tag::Known(KnownTag::Result) => match child.prop(&PropKey::from(PropId::Outcome)) {
+-				Some(Value::Json(raw)) => Some(raw),
+-				_ => None,
+-			},
+-			Tag::Known(KnownTag::Diag) => match child.prop(&PropKey::from(PropId::Fault)) {
+-				Some(Value::Json(raw)) => Some(raw),
+-				_ => None,
+-			},
+-			_ => None,
+-		}
+-	})?;
++	let details = call_outcome(dom, call)?;
+ 	let CallOutcomeDetails::Spilled { blob, byte_len } =
+ 		serde_json::from_str::<CallOutcomeDetails>(details.get()).ok()?
+ 	else {
+ 		return None;
+ 	};
+ 	BlobRef::parse_hex(blob.hash.as_str(), byte_len).ok()
++}
++
++fn call_outcome(dom: &Dom, call: Handle) -> Option<&RawValue> {
++	dom.children(call).iter().rev().find_map(|handle| {
++		let child = dom.get(*handle)?;
++		match child.tag {
++			Tag::Known(KnownTag::Result) => match child.prop(&PropKey::from(PropId::Outcome)) {
++				Some(Value::Json(raw)) => Some(raw.as_ref()),
++				_ => None,
++			},
++			Tag::Known(KnownTag::Diag) => match child.prop(&PropKey::from(PropId::Fault)) {
++				Some(Value::Json(raw)) => Some(raw.as_ref()),
++				_ => None,
++			},
++			_ => None,
++		}
++	})
+ }
+ 
+ /// Inline shape of a settlement output that exceeded the board's bound: the
+diff --git a/crates/agent/tests/turn.rs b/crates/agent/tests/turn.rs
+--- a/crates/agent/tests/turn.rs
++++ b/crates/agent/tests/turn.rs
+@@ -960,6 +960,7 @@
+ 	assert_eq!(outcome.stop, TurnStop::Completed);
+ 	let requests = requests.lock();
+ 	assert_eq!(requests.len(), 2, "the settlement re-woke the loop for one follow-up request");
++	assert_eq!(requests[1].messages.last().expect("follow-up").role, Role::User);
+ 	assert!(requests[1].messages.iter().any(|message| {
+ 		message.role == Role::User
+ 			&& message.content.iter().any(|part| {
+@@ -989,6 +990,92 @@
+ 			.expect("selector")
+ 			.count()
+ 			== 1
++	);
++}
++
++/// Progress from a detached tool updates the journal but must not spend a
++/// model request until the terminal result can be appended as a user follow-up.
++#[tokio::test]
++async fn background_progress_does_not_resume_inference_before_completion() {
++	use omp_agent::{
++		ExternalDispatchEvent, ExternalDispatchRequest, ExternalDispatchStream, ExternalToolExecutor,
++	};
++	use omp_tool::{CallOutcome, Claims, Part, Precedence, Presentation};
++
++	struct ProgressJob {
++		progress: flume::Receiver<()>,
++		complete: flume::Receiver<()>,
++	}
++	impl ExternalToolExecutor for ProgressJob {
++		fn invoke(&self, _: ExternalDispatchRequest) -> ExternalDispatchStream {
++			let progress = self.progress.clone();
++			let complete = self.complete.clone();
++			Box::pin(async_stream::stream! {
++				progress.recv_async().await.expect("progress gate");
++				yield ExternalDispatchEvent::Update(support::raw(serde_json::json!({"text": "still working"})));
++				complete.recv_async().await.expect("completion gate");
++				yield ExternalDispatchEvent::Done {
++					outcome: CallOutcome::Ok(serde_json::json!({"text": "FINAL_RESULT"})),
++					parts: vec![Part::Text { text: Str::new_static("FINAL_RESULT") }],
++					is_error: false,
++					source_artifact: None,
++				};
++			})
++		}
++	}
++	let directory = tempfile::tempdir().expect("temporary directory");
++	let (inference, requests) = ScriptedInference::new([
++		tool_script("job-1", "worker", serde_json::json!({})),
++		text_script("waiting for completion"),
++		text_script("FINAL_RESULT"),
++	]);
++	let mut tools = omp_tool::Registry::new();
++	tools
++		.register_worker(support::tool_spec("worker", 1), Presentation::Slot, Claims {
++			precedence: Precedence::CORE,
++			claimant:   Str::new_static("test"),
++			replaces:   None,
++		})
++		.expect("worker registers");
++	let (progress_tx, progress_rx) = flume::bounded(1);
++	let (complete_tx, complete_rx) = flume::bounded(1);
++	let mut kernel = Kernel::new(
++		inference,
++		Arc::new(tools),
++		policy(&directory.path().join("blobs")).with_limits(64 * 1024, 512, Duration::from_millis(5)),
++		StaticPrompt(Str::new_static("test system")),
++	)
++	.with_external_executor(Arc::new(ProgressJob { progress: progress_rx, complete: complete_rx }));
++	let mut session = fresh_session(&directory.path().join("progress.oms"));
++	let probe = async {
++		tokio::time::timeout(Duration::from_secs(2), async {
++			while requests.lock().len() < 2 {
++				tokio::time::sleep(Duration::from_millis(1)).await;
++			}
++		})
++		.await
++		.expect("parent reaches candidate yield");
++		progress_tx.send(()).expect("send progress");
++		tokio::time::sleep(Duration::from_millis(150)).await;
++		assert_eq!(requests.lock().len(), 2, "progress must not trigger inference");
++		complete_tx.send(()).expect("send completion");
++	};
++	let (outcome, ()) = tokio::time::timeout(Duration::from_secs(3), async {
++		tokio::join!(kernel.run_turn(&mut session, input("run worker"), RunControl::default()), probe)
++	})
++	.await
++	.expect("job completes");
++	assert_eq!(outcome.expect("turn succeeds").stop, TurnStop::Completed);
++	let requests = requests.lock();
++	assert_eq!(requests.len(), 3, "one invocation, one yield, one completion response");
++	let last = requests[2].messages.last().expect("completion input");
++	assert_eq!(last.role, Role::User, "completion must not become assistant prefill");
++	assert!(
++		last.content.iter().any(|part| matches!(part,
++			ContentPart::Text { text, .. } if text.contains("FINAL_RESULT") && text.contains("has completed")
++		)),
++		"completion content: {:?}",
++		last.content
+ 	);
+ }
+ 
+diff --git a/crates/agent/tests/jobs.rs b/crates/agent/tests/jobs.rs
+--- a/crates/agent/tests/jobs.rs
++++ b/crates/agent/tests/jobs.rs
+@@ -526,3 +526,40 @@
+ 		"the recovered terminal is journaled exactly once"
+ 	);
+ }
++
++/// A restart between the tool's terminal entry and jobs.settle must recover
++/// an inline result, rather than re-delivering the initial detached handle.
++#[tokio::test]
++async fn jobs_restart_recovers_inline_terminal_output() {
++	let raw = |value: serde_json::Value| {
++		serde_json::value::to_raw_value(&value).expect("serialize test value")
++	};
++	let temp = tempdir().expect("temporary session directory");
++	let path = temp.path().join("inline.oms");
++	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("create session");
++	session.begin_turn().expect("turn");
++	let call = session
++		.call("bash", 1, "inline-call", None, Some(raw(serde_json::json!({}))), None)
++		.expect("call");
++	session
++		.settle(call, raw(serde_json::json!({"kind": "detached", "id": "inline-job"})))
++		.expect("detach");
++	let output = serde_json::json!({"kind": "ok", "value": {"text": "INLINE_DONE"}});
++	session
++		.settle(call, raw(output.clone()))
++		.expect("terminal result");
++	drop(session);
++	let mut session = Session::open(&path, ComponentRegistry::standard()).expect("restart session");
++	let board = JobBoard::new();
++	board.rebuild(&session);
++	let jobs = board.poll(&mut session).expect("recover");
++	assert_eq!(jobs.len(), 1);
++	assert_eq!(jobs[0].status, "completed");
++	assert_eq!(
++		serde_json::from_str::<serde_json::Value>(
++			jobs[0].output.as_ref().expect("inline output").get()
++		)
++		.expect("json"),
++		output
++	);
++}
+diff --git a/justfile b/justfile
+--- a/justfile
++++ b/justfile
+@@ -302,3 +302,9 @@
+ test-omperor-codex-metadata:
+     cargo nextest run -p omp-ai --lib --locked -E 'test(codec::openai_codex::tests::)'
+     cargo test --doc -p omp-ai --locked
++
++# Detached stdout must not wake inference before its terminal follow-up exists.
++[group('test')]
++test-omperor-background-progress:
++    cargo nextest run -p omp-agent --test turn --test jobs --locked -E 'not test(tool_call_round_settles_in_the_dom_then_runs_second_inference)'
++    cargo test --doc -p omp-agent --locked

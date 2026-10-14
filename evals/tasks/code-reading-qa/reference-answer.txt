@@ -1,0 +1,8 @@
+```json
+{
+  "handler_invocations": 4,
+  "final_status": "dead",
+  "retry_delays_seconds": [2, 6, 15],
+  "effective_lease_seconds": 90
+}
+```

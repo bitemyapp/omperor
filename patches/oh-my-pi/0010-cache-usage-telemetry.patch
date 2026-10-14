@@ -1,0 +1,536 @@
+diff --git a/crates/agent/src/directors/advisor.rs b/crates/agent/src/directors/advisor.rs
+--- a/crates/agent/src/directors/advisor.rs
++++ b/crates/agent/src/directors/advisor.rs
+@@ -819,6 +819,7 @@
+ 			.iter()
+ 			.map(crate::loop_::journal_recovery)
+ 			.collect(),
++		..crate::loop_::usage_receipt(&usage)
+ 	})
+ }
+ 
+diff --git a/crates/agent/src/loop.rs b/crates/agent/src/loop.rs
+--- a/crates/agent/src/loop.rs
++++ b/crates/agent/src/loop.rs
+@@ -4119,6 +4119,33 @@
+ 		premium_requests_millionths: usage.premium_requests_millionths,
+ 		identity,
+ 		recoveries: recoveries.iter().map(journal_recovery).collect(),
++		..usage_receipt(usage)
++	}
++}
++
++/// Durable accounting metadata shared by primary and auxiliary inference.
++pub(crate) fn usage_receipt(usage: &Usage) -> TurnReceipt {
++	use omp_ai::receipt::UsageSource;
++	use omp_journal::data::{ReceiptCostSource, ReceiptUsageSource};
++	let id = omp_core::Ulid::generate();
++	TurnReceipt {
++		receipt_id: Some(Str::new(id.to_string())),
++		recorded_at_ms: Some(id.timestamp_ms()),
++		usage_source: Some(match usage.source {
++			UsageSource::Unknown => ReceiptUsageSource::Unknown,
++			UsageSource::Provider => ReceiptUsageSource::Provider,
++			UsageSource::Measured => ReceiptUsageSource::Measured,
++			UsageSource::Estimated => ReceiptUsageSource::Estimated,
++			UsageSource::Mixed => ReceiptUsageSource::Mixed,
++		}),
++		cost_source: Some(ReceiptCostSource::CatalogEstimate),
++		cache_write_1h: usage
++			.cache_write_1h_reported
++			.then_some(usage.cache_write_1h_tokens),
++		cache_read_reported: Some(usage.cache_read_reported),
++		cache_write_reported: Some(usage.cache_write_reported),
++		cache_write_1h_reported: Some(usage.cache_write_1h_reported),
++		..TurnReceipt::default()
+ 	}
+ }
+ 
+@@ -4176,6 +4203,34 @@
+ 	use super::{
+ 		should_schedule_autolearn, streamed_edit_must_abort, turn_has_terminal_incremental_yield,
+ 	};
++
++	#[test]
++	fn receipt_observation_has_stable_identity_time_and_provenance() {
++		let usage = omp_ai::Usage {
++			cache_write_tokens: 400,
++			cache_write_1h_tokens: 300,
++			cache_write_reported: true,
++			cache_write_1h_reported: true,
++			source: omp_ai::receipt::UsageSource::Provider,
++			..Default::default()
++		};
++		let receipt = super::usage_receipt(&usage);
++		let id: omp_core::Ulid = receipt
++			.receipt_id
++			.as_ref()
++			.expect("receipt ID")
++			.parse()
++			.expect("ULID");
++		assert_eq!(receipt.recorded_at_ms, Some(id.timestamp_ms()));
++		assert_eq!(receipt.cache_write_1h, Some(300));
++		assert_eq!(receipt.cache_write_1h_reported, Some(true));
++		assert_eq!(receipt.usage_source, Some(omp_journal::data::ReceiptUsageSource::Provider));
++		let replay: omp_journal::data::TurnReceipt =
++			serde_json::from_str(&serde_json::to_string(&receipt).expect("journal receipt"))
++				.expect("replay receipt");
++		assert_eq!(replay, receipt);
++		assert_ne!(super::usage_receipt(&usage).receipt_id, receipt.receipt_id);
++	}
+ 
+ 	fn context(enabled: bool) -> Ctx {
+ 		let ctx = Ctx::new();
+diff --git a/crates/ai/src/codec/anthropic.rs b/crates/ai/src/codec/anthropic.rs
+--- a/crates/ai/src/codec/anthropic.rs
++++ b/crates/ai/src/codec/anthropic.rs
+@@ -3062,11 +3062,14 @@
+ 	}
+ 	if let Some(value) = incoming.cache_read_input_tokens {
+ 		target.cache_read_tokens = value;
++		target.cache_read_reported = true;
+ 	}
+ 	if let Some(value) = incoming.cache_creation_input_tokens {
+ 		target.cache_write_tokens = value;
++		target.cache_write_reported = true;
+ 	}
+ 	if let Some(breakdown) = incoming.cache_creation {
++		target.cache_write_1h_reported = breakdown.ephemeral_1h_input_tokens.is_some();
+ 		// An explicit breakdown replaces any earlier snapshot; the one-hour
+ 		// component is a subset of `cache_write_tokens`, so an all-zero
+ 		// object clears it.
+@@ -4629,6 +4632,9 @@
+ 			cache_read_tokens: 4,
+ 			cache_write_tokens: 800,
+ 			cache_write_1h_tokens: 500,
++			cache_read_reported: true,
++			cache_write_reported: true,
++			cache_write_1h_reported: true,
+ 			source: UsageSource::Provider,
+ 			..Usage::default()
+ 		});
+@@ -4648,6 +4654,7 @@
+ 			.unwrap();
+ 		assert_eq!(decoder.outcome().usage.cache_write_1h_tokens, 0);
+ 		assert_eq!(decoder.outcome().usage.cache_write_tokens, 800);
++		assert!(decoder.outcome().usage.cache_write_1h_reported);
+ 	}
+ 
+ 	#[test]
+@@ -4680,6 +4687,8 @@
+ 			output_tokens: 18,
+ 			cache_read_tokens: 7,
+ 			cache_write_tokens: 3,
++			cache_read_reported: true,
++			cache_write_reported: true,
+ 			source: UsageSource::Provider,
+ 			..Usage::default()
+ 		});
+@@ -4705,6 +4714,8 @@
+ 			output_tokens: 9,
+ 			cache_read_tokens: 4,
+ 			cache_write_tokens: 3,
++			cache_read_reported: true,
++			cache_write_reported: true,
+ 			search_calls: 2,
+ 			source: UsageSource::Provider,
+ 			..Usage::default()
+diff --git a/crates/ai/src/codec/gemini.rs b/crates/ai/src/codec/gemini.rs
+--- a/crates/ai/src/codec/gemini.rs
++++ b/crates/ai/src/codec/gemini.rs
+@@ -1870,6 +1870,9 @@
+ 			cache_read_tokens: self.cached_content_token_count,
+ 			cache_write_tokens: 0,
+ 			cache_write_1h_tokens: 0,
++			cache_read_reported: false,
++			cache_write_reported: false,
++			cache_write_1h_reported: false,
+ 			images: 0,
+ 			audio_input_ms: 0,
+ 			audio_output_ms: 0,
+diff --git a/crates/ai/src/codec/openai_responses.rs b/crates/ai/src/codec/openai_responses.rs
+--- a/crates/ai/src/codec/openai_responses.rs
++++ b/crates/ai/src/codec/openai_responses.rs
+@@ -957,7 +957,11 @@
+ pub struct ResponsesInputTokenDetails {
+ 	/// Cached input tokens.
+ 	#[serde(default)]
+-	pub cached_tokens: u64,
++	pub cached_tokens:      Option<u64>,
++	/// Input tokens written to the prompt cache; omitted by older Responses
++	/// routes.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub cache_write_tokens: Option<u64>,
+ }
+ 
+ /// Responses output-token details.
+@@ -973,10 +977,14 @@
+ 		Self {
+ 			input_tokens: value
+ 				.input_tokens
+-				.saturating_sub(value.input_tokens_details.cached_tokens),
++				.saturating_sub(value.input_tokens_details.cached_tokens.unwrap_or(0))
++				.saturating_sub(value.input_tokens_details.cache_write_tokens.unwrap_or(0)),
+ 			output_tokens: value.output_tokens,
+ 			reasoning_tokens: value.output_tokens_details.reasoning_tokens,
+-			cache_read_tokens: value.input_tokens_details.cached_tokens,
++			cache_read_tokens: value.input_tokens_details.cached_tokens.unwrap_or(0),
++			cache_write_tokens: value.input_tokens_details.cache_write_tokens.unwrap_or(0),
++			cache_read_reported: value.input_tokens_details.cached_tokens.is_some(),
++			cache_write_reported: value.input_tokens_details.cache_write_tokens.is_some(),
+ 			source: UsageSource::Provider,
+ 			..Self::default()
+ 		}
+@@ -5321,7 +5329,10 @@
+ 		let usage = Usage::from(&super::ResponsesUsage {
+ 			input_tokens: 100,
+ 			output_tokens: 30,
+-			input_tokens_details: super::ResponsesInputTokenDetails { cached_tokens: 40 },
++			input_tokens_details: super::ResponsesInputTokenDetails {
++				cached_tokens: Some(40),
++				..Default::default()
++			},
+ 			output_tokens_details: super::ResponsesOutputTokenDetails { reasoning_tokens: 20 },
+ 			..Default::default()
+ 		});
+@@ -5329,6 +5340,37 @@
+ 		assert_eq!(usage.cache_read_tokens, 40);
+ 		assert_eq!(usage.output_tokens, 30);
+ 		assert_eq!(usage.reasoning_tokens, 20);
++	}
++
++	#[test]
++	fn responses_cache_write_usage_golden_is_disjoint_and_preserves_absence() {
++		let wire: super::ResponsesUsage = serde_json::from_str(
++			r#"{"input_tokens":1000,"output_tokens":80,"total_tokens":1080,"input_tokens_details":{"cached_tokens":600,"cache_write_tokens":300},"output_tokens_details":{"reasoning_tokens":20}}"#,
++		).expect("provider usage fixture");
++		let usage = Usage::from(&wire);
++		assert_eq!(usage.input_tokens, 100);
++		assert_eq!(usage.cache_read_tokens, 600);
++		assert_eq!(usage.cache_write_tokens, 300);
++		assert_eq!(usage.output_tokens, 80);
++		assert_eq!(usage.reasoning_tokens, 20);
++		assert_eq!(usage.total_tokens(), wire.total_tokens);
++		assert!(usage.cache_read_reported && usage.cache_write_reported);
++		assert!(!usage.cache_write_1h_reported);
++		let omitted: super::ResponsesUsage = serde_json::from_str(
++			r#"{"input_tokens":1000,"input_tokens_details":{"cached_tokens":600}}"#,
++		)
++		.expect("legacy provider usage");
++		let omitted = Usage::from(&omitted);
++		assert_eq!(omitted.input_tokens, 400);
++		assert_eq!(omitted.cache_write_tokens, 0);
++		assert!(!omitted.cache_write_reported);
++		let zero: super::ResponsesUsage = serde_json::from_str(
++			r#"{"input_tokens":1000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}"#,
++		)
++		.expect("explicit provider zero");
++		let zero = Usage::from(&zero);
++		assert!(zero.cache_read_reported && zero.cache_write_reported);
++		assert_eq!(zero.cache_write_tokens, omitted.cache_write_tokens);
+ 	}
+ 
+ 	/// First-party xAI `/v1/responses` wire policy: no summary, no penalties,
+diff --git a/crates/ai/src/receipt.rs b/crates/ai/src/receipt.rs
+--- a/crates/ai/src/receipt.rs
++++ b/crates/ai/src/receipt.rs
+@@ -136,7 +136,7 @@
+ /// Dimensioned resource usage for any inference operation.
+ #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+ pub struct Usage {
+-	/// Input tokens consumed.
++	/// Uncached input tokens consumed; excludes cache reads and cache writes.
+ 	pub input_tokens: u64,
+ 	/// Output tokens consumed, including any reasoning tokens.
+ 	pub output_tokens: u64,
+@@ -152,6 +152,18 @@
+ 	/// input rate instead of the five-minute cache-write rate.
+ 	#[serde(default)]
+ 	pub cache_write_1h_tokens: u64,
++	/// Whether a provider explicitly supplied the cache-read counter, including
++	/// zero.
++	#[serde(default)]
++	pub cache_read_reported: bool,
++	/// Whether a provider explicitly supplied the cache-write counter, including
++	/// zero.
++	#[serde(default)]
++	pub cache_write_reported: bool,
++	/// Whether a provider explicitly supplied the one-hour write counter,
++	/// including zero.
++	#[serde(default)]
++	pub cache_write_1h_reported: bool,
+ 	/// Images processed or generated.
+ 	pub images: u32,
+ 	/// Input audio duration in milliseconds.
+@@ -190,6 +202,14 @@
+ 		self.cache_write_1h_tokens = self
+ 			.cache_write_1h_tokens
+ 			.saturating_add(other.cache_write_1h_tokens);
++		// A combined counter is fully reported only if every observed component was.
++		let initially_unknown = self.source == UsageSource::Unknown;
++		self.cache_read_reported =
++			(initially_unknown || self.cache_read_reported) && other.cache_read_reported;
++		self.cache_write_reported =
++			(initially_unknown || self.cache_write_reported) && other.cache_write_reported;
++		self.cache_write_1h_reported =
++			(initially_unknown || self.cache_write_1h_reported) && other.cache_write_1h_reported;
+ 		self.images = self.images.saturating_add(other.images);
+ 		self.audio_input_ms = self.audio_input_ms.saturating_add(other.audio_input_ms);
+ 		self.audio_output_ms = self.audio_output_ms.saturating_add(other.audio_output_ms);
+@@ -645,6 +665,9 @@
+ 			cache_read_tokens: 4,
+ 			cache_write_tokens: 5,
+ 			cache_write_1h_tokens: 2,
++			cache_read_reported: false,
++			cache_write_reported: false,
++			cache_write_1h_reported: false,
+ 			images: 1,
+ 			audio_input_ms: 6,
+ 			audio_output_ms: 7,
+@@ -660,6 +683,9 @@
+ 			cache_read_tokens: 40,
+ 			cache_write_tokens: 50,
+ 			cache_write_1h_tokens: 20,
++			cache_read_reported: false,
++			cache_write_reported: false,
++			cache_write_1h_reported: false,
+ 			images: 2,
+ 			audio_input_ms: 60,
+ 			audio_output_ms: 70,
+diff --git a/crates/ai/src/staging.rs b/crates/ai/src/staging.rs
+--- a/crates/ai/src/staging.rs
++++ b/crates/ai/src/staging.rs
+@@ -1437,6 +1437,28 @@
+ 	}
+ 
+ 	#[test]
++	fn secure_gate_usage_round_trip_preserves_reported_cache_zero() {
++		let usage = crate::receipt::Usage {
++			input_tokens: 100,
++			cache_read_tokens: 600,
++			cache_read_reported: true,
++			cache_write_reported: true,
++			cache_write_1h_reported: false,
++			source: crate::receipt::UsageSource::Provider,
++			..Default::default()
++		};
++		let event = ChatEvent::Usage(crate::event::UsageUpdate { usage, final_update: true });
++		let mut encoded = Vec::new();
++		super::encode_chat_event(&event, &mut encoded).expect("stage usage");
++		let ChatEvent::Usage(restored) = super::decode_chat_event(&encoded).expect("unstage usage")
++		else {
++			panic!("expected usage");
++		};
++		assert_eq!(restored.usage, usage);
++		assert!(restored.final_update);
++	}
++
++	#[test]
+ 	fn secure_gate_spool_round_trips_order_and_deletes_on_drop() {
+ 		let directory = tempfile::tempdir().unwrap();
+ 		let cancellation = StagingCancellation::new();
+@@ -2044,6 +2066,9 @@
+ 	] {
+ 		put_u64(out, value);
+ 	}
++	put_bool(out, usage.cache_read_reported);
++	put_bool(out, usage.cache_write_reported);
++	put_bool(out, usage.cache_write_1h_reported);
+ 	put_u32(out, usage.images);
+ 	put_u32(out, usage.search_calls);
+ 	put_u8(out, match usage.source {
+@@ -2193,6 +2218,9 @@
+ 			audio_output_ms: self.u64()?,
+ 			video_ms: self.u64()?,
+ 			premium_requests_millionths: self.u64()?,
++			cache_read_reported: self.bool()?,
++			cache_write_reported: self.bool()?,
++			cache_write_1h_reported: self.bool()?,
+ 			images: self.u32()?,
+ 			search_calls: self.u32()?,
+ 			source: match self.u8()? {
+diff --git a/crates/app/src/chat_services/stats.rs b/crates/app/src/chat_services/stats.rs
+--- a/crates/app/src/chat_services/stats.rs
++++ b/crates/app/src/chat_services/stats.rs
+@@ -304,6 +304,7 @@
+ 				premium_requests_millionths: 0,
+ 				identity:                    None,
+ 				recoveries:                  Vec::new(),
++				..TurnReceipt::default()
+ 			})
+ 			.unwrap();
+ 		session
+@@ -337,6 +338,7 @@
+ 				premium_requests_millionths: 0,
+ 				identity:                    None,
+ 				recoveries:                  Vec::new(),
++				..TurnReceipt::default()
+ 			})
+ 			.unwrap();
+ 		path
+diff --git a/crates/app/src/rpc_mode.rs b/crates/app/src/rpc_mode.rs
+--- a/crates/app/src/rpc_mode.rs
++++ b/crates/app/src/rpc_mode.rs
+@@ -2999,6 +2999,14 @@
+ 		// is `tokensOut` over `lastTokenMs - ttftMs`.
+ 		KernelEvent::InferenceReceipt(receipt) => Some(json!({
+ 			"type": "inference_receipt",
++			"receiptId": receipt.receipt_id,
++			"recordedAtMs": receipt.recorded_at_ms,
++			"usageSource": receipt.usage_source,
++			"costSource": receipt.cost_source,
++			"cacheWrite1h": receipt.cache_write_1h,
++			"cacheReadReported": receipt.cache_read_reported,
++			"cacheWriteReported": receipt.cache_write_reported,
++			"cacheWrite1hReported": receipt.cache_write_1h_reported,
+ 			"provider": receipt.identity.as_ref().map(|identity| identity.provider.as_str()),
+ 			"model": receipt.identity.as_ref().map(|identity| identity.model.as_str()),
+ 			"tokensIn": receipt.tokens_in,
+@@ -3120,6 +3128,32 @@
+ 	use super::{inference_error_fields, offered_service_tiers, offers_fast_tier};
+ 
+ 	#[test]
++	fn receipt_rpc_preserves_journal_identity_and_accounting_provenance() {
++		use omp_journal::data::{ReceiptCostSource, ReceiptUsageSource, TurnReceipt};
++		let receipt = TurnReceipt {
++			receipt_id: Some(Str::new_static("01RECEIPT")),
++			recorded_at_ms: Some(1750000000123),
++			usage_source: Some(ReceiptUsageSource::Provider),
++			cost_source: Some(ReceiptCostSource::CatalogEstimate),
++			cache_write_reported: Some(true),
++			cache_write_1h_reported: Some(false),
++			..TurnReceipt::tokens(100, 80, 12000)
++		};
++		let value =
++			super::kernel_event_value(omp_agent::KernelEvent::InferenceReceipt(Box::new(receipt)))
++				.expect("RPC receipt");
++		assert_eq!(value["receiptId"], "01RECEIPT");
++		assert_eq!(value["recordedAtMs"], 1750000000123_u64);
++		assert_eq!(value["usageSource"], "provider");
++		assert_eq!(value["costSource"], "catalog_estimate");
++		assert_eq!(value["costNanoUsd"], 12000);
++		assert_eq!(value["cacheWrite"], 0);
++		assert_eq!(value["cacheWriteReported"], true);
++		assert!(value["cacheWrite1h"].is_null());
++		assert_eq!(value["cacheWrite1hReported"], false);
++	}
++
++	#[test]
+ 	fn a_model_offers_fast_only_when_its_listing_advertises_the_priority_tier() {
+ 		use omp_catalog::{Availability, ModelKey, ProviderFamily, ServiceTier, snapshot::Catalog};
+ 		let catalog = Catalog::embedded();
+diff --git a/crates/journal/src/data.rs b/crates/journal/src/data.rs
+--- a/crates/journal/src/data.rs
++++ b/crates/journal/src/data.rs
+@@ -676,10 +676,62 @@
+ 	pub steps:       u32,
+ }
+ 
++/// Origin of a receipt's token accounting; absence in older journals means
++/// unknown.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ReceiptUsageSource {
++	/// No usage observation was available.
++	Unknown,
++	/// Provider-reported token accounting.
++	Provider,
++	/// Deterministic local measurements.
++	Measured,
++	/// Locally estimated token accounting.
++	Estimated,
++	/// Accounting combines different origins.
++	Mixed,
++}
++
++/// Origin of the monetary amount; catalog estimates are not billing receipts.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ReceiptCostSource {
++	/// Token counts priced using the model catalog.
++	CatalogEstimate,
++}
++
+ /// `turn.receipt@1` payload.
+ #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct TurnReceipt {
+-	/// Input token count.
++	/// Stable identity generated once before journaling and reused by live
++	/// delivery.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub receipt_id:                  Option<Str>,
++	/// Unix milliseconds at receipt creation, not replay or GUI arrival time.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub recorded_at_ms:              Option<u64>,
++	/// Source of token accounting, kept separate from monetary provenance.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub usage_source:                Option<ReceiptUsageSource>,
++	/// Source of the monetary estimate; older journals do not establish it.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub cost_source:                 Option<ReceiptCostSource>,
++	/// One-hour subset of cache writes; absent when the provider omitted its
++	/// breakdown.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub cache_write_1h:              Option<u64>,
++	/// Whether the cache-read counter was explicitly reported (zero is
++	/// meaningful).
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub cache_read_reported:         Option<bool>,
++	/// Whether the cache-write counter was explicitly reported.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub cache_write_reported:        Option<bool>,
++	/// Whether the one-hour write counter was explicitly reported.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub cache_write_1h_reported:     Option<bool>,
++	/// Uncached input token count; excludes `cache_read` and `cache_write`.
+ 	pub tokens_in:                   u64,
+ 	/// Output token count.
+ 	pub tokens_out:                  u64,
+@@ -729,6 +781,14 @@
+ 	#[must_use]
+ 	pub const fn tokens(tokens_in: u64, tokens_out: u64, cost_nano_usd: u64) -> Self {
+ 		Self {
++			receipt_id: None,
++			recorded_at_ms: None,
++			usage_source: None,
++			cost_source: None,
++			cache_write_1h: None,
++			cache_read_reported: None,
++			cache_write_reported: None,
++			cache_write_1h_reported: None,
+ 			tokens_in,
+ 			tokens_out,
+ 			cost_nano_usd,
+@@ -924,6 +984,32 @@
+ 	}
+ 
+ 	#[test]
++	fn receipt_observation_round_trip_preserves_unknown_and_reported_zero() {
++		let legacy: TurnReceipt =
++			serde_json::from_str(r#"{"tokens_in":0,"tokens_out":0,"cost_nano_usd":0}"#)
++				.expect("old journal receipt");
++		assert_eq!(legacy.usage_source, None);
++		assert_eq!(legacy.cache_write_reported, None);
++		assert_eq!(legacy.cache_write_1h, None);
++		assert_eq!(legacy.cost_source, None);
++		let recorded = TurnReceipt {
++			receipt_id: Some(Str::new_static("01RECEIPT")),
++			recorded_at_ms: Some(1750000000123),
++			usage_source: Some(super::ReceiptUsageSource::Provider),
++			cost_source: Some(super::ReceiptCostSource::CatalogEstimate),
++			cache_write_reported: Some(true),
++			cache_write_1h_reported: Some(true),
++			cache_write_1h: Some(0),
++			..legacy
++		};
++		let json = serde_json::to_string(&recorded).expect("serialize receipt");
++		let replay: TurnReceipt = serde_json::from_str(&json).expect("replay receipt");
++		assert_eq!(recorded, replay);
++		assert!(json.contains(r#""cache_write_1h":0"#));
++		assert!(json.contains(r#""cost_source":"catalog_estimate""#));
++	}
++
++	#[test]
+ 	fn recovery_evidence_is_typed_and_legacy_receipts_default_empty() {
+ 		let legacy: TurnReceipt =
+ 			serde_json::from_str(r#"{"tokens_in":1,"tokens_out":2,"cost_nano_usd":3}"#)

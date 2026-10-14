@@ -1,0 +1,12 @@
+[package]
+name = "harbor"
+version = "0.3.0"
+edition = "2024"
+description = "A small terminal chat client for local language models."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-width = "0.2"

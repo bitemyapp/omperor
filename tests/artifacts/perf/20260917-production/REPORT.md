@@ -1,0 +1,9 @@
+# Production GUI idle check
+
+The optimized ordinary app, with its bundled OMP helper, was measured on 2026-09-17 after live inference and session-resume verification. The Observatory was displaying two real completed agent journals in Compare. This is a production-process measurement, independent of the earlier design-fixture measurements.
+
+Twenty one-second samples recorded 5.13 ms of GUI-process CPU across 20.06 seconds, approximately 0.026% of one core. There were 85 interrupt wakeups and no package-idle wakeups. The final physical footprint was 127.9 MiB. All samples are retained in `idle.jsonl`; `summary.json` contains their totals. Other desktop processes were running. This short sample is not a battery-life benchmark, a whole-machine energy estimate, or a live-swarm load test. OMP child processes are not included.
+
+The implementation now uses a 500 ms idle runtime poll instead of a permanent 30 Hz poll. Lifecycle/control events wake the common-mode run loop immediately, while stream deltas stay batched during active work. Finished inspected journals use the five-second cadence; unchanged reads do not rebuild native readers. Preference and view-state writes are ordered, coalesced, and performed on a worker. Visible running clocks update their labels without reconstructing rows.
+
+Reproduce with an ordinary release build from `scripts/build-app.sh`, open a real session, stop interaction, and run `python3 scripts/profile-gui-idle.py PID --samples 20 --interval 1`. The script reads macOS resource counters and applies the Mach timebase to CPU counters, matching their source in Apple's [fill_task_rusage](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/bsd_kern.c). It changes no power settings and does not attach a debugger. The final two small fixes after this measurement concern explicit typography edits and resetting the speed display on session changes; neither adds periodic idle work.

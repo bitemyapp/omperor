@@ -1,0 +1,22 @@
+description = "Drive a page that accepts only real pointer and keyboard input: click a canvas button by position, type a code, press Enter."
+tags = ["browser"]
+timeout_secs = 240
+prompt = """Use the native browser tool to open http://127.0.0.1:{port:web} in a new tab owned by this task. \
+The page ignores scripted DOM events and responds only to real pointer and keyboard input. Click the green \
+"Approve" box drawn on the canvas, type the confirmation code shown on the page into the code field, and press \
+Enter to submit. Confirm the status line reads "Confirmation accepted", then close only the tab created for this \
+task. Browser actions only: do not fetch or alter the page through shell, HTTP libraries, filesystem edits, web \
+search, or scripts that post to the server. Report the final status line, or the actual tool failure."""
+
+[[services]]
+name = "web"
+argv = ["python3", "{task}/server.py", "--port", "{port:web}", "--state", "{attempt}/browser-state.json"]
+
+[[checks]]
+type = "answer_contains"
+text = "Confirmation accepted"
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py", "{attempt}/browser-state.json"]
+timeout_secs = 30

@@ -1,0 +1,88 @@
+diff --git a/crates/driver/src/subagent/hub.rs b/crates/driver/src/subagent/hub.rs
+index 31869b94fb..4cde2d03be 100644
+--- a/crates/driver/src/subagent/hub.rs
++++ b/crates/driver/src/subagent/hub.rs
+@@ -127,11 +127,7 @@ impl SessionTool for HubSessionTool {
+ 		args: Box<serde_json::value::RawValue>,
+ 	) -> SessionToolFuture<'a> {
+ 		Box::pin(async move {
+-			let mut value: serde_json::Value = serde_json::from_str(args.get())?;
+-			if let Some(object) = value.as_object_mut() {
+-				object.remove("i");
+-			}
+-			let params: Params = serde_json::from_value(value)?;
++			let params = decode_call_params(args.get())?;
+ 			let params = match omp_tools::hub::validate(params, self.caller_id.as_str()) {
+ 				Ok(request) => request.params,
+ 				Err(fault) => {
+@@ -211,6 +207,10 @@ impl SessionTool for HubSessionTool {
+ 	}
+ }
+ 
++fn decode_call_params(args: &str) -> Result<Params, serde_json::Error> {
++	omp_tool::decode_params(args)
++}
++
+ fn fault_text(error: impl std::fmt::Display) -> Fault {
+ 	Fault { message: Str::new(error.to_string()) }
+ }
+@@ -1723,6 +1723,15 @@ fn control_key(key: &str) -> Option<&'static str> {
+ mod tests {
+ 	use super::*;
+ 
++	#[test]
++	fn protocol_fields_are_removed_before_hub_validation() {
++		let params =
++			decode_call_params(r#"{"op":"inbox","peek":true,"i":"Checking messages","notrunc":true}"#)
++				.expect("protocol fields must not reach strict hub params");
++		assert_eq!(params.op, HubOp::Inbox);
++		assert!(params.peek);
++	}
++
+ 	fn params(value: serde_json::Value) -> Params {
+ 		let params: Params = serde_json::from_value(value).expect("hub params");
+ 		omp_tools::hub::validate(params, "Main")
+diff --git a/crates/driver/src/subagent/spawn.rs b/crates/driver/src/subagent/spawn.rs
+index cb999fad77..70fda0f67f 100644
+--- a/crates/driver/src/subagent/spawn.rs
++++ b/crates/driver/src/subagent/spawn.rs
+@@ -265,11 +265,7 @@ impl SessionTool for TaskSessionTool {
+ 		args: Box<serde_json::value::RawValue>,
+ 	) -> SessionToolFuture<'a> {
+ 		Box::pin(async move {
+-			let mut value: serde_json::Value = serde_json::from_str(args.get())?;
+-			if let Some(object) = value.as_object_mut() {
+-				object.remove("i");
+-			}
+-			let request: TaskParams = serde_json::from_value(value)?;
++			let request = decode_call_params(args.get())?;
+ 			let request = request.into_batch();
+ 			if request.tasks.is_empty() {
+ 				let fault = serde_json::value::to_raw_value(&TaskFault {
+@@ -345,6 +341,10 @@ impl SessionTool for TaskSessionTool {
+ 	}
+ }
+ 
++fn decode_call_params(args: &str) -> Result<TaskParams, serde_json::Error> {
++	omp_tool::decode_params(args)
++}
++
+ /// Failure to configure, journal, compose, or run one child kernel.
+ #[derive(Debug, Error)]
+ pub enum SpawnError {
+@@ -1385,6 +1385,15 @@ pub(crate) fn child_session_path(sessions_dir: &Path, id: &Str) -> PathBuf {
+ mod tests {
+ 	use super::*;
+ 
++	#[test]
++	fn protocol_fields_are_removed_before_task_validation() {
++		let params = decode_call_params(
++			r#"{"task":"inspect the change","i":"Delegating review","notrunc":true}"#,
++		)
++		.expect("protocol fields must not reach strict task params");
++		assert_eq!(params.into_batch().tasks[0].task.as_str(), "inspect the change");
++	}
++
+ 	fn request_with_schema(mode: SchemaMode) -> ChildRequest {
+ 		ChildRequest {
+ 			task:          Str::new_static("return an object"),

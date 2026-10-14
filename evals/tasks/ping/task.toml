@@ -1,0 +1,8 @@
+description = "Cheapest end-to-end check: one request, no tools."
+tags = ["smoke"]
+timeout_secs = 120
+prompt = "Reply with exactly OMPEROR_EVAL_OK and nothing else. Do not use any tools."
+
+[[checks]]
+type = "answer_contains"
+text = "OMPEROR_EVAL_OK"

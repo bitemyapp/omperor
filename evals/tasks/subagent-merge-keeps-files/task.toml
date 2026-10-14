@@ -1,0 +1,12 @@
+description = "Regression: a sub-agent's work merges back without deleting files its isolated copy could not see (bin/, build/, workspace/, .cargo/ under a home directory kept in git)."
+tags = ["regression", "subagents"]
+timeout_secs = 300
+prompt = """Use the task tool to start exactly one sub-agent. Ask it to list every file in this repository \
+(including hidden ones, but not .git) and write that list, one relative path per line and sorted, to \
+INVENTORY.txt at the repository root. When it finishes, check INVENTORY.txt exists and reply with the \
+number of lines in it. Do not change any other file."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 30

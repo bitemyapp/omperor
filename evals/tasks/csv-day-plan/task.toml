@@ -1,0 +1,12 @@
+description = "Plan a day from a CSV with priorities, a dependency, and capacity; answer as JSON."
+tags = ["smoke", "analysis"]
+timeout_secs = 180
+prompt = """Read issues.csv in this directory. Schedule an 8-hour day: open tasks only, P1 before P2, \
+shorter tasks first within a priority. A2 requires A1 completed earlier in the same day. Skip tasks that \
+do not fit; never split tasks. Do not edit any files. Return only JSON with scheduled (ordered task IDs), \
+hours_used, and hours_remaining."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 30

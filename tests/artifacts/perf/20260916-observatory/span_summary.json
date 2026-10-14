@@ -1,0 +1,156 @@
+{
+  "baseline": {
+    "gui.markdown.render_message": {
+      "n": 13,
+      "p50_us": 116,
+      "p95_us": 860,
+      "total_us": 4239
+    },
+    "gui.render_chat_transcript": {
+      "n": 4,
+      "p50_us": 1638.5,
+      "p95_us": 2109,
+      "total_us": 7089
+    },
+    "gui.observatory.refresh": {
+      "n": 49,
+      "p50_us": 20968,
+      "p95_us": 24389,
+      "total_us": 913380
+    },
+    "gui.build_window": {
+      "n": 1,
+      "p50_us": 100988,
+      "p95_us": 100988,
+      "total_us": 100988
+    },
+    "gui.job.run": {
+      "n": 1,
+      "p50_us": 2318,
+      "p95_us": 2318,
+      "total_us": 2318
+    },
+    "gui.application_did_finish_launching": {
+      "n": 1,
+      "p50_us": 129311,
+      "p95_us": 129311,
+      "total_us": 129311
+    },
+    "gui.preview.poll": {
+      "n": 1875,
+      "p50_us": 2,
+      "p95_us": 46,
+      "total_us": 15966
+    },
+    "gui.observatory.scroll": {
+      "n": 62,
+      "p50_us": 0.0,
+      "p95_us": 11729,
+      "total_us": 234455
+    },
+    "gui.observatory.row.create": {
+      "n": 1112,
+      "p50_us": 639.0,
+      "p95_us": 974,
+      "total_us": 794012
+    },
+    "gui.observatory.scope": {
+      "n": 20,
+      "p50_us": 68543.5,
+      "p95_us": 72688,
+      "total_us": 1351846
+    },
+    "gui.application_will_terminate": {
+      "n": 1,
+      "p50_us": 5,
+      "p95_us": 5,
+      "total_us": 5
+    },
+    "scroll-workload.callback": {
+      "n": 20,
+      "p50_us": 10059.0,
+      "p95_us": 22911,
+      "total_us": 234455
+    },
+    "scroll-workload.row-created": {
+      "n": 200,
+      "p50_us": 754.5,
+      "p95_us": 1232,
+      "total_us": 192001
+    }
+  },
+  "after": {
+    "gui.markdown.render_message": {
+      "n": 13,
+      "p50_us": 117,
+      "p95_us": 1596,
+      "total_us": 7226
+    },
+    "gui.render_chat_transcript": {
+      "n": 4,
+      "p50_us": 1819.5,
+      "p95_us": 2269,
+      "total_us": 7494
+    },
+    "gui.observatory.refresh": {
+      "n": 29,
+      "p50_us": 21525,
+      "p95_us": 24380,
+      "total_us": 532873
+    },
+    "gui.build_window": {
+      "n": 1,
+      "p50_us": 124506,
+      "p95_us": 124506,
+      "total_us": 124506
+    },
+    "gui.job.run": {
+      "n": 1,
+      "p50_us": 1812,
+      "p95_us": 1812,
+      "total_us": 1812
+    },
+    "gui.application_did_finish_launching": {
+      "n": 1,
+      "p50_us": 159184,
+      "p95_us": 159184,
+      "total_us": 159184
+    },
+    "gui.preview.poll": {
+      "n": 610,
+      "p50_us": 2.0,
+      "p95_us": 35,
+      "total_us": 6146
+    },
+    "gui.observatory.scroll": {
+      "n": 62,
+      "p50_us": 0.0,
+      "p95_us": 1912,
+      "total_us": 25438
+    },
+    "gui.observatory.row.create": {
+      "n": 512,
+      "p50_us": 632.5,
+      "p95_us": 992,
+      "total_us": 347996
+    },
+    "gui.observatory.scope": {
+      "n": 20,
+      "p50_us": 48658.0,
+      "p95_us": 50805,
+      "total_us": 971332
+    },
+    "scroll-workload.callback": {
+      "n": 20,
+      "p50_us": 1207.0,
+      "p95_us": 2204,
+      "total_us": 25438
+    },
+    "scroll-workload.row-created": {
+      "n": 20,
+      "p50_us": 974.0,
+      "p95_us": 1257,
+      "total_us": 19003
+    }
+  }
+}

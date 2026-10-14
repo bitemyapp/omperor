@@ -1,0 +1,141 @@
+diff --git a/crates/agent/src/dispatch.rs b/crates/agent/src/dispatch.rs
+index f1cc04f6ae..befe5c5194 100644
+--- a/crates/agent/src/dispatch.rs
++++ b/crates/agent/src/dispatch.rs
+@@ -829,7 +829,11 @@ pub trait SessionTool: Send + Sync {
+ 			CallOutcome::Ok(payload) | CallOutcome::Faulted(payload) => {
+ 				vec![Part::Json { json: bytes::Bytes::copy_from_slice(payload.get().as_bytes()) }]
+ 			},
+-			CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => Vec::new(),
++			// The model must see what was wrong with its arguments to repair them.
++			CallOutcome::ArgsRejected(issue) => {
++				vec![Part::Json { json: bytes::Bytes::from(serde_json::to_vec(issue)?) }]
++			},
++			CallOutcome::Aborted { .. } => Vec::new(),
+ 		})
+ 	}
+ }
+diff --git a/crates/agent/tests/dispatch.rs b/crates/agent/tests/dispatch.rs
+index fb71cc942d..504d31e5a7 100644
+--- a/crates/agent/tests/dispatch.rs
++++ b/crates/agent/tests/dispatch.rs
+@@ -70,6 +70,63 @@ async fn session_tools_route_before_registry_invocation() {
+ 	assert_eq!(result_text(&active, "session-tool"), ["\"session-owned\""]);
+ }
+ 
++/// Strict parameters, like `task`'s: an unknown field is the model's mistake.
++struct StrictSession(ToolSpec);
++
++impl SessionTool for StrictSession {
++	fn spec(&self) -> &ToolSpec {
++		&self.0
++	}
++
++	fn call<'a>(
++		&'a self,
++		_cx: SessionToolCx<'a>,
++		args: Box<serde_json::value::RawValue>,
++	) -> SessionToolFuture<'a> {
++		#[derive(serde::Deserialize)]
++		#[serde(deny_unknown_fields)]
++		#[allow(dead_code)]
++		struct Params {
++			task: String,
++		}
++		Box::pin(async move {
++			match omp_tool::decode_params::<Params>(r#"{"task":"scan","stray":1}"#) {
++				Ok(_) => Ok(CallOutcome::Ok(args)),
++				Err(error) => Ok(CallOutcome::ArgsRejected(omp_tool::malformed_arguments(&error))),
++			}
++		})
++	}
++}
++
++#[tokio::test]
++async fn malformed_session_tool_arguments_are_a_repairable_tool_error_not_a_turn_failure() {
++	let directory = tempfile::tempdir().expect("temporary directory");
++	let tools = registry([spec("strict_session", 1, "unused")]);
++	let identity = tools.resolved_identity("strict_session").expect("identity");
++	let dispatcher = Dispatcher::new(
++		Arc::clone(&tools),
++		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")),
++	)
++	.with_session_tool(Arc::new(StrictSession(tool_spec("strict_session", 1))));
++	let mut active = session(&directory.path().join("strict-session.oms"));
++	let (entry, args) = call(&mut active, &identity, "strict-call");
++	dispatcher
++		.dispatch(
++			&mut active,
++			request(
++				entry,
++				identity,
++				args,
++				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
++				false,
++			),
++		)
++		.await
++		.expect("an argument error settles the call instead of failing dispatch");
++	let text = result_text(&active, "strict-call").join("\n");
++	assert!(text.contains("unknown field `stray`"), "{text}");
++}
++
+ #[tokio::test]
+ async fn central_truncation_spills_and_notrunc_explicitly_opts_out() {
+ 	let directory = tempfile::tempdir().expect("temporary directory");
+diff --git a/crates/driver/src/subagent/hub.rs b/crates/driver/src/subagent/hub.rs
+index cb90a5b34a..0521ec1eae 100644
+--- a/crates/driver/src/subagent/hub.rs
++++ b/crates/driver/src/subagent/hub.rs
+@@ -127,7 +127,10 @@ impl SessionTool for HubSessionTool {
+ 		args: Box<serde_json::value::RawValue>,
+ 	) -> SessionToolFuture<'a> {
+ 		Box::pin(async move {
+-			let params = decode_call_params(args.get())?;
++			let params = match decode_call_params(args.get()) {
++				Ok(params) => params,
++				Err(error) => return Ok(CallOutcome::ArgsRejected(omp_tool::malformed_arguments(&error))),
++			};
+ 			let params = match omp_tools::hub::validate(params, self.caller_id.as_str()) {
+ 				Ok(request) => request.params,
+ 				Err(fault) => {
+diff --git a/crates/driver/src/subagent/spawn.rs b/crates/driver/src/subagent/spawn.rs
+index 8a693d0292..ea209a4afc 100644
+--- a/crates/driver/src/subagent/spawn.rs
++++ b/crates/driver/src/subagent/spawn.rs
+@@ -275,7 +275,10 @@ impl SessionTool for TaskSessionTool {
+ 		args: Box<serde_json::value::RawValue>,
+ 	) -> SessionToolFuture<'a> {
+ 		Box::pin(async move {
+-			let request = decode_call_params(args.get())?;
++			let request = match decode_call_params(args.get()) {
++				Ok(request) => request,
++				Err(error) => return Ok(CallOutcome::ArgsRejected(omp_tool::malformed_arguments(&error))),
++			};
+ 			let request = request.into_batch();
+ 			if request.tasks.is_empty() {
+ 				let fault = serde_json::value::to_raw_value(&TaskFault {
+diff --git a/crates/tool/src/lib.rs b/crates/tool/src/lib.rs
+index 1a76a4d3b2..ff7e47068c 100755
+--- a/crates/tool/src/lib.rs
++++ b/crates/tool/src/lib.rs
+@@ -159,6 +159,19 @@ pub fn decode_params<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::E
+ 	serde_json::from_value(value)
+ }
+ 
++/// The rejection for arguments that do not decode into a tool's parameters:
++/// the call settles as an argument error the model can read and repair,
++/// never as a failure of the whole turn.
++pub fn malformed_arguments(error: &serde_json::Error) -> ArgIssue {
++	ArgIssue {
++		path:     Vec::new(),
++		expected: sf!("arguments matching the tool's parameter schema"),
++		kind:     ArgIssueKind::Malformed,
++		example:  None,
++		found:    Some(Str::new(error.to_string())),
++	}
++}
++
+ /// Namespaced thread-item property carrying a committed tool revision.
+ pub const TOOL_REV_PROP: &str = "omp/tool-rev";
+ 

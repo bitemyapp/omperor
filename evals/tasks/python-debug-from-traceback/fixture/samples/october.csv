@@ -1,0 +1,10 @@
+date,client,project,duration,description
+2024-10-01,Northwind,Website,1:30,Kickoff call and notes
+2024-10-02,Northwind,Website,2:15,Wireframes for checkout
+2024-10-03,Contoso,Audit,0:45,Access review
+2024-10-07,Northwind,Website,0:50,Copy review with marketing
+2024-10-09,Northwind,Website,3:05,Checkout implementation
+2024-10-15,Northwind,Support,0:20,Password reset escalation
+2024-10-22,Northwind,Website,1:00,Launch checklist
+2024-10-31,Northwind,Website,0:40,Post-launch fixes
+2024-11-01,Northwind,Website,1:00,November planning

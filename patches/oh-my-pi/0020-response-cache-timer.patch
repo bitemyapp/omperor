@@ -1,0 +1,662 @@
+diff --git a/crates/agent/src/loop.rs b/crates/agent/src/loop.rs
+index 1621af777c..674c4166d6 100644
+--- a/crates/agent/src/loop.rs
++++ b/crates/agent/src/loop.rs
+@@ -2560,6 +2560,10 @@ impl<C: Inference> Kernel<C> {
+ 						});
+ 					},
+ 					ChatEvent::Completed(completion) => {
++						let response_completed_at_ms = completion.receipt.timings.completed_at
++							.unwrap_or_else(std::time::SystemTime::now)
++							.duration_since(std::time::UNIX_EPOCH).ok()
++							.and_then(|d| u64::try_from(d.as_millis()).ok());
+ 						close_streams(session, &mut content_streams)?;
+ 						self.apply_live_components(session)?;
+ 						stop_reason = finish_reason(&completion.reason);
+@@ -2622,7 +2626,7 @@ impl<C: Inference> Kernel<C> {
+ 								}),
+ 							)?;
+ 						}
+-						let receipt = receipt_facts(
++						let mut receipt = receipt_facts(
+ 							&usage,
+ 							cost_nano_usd(&completion),
+ 							request_started,
+@@ -2631,6 +2635,7 @@ impl<C: Inference> Kernel<C> {
+ 							&completion.receipt.recoveries,
+ 							identity.clone(),
+ 						);
++						receipt.response_completed_at_ms = response_completed_at_ms;
+ 						session.receipt(receipt.clone())?;
+ 						self.apply_live_components(session)?;
+ 						self
+@@ -4145,6 +4150,8 @@ pub(crate) fn usage_receipt(usage: &Usage) -> TurnReceipt {
+ 		cache_read_reported: Some(usage.cache_read_reported),
+ 		cache_write_reported: Some(usage.cache_write_reported),
+ 		cache_write_1h_reported: Some(usage.cache_write_1h_reported),
++		prompt_cache_ttl_seconds: usage.prompt_cache_ttl_seconds,
++		prompt_cache_retention: usage.prompt_cache_retention.map(|policy| Str::new_static(policy.into())),
+ 		..TurnReceipt::default()
+ 	}
+ }
+@@ -4207,6 +4214,8 @@ mod streaming_edit_tests {
+ 	#[test]
+ 	fn receipt_observation_has_stable_identity_time_and_provenance() {
+ 		let usage = omp_ai::Usage {
++			prompt_cache_ttl_seconds: Some(1800),
++			prompt_cache_retention: Some(omp_ai::receipt::PromptCacheRetention::Extended24h),
+ 			cache_write_tokens: 400,
+ 			cache_write_1h_tokens: 300,
+ 			cache_write_reported: true,
+@@ -4223,6 +4232,8 @@ mod streaming_edit_tests {
+ 			.expect("ULID");
+ 		assert_eq!(receipt.recorded_at_ms, Some(id.timestamp_ms()));
+ 		assert_eq!(receipt.cache_write_1h, Some(300));
++		assert_eq!(receipt.prompt_cache_ttl_seconds, Some(1800));
++		assert_eq!(receipt.prompt_cache_retention.as_deref(), Some("24h"));
+ 		assert_eq!(receipt.cache_write_1h_reported, Some(true));
+ 		assert_eq!(receipt.usage_source, Some(omp_journal::data::ReceiptUsageSource::Provider));
+ 		let replay: omp_journal::data::TurnReceipt =
+diff --git a/crates/agent/tests/turn.rs b/crates/agent/tests/turn.rs
+index 4fef54fdac..d9d7b90d97 100644
+--- a/crates/agent/tests/turn.rs
++++ b/crates/agent/tests/turn.rs
+@@ -198,6 +198,62 @@ async fn user_turn_journals_assistant_text_in_the_explicit_turn() {
+ 	}
+ }
+ 
++#[tokio::test]
++async fn cache_timer_journals_stream_end_time_and_only_the_current_response_metadata() {
++	let directory = tempfile::tempdir().expect("temporary directory");
++	let journal_path = directory.path().join("cache.oms");
++	let stream_end = SystemTime::UNIX_EPOCH + Duration::from_millis(1_750_000_000_100);
++	let mut reported = text_script("cached");
++	let Some(ChatEvent::Completed(completion)) = reported.last_mut() else {
++		panic!("completion");
++	};
++	completion.usage.prompt_cache_ttl_seconds = Some(1800);
++	completion.usage.prompt_cache_retention =
++		Some(omp_ai::receipt::PromptCacheRetention::Extended24h);
++	completion.receipt.timings.completed_at = Some(stream_end);
++	let (inference, _) = ScriptedInference::new([reported, text_script("no metadata")]);
++	let mut kernel = Kernel::new(
++		inference,
++		registry(std::iter::empty()),
++		policy(&directory.path().join("blobs")),
++		StaticPrompt(Str::new_static("test system")),
++	);
++	let mut session = fresh_session(&journal_path);
++	let before = SystemTime::now()
++		.duration_since(SystemTime::UNIX_EPOCH)
++		.unwrap()
++		.as_millis() as u64;
++	for text in ["first", "second"] {
++		kernel
++			.run_turn(&mut session, input(text), RunControl::default())
++			.await
++			.expect("turn completes");
++	}
++	let after = SystemTime::now()
++		.duration_since(SystemTime::UNIX_EPOCH)
++		.unwrap()
++		.as_millis() as u64;
++	drop(session);
++	let receipts: Vec<omp_journal::data::TurnReceipt> = journal_entries(&journal_path)
++		.into_iter()
++		.filter(|entry| entry.kind.name.as_str() == kind::TURN_RECEIPT)
++		.map(|entry| serde_json::from_str(entry.data.as_str()).expect("receipt decodes"))
++		.collect();
++	assert_eq!(receipts.len(), 2);
++	assert_eq!(receipts[0].response_completed_at_ms, Some(1_750_000_000_100));
++	assert_eq!(receipts[0].prompt_cache_ttl_seconds, Some(1800));
++	assert_eq!(receipts[0].prompt_cache_retention.as_deref(), Some("24h"));
++	assert_eq!(receipts[1].prompt_cache_ttl_seconds, None);
++	assert_eq!(receipts[1].prompt_cache_retention, None);
++	assert!(
++		(before..=after).contains(
++			&receipts[1]
++				.response_completed_at_ms
++				.expect("local completion time")
++		)
++	);
++}
++
+ #[tokio::test]
+ async fn paused_completion_resamples_and_replays_durable_evidence() {
+ 	let directory = tempfile::tempdir().expect("temporary directory");
+diff --git a/crates/ai/src/codec/gemini.rs b/crates/ai/src/codec/gemini.rs
+index 7c1fe7ea3e..70941e59ad 100644
+--- a/crates/ai/src/codec/gemini.rs
++++ b/crates/ai/src/codec/gemini.rs
+@@ -1873,6 +1873,8 @@ impl GoogleUsageMetadata {
+ 			cache_read_reported: false,
+ 			cache_write_reported: false,
+ 			cache_write_1h_reported: false,
++			prompt_cache_ttl_seconds: None,
++			prompt_cache_retention: None,
+ 			images: 0,
+ 			audio_input_ms: 0,
+ 			audio_output_ms: 0,
+diff --git a/crates/ai/src/codec/openai_responses.rs b/crates/ai/src/codec/openai_responses.rs
+index da9aef1562..d7c537c6e6 100644
+--- a/crates/ai/src/codec/openai_responses.rs
++++ b/crates/ai/src/codec/openai_responses.rs
+@@ -34,7 +34,7 @@ use crate::{
+ 	error::{Error, ErrorKind, RetryAction},
+ 	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
+ 	id::{RequestId, ToolCallId},
+-	receipt::{Adjustment, Cost, FeatureId, ReasonId, Usage, UsageSource},
++	receipt::{Adjustment, Cost, FeatureId, PromptCacheRetention, ReasonId, Usage, UsageSource},
+ 	session::StoredProviderStateEvent,
+ 	transport::{Frame, FramingProtocol},
+ };
+@@ -1023,36 +1023,70 @@ pub struct ResponsesStatusDetails {
+ 	pub error: Option<ResponsesErrorObject>,
+ }
+ 
++/// Cache options reported in the response, independent of request preferences.
++#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ResponsesReturnedPromptCacheOptions {
++	/// Minimum retention duration explicitly reported by the provider.
++	#[serde(default)]
++	pub ttl: Option<Str>,
++}
++
++// Cache diagnostics are optional: future metadata shapes must not make an
++// otherwise valid inference response fail to decode.
++fn deserialize_optional_cache_metadata<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
++where
++	D: serde::Deserializer<'de>,
++	T: Deserialize<'de>,
++{
++	#[derive(Deserialize)]
++	#[serde(untagged)]
++	enum Metadata<T> {
++		Known(T),
++		Unknown(serde::de::IgnoredAny),
++	}
++	Ok(match Metadata::deserialize(deserializer)? {
++		Metadata::Known(value) => Some(value),
++		Metadata::Unknown(_) => None,
++	})
++}
++
+ /// Typed response envelope carried by lifecycle events.
+ #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct ResponsesResponse {
+ 	/// Authoritative response identity.
+ 	#[serde(default)]
+-	pub id:                 Option<Str>,
++	pub id:                     Option<Str>,
+ 	/// Wire model identity.
+ 	#[serde(default)]
+-	pub model:              Option<Str>,
++	pub model:                  Option<Str>,
+ 	/// Response status.
+ 	#[serde(default)]
+-	pub status:             Option<Str>,
++	pub status:                 Option<Str>,
+ 	/// Terminal error.
+ 	#[serde(default)]
+-	pub error:              Option<ResponsesErrorObject>,
++	pub error:                  Option<ResponsesErrorObject>,
+ 	/// Nested status details.
+ 	#[serde(default)]
+-	pub status_details:     Option<ResponsesStatusDetails>,
++	pub status_details:         Option<ResponsesStatusDetails>,
+ 	/// Incomplete details.
+ 	#[serde(default)]
+-	pub incomplete_details: Option<ResponsesIncompleteDetails>,
++	pub incomplete_details:     Option<ResponsesIncompleteDetails>,
+ 	/// Terminal output items.
+ 	#[serde(default)]
+-	pub output:             Vec<ResponsesOutputItem>,
++	pub output:                 Vec<ResponsesOutputItem>,
+ 	/// Terminal usage.
+ 	#[serde(default)]
+-	pub usage:              Option<ResponsesUsage>,
++	pub usage:                  Option<ResponsesUsage>,
+ 	/// Applied service tier.
+ 	#[serde(default)]
+-	pub service_tier:       Option<Str>,
++	pub service_tier:           Option<Str>,
++	/// Cache options actually applied by the provider. Unknown option shapes
++	/// must not break an otherwise valid inference response.
++	#[serde(default, deserialize_with = "deserialize_optional_cache_metadata")]
++	pub prompt_cache_options:   Option<ResponsesReturnedPromptCacheOptions>,
++	/// Legacy policy returned by the provider, not the request preference.
++	#[serde(default, deserialize_with = "deserialize_optional_cache_metadata")]
++	pub prompt_cache_retention: Option<PromptCacheRetention>,
+ }
+ 
+ /// Responses stream event discriminator.
+@@ -2056,8 +2090,9 @@ impl OpenAiResponsesDecoder {
+ 				)));
+ 				return;
+ 			}
+-			if let Some(usage) = &response.usage {
+-				let mut usage = Usage::from(usage);
++			if response.usage.is_some() || response.prompt_cache_options.is_some()
++				|| response.prompt_cache_retention.is_some() {
++				let mut usage = response_usage(response);
+ 				usage.search_calls = u32::from(self.saw_completed_hosted_tool);
+ 				out.push(ResponsesProjection::Canonical(ChatEvent::Usage(UsageUpdate {
+ 					usage,
+@@ -2100,8 +2135,7 @@ impl OpenAiResponsesDecoder {
+ 			FinishReason::Stop
+ 		};
+ 		let mut usage = response
+-			.and_then(|value| value.usage.as_ref())
+-			.map_or_else(Usage::default, Usage::from);
++			.map_or_else(Usage::default, response_usage);
+ 		usage.search_calls = u32::from(self.saw_completed_hosted_tool);
+ 		out.push(ResponsesProjection::Completion(Box::new(RawCompletion {
+ 			reason,
+@@ -2111,6 +2145,39 @@ impl OpenAiResponsesDecoder {
+ 	}
+ }
+ 
++/// Keep response metadata separate from inferred cache-token accounting.
++fn response_usage(response: &ResponsesResponse) -> Usage {
++	let mut usage = response
++		.usage
++		.as_ref()
++		.map_or_else(Usage::default, Usage::from);
++	usage.prompt_cache_ttl_seconds = response
++		.prompt_cache_options
++		.as_ref()
++		.and_then(|options| options.ttl.as_deref())
++		.and_then(|ttl| {
++			let (amount, multiplier) = if let Some(n) = ttl.strip_suffix('m') {
++				(n, 60)
++			} else if let Some(n) = ttl.strip_suffix('h') {
++				(n, 3600)
++			} else if let Some(n) = ttl.strip_suffix('s') {
++				(n, 1)
++			} else {
++				return None;
++			};
++			if !amount.bytes().all(|byte| byte.is_ascii_digit()) {
++				return None;
++			}
++			amount
++				.parse::<u64>()
++				.ok()?
++				.checked_mul(multiplier)
++				.filter(|&n| n > 0)
++		});
++	usage.prompt_cache_retention = response.prompt_cache_retention;
++	usage
++}
++
+ #[derive(Clone, Copy)]
+ enum SlotClass {
+ 	Text,
+@@ -5715,6 +5782,108 @@ mod tests {
+ 		);
+ 	}
+ 
++	#[test]
++	fn terminal_response_passes_cache_ttl_without_requiring_token_usage() {
++		for terminal in ["response.completed", "response.done", "response.incomplete"] {
++			let mut decoder = OpenAiResponsesDecoder::default();
++			let wire = serde_json::json!({"type":terminal,"response":{
++				"id":"resp_cache", "status": if terminal == "response.incomplete" { "incomplete" } else { "completed" },
++				"prompt_cache_options":{"ttl":"30m","mode":"auto"},
++				"prompt_cache_retention":"24h"
++			}});
++			let events = decoder.push_json(&serde_json::to_vec(&wire).unwrap());
++			let completion = events
++				.iter()
++				.find_map(|event| match event {
++					ResponsesProjection::Completion(completion) => Some(completion),
++					_ => None,
++				})
++				.expect("terminal completion");
++			assert_eq!(completion.usage.prompt_cache_ttl_seconds, Some(1800));
++			assert_eq!(
++				completion.usage.prompt_cache_retention,
++				Some(crate::receipt::PromptCacheRetention::Extended24h)
++			);
++			assert_eq!(completion.usage.source, crate::receipt::UsageSource::Unknown);
++			assert!(events.iter().any(|event| matches!(event,
++				ResponsesProjection::Canonical(ChatEvent::Usage(update)) if update.usage == completion.usage)));
++		}
++	}
++
++	#[test]
++	fn terminal_response_retains_cache_metadata_and_token_accounting_independently() {
++		for (ttl, seconds) in [("30m", 1800), ("1h", 3600), ("45s", 45)] {
++			let mut decoder = OpenAiResponsesDecoder::default();
++			let wire = serde_json::json!({"type":"response.completed","response":{
++				"id":"resp_cache", "status":"completed",
++				"prompt_cache_options":{"ttl":ttl,"mode":"future_mode"},
++				"usage":{"input_tokens":100,"output_tokens":5,
++					"input_tokens_details":{"cached_tokens":20,"cache_write_tokens":10}}
++			}});
++			let events = decoder.push_json(&serde_json::to_vec(&wire).unwrap());
++			let completion = events
++				.iter()
++				.find_map(|event| match event {
++					ResponsesProjection::Completion(completion) => Some(completion),
++					_ => None,
++				})
++				.expect("terminal completion");
++			assert_eq!(completion.usage.prompt_cache_ttl_seconds, Some(seconds));
++			assert_eq!(completion.usage.input_tokens, 70);
++			assert_eq!(completion.usage.cache_read_tokens, 20);
++			assert_eq!(completion.usage.cache_write_tokens, 10);
++			assert_eq!(completion.usage.output_tokens, 5);
++			assert_eq!(completion.usage.source, crate::receipt::UsageSource::Provider);
++		}
++	}
++
++	#[test]
++	fn absent_or_unrecognized_cache_metadata_does_not_invent_a_ttl_or_fail_inference() {
++		for ttl in [
++			serde_json::Value::Null,
++			serde_json::json!("0m"),
++			serde_json::json!("+30m"),
++			serde_json::json!("future"),
++			serde_json::json!("18446744073709551615h"),
++			serde_json::json!(30),
++		] {
++			let wire = serde_json::json!({"prompt_cache_options":{"ttl":ttl}, "prompt_cache_retention":"future_policy"});
++			let response: super::ResponsesResponse = serde_json::from_value(wire).unwrap();
++			let usage = super::response_usage(&response);
++			assert_eq!(usage.prompt_cache_ttl_seconds, None);
++			assert_eq!(usage.prompt_cache_retention, None);
++		}
++		assert_eq!(
++			super::response_usage(&super::ResponsesResponse::default()).prompt_cache_ttl_seconds,
++			None
++		);
++		let response: super::ResponsesResponse = serde_json::from_value(serde_json::json!({
++			"prompt_cache_retention":"in_memory", "usage":{"input_tokens":100,"output_tokens":5}
++		}))
++		.unwrap();
++		let usage = super::response_usage(&response);
++		assert_eq!(
++			usage.prompt_cache_retention,
++			Some(crate::receipt::PromptCacheRetention::InMemory)
++		);
++		assert_eq!(usage.prompt_cache_ttl_seconds, None);
++		assert_eq!(usage.input_tokens, 100);
++		for options in
++			[serde_json::json!(30), serde_json::json!([]), serde_json::json!("future_options")]
++		{
++			let response: super::ResponsesResponse = serde_json::from_value(serde_json::json!({
++				"prompt_cache_options":options, "prompt_cache_retention":"24h"
++			}))
++			.unwrap();
++			let usage = super::response_usage(&response);
++			assert_eq!(
++				usage.prompt_cache_retention,
++				Some(crate::receipt::PromptCacheRetention::Extended24h)
++			);
++			assert_eq!(usage.prompt_cache_ttl_seconds, None, "a maximum policy is not a TTL");
++		}
++	}
++
+ 	#[test]
+ 	fn replays_encrypted_reasoning_tool_and_usage_fixture() {
+ 		let events = replay_sse(include_str!(
+diff --git a/crates/ai/src/receipt.rs b/crates/ai/src/receipt.rs
+index ef80109e57..07c1bd6a1e 100644
+--- a/crates/ai/src/receipt.rs
++++ b/crates/ai/src/receipt.rs
+@@ -133,6 +133,19 @@ pub enum UsageSource {
+ 	Mixed,
+ }
+ 
++/// Legacy OpenAI retention policy returned by the provider (not an expiry).
++#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, strum::IntoStaticStr)]
++#[serde(rename_all = "snake_case")]
++#[strum(serialize_all = "snake_case")]
++pub enum PromptCacheRetention {
++	/// The provider selected in-memory retention.
++	InMemory,
++	/// The provider selected extended retention, at most 24 hours.
++	#[serde(rename = "24h")]
++	#[strum(serialize = "24h")]
++	Extended24h,
++}
++
+ /// Dimensioned resource usage for any inference operation.
+ #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+ pub struct Usage {
+@@ -164,6 +177,14 @@ pub struct Usage {
+ 	/// including zero.
+ 	#[serde(default)]
+ 	pub cache_write_1h_reported: bool,
++	/// Minimum lifetime explicitly returned in `prompt_cache_options.ttl`.
++	/// Absent means unknown; request settings and model defaults are not
++	/// evidence.
++	#[serde(default)]
++	pub prompt_cache_ttl_seconds: Option<u64>,
++	/// Legacy retention policy explicitly returned by the provider.
++	#[serde(default)]
++	pub prompt_cache_retention: Option<PromptCacheRetention>,
+ 	/// Images processed or generated.
+ 	pub images: u32,
+ 	/// Input audio duration in milliseconds.
+@@ -210,6 +231,10 @@ impl Usage {
+ 			(initially_unknown || self.cache_write_reported) && other.cache_write_reported;
+ 		self.cache_write_1h_reported =
+ 			(initially_unknown || self.cache_write_1h_reported) && other.cache_write_1h_reported;
++		// These describe the latest attempt, not a sum of token dimensions. An
++		// attempt with no metadata must not inherit an earlier attempt's TTL.
++		self.prompt_cache_ttl_seconds = other.prompt_cache_ttl_seconds;
++		self.prompt_cache_retention = other.prompt_cache_retention;
+ 		self.images = self.images.saturating_add(other.images);
+ 		self.audio_input_ms = self.audio_input_ms.saturating_add(other.audio_input_ms);
+ 		self.audio_output_ms = self.audio_output_ms.saturating_add(other.audio_output_ms);
+@@ -601,7 +626,8 @@ pub struct ExecutionReceipt {
+ 	/// Accumulated dimensioned usage.
+ 	pub usage:         Usage,
+ 	/// Anchored request-context accounting for the settled attempt.
+-	#[serde(default, skip_serializing_if = "Option::is_none")]
++	// Keep absent fields in positional postcard receipts as well as JSON.
++	#[serde(default)]
+ 	pub context:       Option<ContextUsageReceipt>,
+ 	/// Accumulated integer cost.
+ 	pub cost:          Cost,
+@@ -656,6 +682,15 @@ mod tests {
+ 		assert_eq!(receipt.settle_serving_model(conflicting.clone()), Err(conflicting));
+ 	}
+ 
++	#[test]
++	fn cache_metadata_belongs_to_the_latest_attempt_even_if_it_is_absent() {
++		let mut usage = Usage::default();
++		usage += Usage { prompt_cache_ttl_seconds: Some(1800), ..Usage::default() };
++		assert_eq!(usage.prompt_cache_ttl_seconds, Some(1800));
++		usage += Usage::default();
++		assert_eq!(usage.prompt_cache_ttl_seconds, None);
++	}
++
+ 	#[test]
+ 	fn accumulates_every_usage_dimension_and_integer_cost() {
+ 		let mut usage = Usage {
+@@ -668,6 +703,8 @@ mod tests {
+ 			cache_read_reported: false,
+ 			cache_write_reported: false,
+ 			cache_write_1h_reported: false,
++			prompt_cache_ttl_seconds: None,
++			prompt_cache_retention: None,
+ 			images: 1,
+ 			audio_input_ms: 6,
+ 			audio_output_ms: 7,
+@@ -686,6 +723,8 @@ mod tests {
+ 			cache_read_reported: false,
+ 			cache_write_reported: false,
+ 			cache_write_1h_reported: false,
++			prompt_cache_ttl_seconds: None,
++			prompt_cache_retention: None,
+ 			images: 2,
+ 			audio_input_ms: 60,
+ 			audio_output_ms: 70,
+diff --git a/crates/ai/src/staging.rs b/crates/ai/src/staging.rs
+index cbcfc8fbd6..b17e66fff1 100644
+--- a/crates/ai/src/staging.rs
++++ b/crates/ai/src/staging.rs
+@@ -1437,9 +1437,11 @@ mod tests {
+ 	}
+ 
+ 	#[test]
+-	fn secure_gate_usage_round_trip_preserves_reported_cache_zero() {
++	fn secure_gate_usage_round_trip_preserves_reported_cache_zero_and_retention() {
+ 		let usage = crate::receipt::Usage {
+ 			input_tokens: 100,
++			prompt_cache_ttl_seconds: Some(1800),
++			prompt_cache_retention: Some(crate::receipt::PromptCacheRetention::Extended24h),
+ 			cache_read_tokens: 600,
+ 			cache_read_reported: true,
+ 			cache_write_reported: true,
+@@ -1456,6 +1458,24 @@ mod tests {
+ 		};
+ 		assert_eq!(restored.usage, usage);
+ 		assert!(restored.final_update);
++		let mut receipt = crate::receipt::ExecutionReceipt::default();
++		receipt.timings.completed_at =
++			Some(std::time::UNIX_EPOCH + Duration::from_secs(1_750_000_000));
++		let event = ChatEvent::Completed(crate::event::Completion {
++			reason: crate::event::FinishReason::Stop,
++			blocks: 1,
++			usage,
++			receipt: receipt.clone().into(),
++		});
++		encoded.clear();
++		super::encode_chat_event(&event, &mut encoded).expect("stage completion");
++		let ChatEvent::Completed(restored) =
++			super::decode_chat_event(&encoded).expect("unstage completion")
++		else {
++			panic!("expected completion");
++		};
++		assert_eq!(restored.usage, usage);
++		assert_eq!(*restored.receipt, receipt);
+ 	}
+ 
+ 	#[test]
+@@ -2069,6 +2089,12 @@ fn encode_usage(usage: Usage, out: &mut Vec<u8>) {
+ 	put_bool(out, usage.cache_read_reported);
+ 	put_bool(out, usage.cache_write_reported);
+ 	put_bool(out, usage.cache_write_1h_reported);
++	put_option_u64(out, usage.prompt_cache_ttl_seconds);
++	put_u8(out, match usage.prompt_cache_retention {
++		None => 0,
++		Some(crate::receipt::PromptCacheRetention::InMemory) => 1,
++		Some(crate::receipt::PromptCacheRetention::Extended24h) => 2,
++	});
+ 	put_u32(out, usage.images);
+ 	put_u32(out, usage.search_calls);
+ 	put_u8(out, match usage.source {
+@@ -2221,6 +2247,13 @@ impl<'a> GateCursor<'a> {
+ 			cache_read_reported: self.bool()?,
+ 			cache_write_reported: self.bool()?,
+ 			cache_write_1h_reported: self.bool()?,
++			prompt_cache_ttl_seconds: self.option_u64()?,
++			prompt_cache_retention: match self.u8()? {
++				0 => None,
++				1 => Some(crate::receipt::PromptCacheRetention::InMemory),
++				2 => Some(crate::receipt::PromptCacheRetention::Extended24h),
++				_ => return Err(gate_corrupt("secure_gate_cache_retention_corrupt")),
++			},
+ 			images: self.u32()?,
+ 			search_calls: self.u32()?,
+ 			source: match self.u8()? {
+diff --git a/crates/app/src/rpc_mode.rs b/crates/app/src/rpc_mode.rs
+index d05febe6b3..6edb270697 100644
+--- a/crates/app/src/rpc_mode.rs
++++ b/crates/app/src/rpc_mode.rs
+@@ -3019,6 +3019,9 @@ fn kernel_event_value(event: KernelEvent) -> Option<Value> {
+ 			"cacheReadReported": receipt.cache_read_reported,
+ 			"cacheWriteReported": receipt.cache_write_reported,
+ 			"cacheWrite1hReported": receipt.cache_write_1h_reported,
++			"promptCacheTtlSeconds": receipt.prompt_cache_ttl_seconds,
++			"promptCacheRetention": receipt.prompt_cache_retention,
++			"responseCompletedAtMs": receipt.response_completed_at_ms,
+ 			"provider": receipt.identity.as_ref().map(|identity| identity.provider.as_str()),
+ 			"model": receipt.identity.as_ref().map(|identity| identity.model.as_str()),
+ 			"tokensIn": receipt.tokens_in,
+@@ -3252,6 +3255,9 @@ mod tests {
+ 	fn receipt_rpc_preserves_journal_identity_and_accounting_provenance() {
+ 		use omp_journal::data::{ReceiptCostSource, ReceiptUsageSource, TurnReceipt};
+ 		let receipt = TurnReceipt {
++			prompt_cache_ttl_seconds: Some(1800),
++			prompt_cache_retention: Some(Str::new_static("24h")),
++			response_completed_at_ms: Some(1750000000100),
+ 			receipt_id: Some(Str::new_static("01RECEIPT")),
+ 			recorded_at_ms: Some(1750000000123),
+ 			usage_source: Some(ReceiptUsageSource::Provider),
+@@ -3264,6 +3270,9 @@ mod tests {
+ 			super::kernel_event_value(omp_agent::KernelEvent::InferenceReceipt(Box::new(receipt)))
+ 				.expect("RPC receipt");
+ 		assert_eq!(value["receiptId"], "01RECEIPT");
++		assert_eq!(value["promptCacheTtlSeconds"], 1800);
++		assert_eq!(value["promptCacheRetention"], "24h");
++		assert_eq!(value["responseCompletedAtMs"], 1750000000100_u64);
+ 		assert_eq!(value["recordedAtMs"], 1750000000123_u64);
+ 		assert_eq!(value["usageSource"], "provider");
+ 		assert_eq!(value["costSource"], "catalog_estimate");
+diff --git a/crates/journal/src/data.rs b/crates/journal/src/data.rs
+index f186741ae3..583fa18673 100644
+--- a/crates/journal/src/data.rs
++++ b/crates/journal/src/data.rs
+@@ -731,6 +731,16 @@ pub struct TurnReceipt {
+ 	/// Whether the one-hour write counter was explicitly reported.
+ 	#[serde(default, skip_serializing_if = "Option::is_none")]
+ 	pub cache_write_1h_reported:     Option<bool>,
++	/// Minimum cache lifetime explicitly returned in the API response.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub prompt_cache_ttl_seconds:    Option<u64>,
++	/// Legacy provider-reported policy; never an exact expiry or minimum TTL.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub prompt_cache_retention:      Option<Str>,
++	/// Client wall clock at inference stream completion, before
++	/// journaling/hooks.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	pub response_completed_at_ms:    Option<u64>,
+ 	/// Uncached input token count; excludes `cache_read` and `cache_write`.
+ 	pub tokens_in:                   u64,
+ 	/// Output token count.
+@@ -789,6 +799,9 @@ impl TurnReceipt {
+ 			cache_read_reported: None,
+ 			cache_write_reported: None,
+ 			cache_write_1h_reported: None,
++			prompt_cache_ttl_seconds: None,
++			prompt_cache_retention: None,
++			response_completed_at_ms: None,
+ 			tokens_in,
+ 			tokens_out,
+ 			cost_nano_usd,
+@@ -992,7 +1005,13 @@ mod tests {
+ 		assert_eq!(legacy.cache_write_reported, None);
+ 		assert_eq!(legacy.cache_write_1h, None);
+ 		assert_eq!(legacy.cost_source, None);
++		assert_eq!(legacy.prompt_cache_ttl_seconds, None);
++		assert_eq!(legacy.prompt_cache_retention, None);
++		assert_eq!(legacy.response_completed_at_ms, None);
+ 		let recorded = TurnReceipt {
++			prompt_cache_ttl_seconds: Some(1800),
++			prompt_cache_retention: Some(Str::new_static("24h")),
++			response_completed_at_ms: Some(1750000000100),
+ 			receipt_id: Some(Str::new_static("01RECEIPT")),
+ 			recorded_at_ms: Some(1750000000123),
+ 			usage_source: Some(super::ReceiptUsageSource::Provider),
+diff --git a/justfile b/justfile
+index a456a313cc..4300e78668 100644
+--- a/justfile
++++ b/justfile
+@@ -380,3 +380,12 @@ test-omperor-catalog-startup:
+ test-omperor-partition-disconnect:
+     cargo nextest run -p omp-env --lib --locked -E 'test(partition::tests::)'
+     cargo test --doc -p omp-env --locked
++
++# Response-reported cache retention survives decoding, staging, journal replay and RPC.
++[group('test')]
++test-omperor-cache-timer:
++    cargo nextest run -p omp-ai --lib --locked -E 'test(codec::openai_responses::tests::) | test(cache_metadata) | test(secure_gate_usage_round_trip)'
++    cargo nextest run -p omp-agent --lib --test turn --locked -E 'test(receipt_observation) | test(cache_timer)'
++    cargo nextest run -p omp-journal --lib --locked -E 'test(receipt_observation)'
++    cargo nextest run -p omp-app --lib --locked -E 'test(receipt_rpc_preserves)'
++    cargo test --doc -p omp-ai -p omp-agent -p omp-journal -p omp-app --locked

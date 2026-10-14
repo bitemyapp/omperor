@@ -1,0 +1,55 @@
+diff --git a/crates/mermaid/Cargo.toml b/crates/mermaid/Cargo.toml
+index 0c2ec89..0b80383 100644
+--- a/crates/mermaid/Cargo.toml
++++ b/crates/mermaid/Cargo.toml
+@@ -74,5 +74,8 @@ default = ["elk"]
+ # oracle, replay Swift's recorded ELK answers).
+ elk = ["dep:upleft-elk"]
+ 
++[target.'cfg(target_os = "linux")'.dependencies]
++libc = "0.2"
++
+ [dev-dependencies]
+ objc2-app-kit = { workspace = true, features = ["NSAppearance", "NSBitmapImageRep", "NSImage", "NSImageRep"] }
+diff --git a/crates/mermaid/src/swift.rs b/crates/mermaid/src/swift.rs
+index a445edb..f63057c 100644
+--- a/crates/mermaid/src/swift.rs
++++ b/crates/mermaid/src/swift.rs
+@@ -95,6 +95,22 @@ pub fn int(x: f64) -> i64 {
+     x as i64
+ }
+ 
++/// A valid immutable C locale for Linux's numeric parser.
++#[cfg(target_os = "linux")]
++fn c_numeric_locale() -> *mut std::ffi::c_void {
++    // Unlike Darwin, glibc requires a live locale_t for strtod_l. Keep an
++    // immutable C locale for the process lifetime so parallel diagram workers
++    // share it without changing the caller's thread or global locale.
++    static LOCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *LOCALE.get_or_init(|| {
++        // SAFETY: the name is NUL-terminated, the mask is valid, and a null
++        // base asks newlocale to allocate a new locale (all other categories C).
++        let locale = unsafe { libc::newlocale(libc::LC_NUMERIC_MASK, c"C".as_ptr(), std::ptr::null_mut()) };
++        assert!(!locale.is_null(), "cannot create the C numeric locale");
++        locale as usize
++    }) as *mut std::ffi::c_void
++}
++
+ /// `Double(text)`: `strtod` in the C locale, rejecting a leading ASCII space
+ /// or control whitespace and requiring the whole string to be consumed.
+ pub fn parse_double(text: &str) -> Option<f64> {
+@@ -118,7 +134,13 @@ pub fn parse_double(text: &str) -> Option<f64> {
+     #[allow(non_camel_case_types)]
+     type libc_char = std::ffi::c_char;
+     let mut end: *mut libc_char = std::ptr::null_mut();
+-    let value = unsafe { strtod_l(c.as_ptr(), &mut end, std::ptr::null_mut()) };
++    #[cfg(target_os = "linux")]
++    let locale = c_numeric_locale();
++    #[cfg(not(target_os = "linux"))]
++    let locale = std::ptr::null_mut();
++    // SAFETY: c and end are valid, and locale is live on Linux (Darwin
++    // accepts null for its default C locale).
++    let value = unsafe { strtod_l(c.as_ptr(), &mut end, locale) };
+     if end.is_null() {
+         return None;
+     }

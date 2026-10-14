@@ -1,0 +1,34 @@
+diff --git a/crates/ai/src/codec/openai_codex.rs b/crates/ai/src/codec/openai_codex.rs
+index bf5c34cde3..316a8887d3 100644
+--- a/crates/ai/src/codec/openai_codex.rs
++++ b/crates/ai/src/codec/openai_codex.rs
+@@ -1161,12 +1161,14 @@ impl Codec for OpenAiCodexCodec {
+ 					account_id: None,
+ 					originator: Some(Str::new(CODEX_ORIGINATOR)),
+ 				});
++		let mut routing_session = None;
+ 		if let Some(identity) = self
+ 			.options
+ 			.identity
+ 			.as_ref()
+ 			.or(affinity_identity.as_ref())
+ 		{
++			routing_session = Some(identity.session_id.clone());
+ 			apply_codex_client_metadata(
+ 				&mut request,
+ 				identity,
+@@ -1204,6 +1206,14 @@ impl Codec for OpenAiCodexCodec {
+ 			super::RequestHeader { name: sf!("accept"), value: Str::new(accept) },
+ 		];
+ 		apply_codex_residency_header(&mut headers, context.account);
++		// The Codex client names its conversation in these headers on every
++		// request; the backend keeps a conversation's turns on the machines
++		// that hold its prompt cache. Without them consecutive turns land
++		// anywhere and re-read their whole history uncached.
++		if let Some(session) = routing_session {
++			headers.push(super::RequestHeader { name: sf!("session_id"), value: session.clone() });
++			headers.push(super::RequestHeader { name: sf!("conversation_id"), value: session });
++		}
+ 		Ok(EncodedRequest {
+ 			operation: OperationKind::Chat,
+ 			method,

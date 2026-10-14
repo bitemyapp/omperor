@@ -1,0 +1,113 @@
+diff --git a/crates/envd/src/workspace/operations.rs b/crates/envd/src/workspace/operations.rs
+index cbbc111d97..b171551441 100644
+--- a/crates/envd/src/workspace/operations.rs
++++ b/crates/envd/src/workspace/operations.rs
+@@ -244,7 +244,9 @@ struct IsolationOwner<'a> {
+ 	id:  &'a str,
+ }
+ 
+-const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner";
++/// Written into each isolated root; the walker treats it as a repository
++/// boundary, so ignore files above the copy never filter its snapshot.
++const ISOLATION_OWNER_FILE: &str = omp_walker::ISOLATION_ROOT_MARKER;
+ 
+ #[must_use]
+ struct WorktreeBuild {
+diff --git a/crates/walker/src/lib.rs b/crates/walker/src/lib.rs
+index b4957778b7..d833d9b991 100644
+--- a/crates/walker/src/lib.rs
++++ b/crates/walker/src/lib.rs
+@@ -49,6 +49,11 @@ use parking_lot::Mutex;
+ 
+ const HEARTBEAT_INTERVAL: usize = 128;
+ 
++/// Marks the root of an isolated workspace copy made by the environment
++/// daemon. It stands in for the repository it copies, so ignore rules from the
++/// directories it happens to live in never apply to it.
++pub const ISOLATION_ROOT_MARKER: &str = ".omp-isolation-owner";
++
+ /// Filesystem entry kind reported by the walker.
+ #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+ pub enum FileType {
+@@ -3013,7 +3018,7 @@ impl IgnoreEntryNames {
+ }
+ 
+ fn has_repo_marker(dir: &Path) -> bool {
+-	dir.join(".git").exists() || dir.join(".jj").exists()
++	dir.join(".git").exists() || dir.join(".jj").exists() || dir.join(ISOLATION_ROOT_MARKER).exists()
+ }
+ /// Resolves the repository-local exclude file for both normal repositories and
+ /// linked worktrees whose `.git` entry is a `gitdir:` pointer file.
+@@ -3209,6 +3214,15 @@ impl IgnoreState {
+ 		if !use_gitignore {
+ 			return None;
+ 		}
++		// A repository's ignore rules come from inside it. Git never applies an
++		// enclosing repository's .gitignore in a nested one, and a home
++		// directory kept in git commonly ignores `bin/`, `build/` or
++		// `workspace/`: applying those to a project, or to an isolated copy
++		// that lives under that home, hid tracked files from every walk and
++		// made a merge-back read them as deleted.
++		if has_repo_marker(root) {
++			return None;
++		}
+ 		let mut ancestors = Vec::new();
+ 		let mut current = root.parent();
+ 		let mut repo_start = None;
+@@ -4769,6 +4783,56 @@ mod tests {
+ 		);
+ 	}
+ 
++	fn collected_paths(root: &Path) -> Vec<String> {
++		collect_entries(
++			root,
++			WalkOptions { use_gitignore: true, cache: false, ..test_options() },
++			|| Ok::<(), Infallible>(()),
++		)
++		.expect("collection should not fail")
++		.entries
++		.into_iter()
++		.map(|entry| entry.path.to_string())
++		.collect()
++	}
++
++	#[test]
++	fn an_enclosing_repository_gitignore_does_not_apply_inside_a_nested_repository() {
++		let tree = temp_tree("nested-repo-boundary");
++		fs::create_dir_all(tree.path().join(".git")).expect("outer repo marker");
++		fs::write(tree.path().join(".gitignore"), "bin/\nworkspace/\n").expect("outer .gitignore");
++		let project = tree.path().join("project");
++		fs::create_dir_all(project.join(".git")).expect("inner repo marker");
++		fs::create_dir_all(project.join("src/bin")).expect("bin directory");
++		fs::write(project.join("src/bin/main.rs"), "fn main() {}").expect("tracked source");
++		fs::write(project.join(".gitignore"), "*.log\n").expect("inner .gitignore");
++		fs::write(project.join("debug.log"), "noise").expect("ignored file");
++
++		let paths = collected_paths(&project);
++		assert!(paths.iter().any(|path| path.ends_with("src/bin/main.rs")), "{paths:?}");
++		assert!(!paths.iter().any(|path| path == "debug.log"), "{paths:?}");
++	}
++
++	#[test]
++	fn an_isolated_workspace_root_is_a_repository_boundary() {
++		let tree = temp_tree("isolation-root-boundary");
++		fs::create_dir_all(tree.path().join(".git")).expect("enclosing home repo marker");
++		fs::write(tree.path().join(".gitignore"), "bin/\n.cargo\n").expect("home .gitignore");
++		let copy = tree.path().join("data/worktrees/subagent-x");
++		fs::create_dir_all(copy.join("src/bin")).expect("bin directory");
++		fs::create_dir_all(copy.join(".cargo")).expect("cargo directory");
++		fs::write(copy.join(ISOLATION_ROOT_MARKER), "{}").expect("isolation marker");
++		fs::write(copy.join("src/bin/main.rs"), "fn main() {}").expect("copied source");
++		fs::write(copy.join(".cargo/config.toml"), "").expect("copied config");
++		fs::write(copy.join(".gitignore"), "*.log\n").expect("copied project .gitignore");
++		fs::write(copy.join("debug.log"), "noise").expect("ignored file");
++
++		let paths = collected_paths(&copy);
++		assert!(paths.iter().any(|path| path.ends_with("src/bin/main.rs")), "{paths:?}");
++		assert!(paths.iter().any(|path| path == ".cargo/config.toml"), "{paths:?}");
++		assert!(!paths.iter().any(|path| path == "debug.log"), "{paths:?}");
++	}
++
+ 	#[test]
+ 	fn collect_entries_applies_repo_root_gitignore_to_subdirectory_search_root() {
+ 		let tree = temp_tree("repo-root-gitignore-subdir-root");

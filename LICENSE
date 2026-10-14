@@ -1,0 +1,20 @@
+Omperor
+Copyright (c) 2026 Chris Allen
+
+Except where otherwise noted, original Omperor code, documentation, and assets
+are licensed under either of the following licenses, at your option:
+
+  * MIT license (LICENSE-MIT)
+  * Apache License, Version 2.0 (LICENSE-APACHE)
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+Third-party material, including the vendor submodules and their dependencies,
+retains its own licenses and notices. The licenses above do not relicense that
+material or grant rights to material whose license has not been established.
+Patches do not change the licenses of the upstream material they modify.
+See docs/LICENSING.md for the dependency boundaries and public-release work.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in Omperor, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.

@@ -1,0 +1,68 @@
+diff --git a/crates/ai/src/codec/openai_codex.rs b/crates/ai/src/codec/openai_codex.rs
+--- a/crates/ai/src/codec/openai_codex.rs
++++ b/crates/ai/src/codec/openai_codex.rs
+@@ -302,7 +302,9 @@
+ 	let mut metadata = turn_metadata.clone();
+ 	metadata.insert(sf!("session_id"), ResponsesMetadataValue::String(identity.session_id.clone()));
+ 	metadata.insert(sf!("turn_id"), ResponsesMetadataValue::String(identity.turn_id.clone()));
+-	metadata.insert(sf!("responses_lite"), ResponsesMetadataValue::Bool(responses_lite));
++	// The server's client_metadata contract requires string values, including
++	// flags.
++	metadata.insert(sf!("responses_lite"), ResponsesMetadataValue::String(sf!("{responses_lite}")));
+ 	if let Some(account) = &identity.account_id {
+ 		metadata.insert(sf!("account_id"), ResponsesMetadataValue::String(account.clone()));
+ 	}
+@@ -1277,6 +1279,40 @@
+ 	}
+ 
+ 	#[test]
++	fn codex_client_metadata_serializes_protocol_strings() {
++		let identity = super::CodexRequestIdentity {
++			session_id: Str::new_static("session-1"),
++			turn_id:    Str::new_static("turn-1"),
++			account_id: Some(Str::new_static("account-1")),
++			originator: Some(Str::new_static("omperor")),
++		};
++		for transport in [super::CodexWireTransport::Http, super::CodexWireTransport::WebSocket] {
++			for responses_lite in [false, true] {
++				let mut request: ResponsesRequest = serde_json::from_str(include_str!(
++					"../../../../fixtures/llm-oracle/openai/codex/request.responses_lite.json"
++				))
++				.expect("typed request fixture");
++				super::apply_codex_client_metadata(
++					&mut request,
++					&identity,
++					transport,
++					responses_lite,
++					Some("state-1"),
++					&super::ResponsesMetadata::new(),
++				);
++				let wire = serde_json::to_value(&request).expect("wire request");
++				let metadata = wire["client_metadata"]
++					.as_object()
++					.expect("metadata object");
++				assert!(metadata.values().all(serde_json::Value::is_string));
++				assert_eq!(metadata["responses_lite"], responses_lite.to_string());
++				assert_eq!(metadata["session_id"], "session-1");
++				assert_eq!(metadata["turn_id"], "turn-1");
++			}
++		}
++	}
++
++	#[test]
+ 	fn responses_lite_fixture_is_an_exact_typed_rewrite() {
+ 		let mut request: ResponsesRequest = serde_json::from_str(include_str!(
+ 			"../../../../fixtures/llm-oracle/openai/codex/request.responses_lite.json"
+diff --git a/justfile b/justfile
+--- a/justfile
++++ b/justfile
+@@ -296,3 +296,9 @@
+     cargo nextest run -p omp-agent --test dispatch --test turn --test jobs --locked -E 'test(dispatch_timed_out_call) | test(an_adopted_job_survives) | test(settled_background_job) | binary(jobs)'
+     cargo nextest run -p omp-driver --lib --locked -E 'test(efficiency::)'
+     cargo test --doc -p omp-tools -p omp-agent -p omp-driver --locked
++
++# Wire-format regression discovered by the live Luna background-job check.
++[group('test')]
++test-omperor-codex-metadata:
++    cargo nextest run -p omp-ai --lib --locked -E 'test(codec::openai_codex::tests::)'
++    cargo test --doc -p omp-ai --locked

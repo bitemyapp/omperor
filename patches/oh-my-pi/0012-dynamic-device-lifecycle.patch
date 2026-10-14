@@ -1,0 +1,309 @@
+diff --git a/crates/envd/src/devices_host.rs b/crates/envd/src/devices_host.rs
+index a866162e01..00c64c80f3 100644
+--- a/crates/envd/src/devices_host.rs
++++ b/crates/envd/src/devices_host.rs
+@@ -12,7 +12,7 @@ use omp_shell_builtins::{
+ };
+ use omp_tool::{
+ 	DevicePath, Diag, DiagEnvelope, DiagKind, ErasedEv, ErasedOutcome, ErasedStream, IncomingParams,
+-	Part, PromptCaps, Registry, RegistryError, ToolIdentity, ToolRoute,
++	Interrupt, InvocationFeed, Part, PromptCaps, Registry, RegistryError, ToolIdentity, ToolRoute,
+ };
+ use omp_tools::{
+ 	device::{DeviceCatalog, DeviceInvokeRequest, ErasedDeviceInvoker},
+@@ -373,22 +373,25 @@ impl ShellDynHost for DynHost {
+ 					.map_err(|error| DynFault::new(error.to_string()))?;
+ 				let raw = Str::new(args.to_string());
+ 				let args_json = Bytes::from(raw.clone());
+-				let mut stream = match target.route.clone() {
++				// The committed feed also owns the post-commit interrupt channel.
++				// Retain it until the nested invocation reaches its terminal outcome.
++				let (mut stream, feed) = match target.route.clone() {
+ 					ToolRoute::Native => {
+ 						let (feed, params) =
+ 							IncomingParams::channel_for(None, Some(invocation_id.clone()));
+ 						feed.args_committed(raw).map_err(|_| {
+ 							DynFault::new("device argument channel closed before dispatch")
+ 						})?;
+-						registry
++						let stream = registry
+ 							.invoke_device(&path, params)
+-							.map_err(|error| DynFault::new(format!("device dispatch failed: {error}")))?
++							.map_err(|error| DynFault::new(format!("device dispatch failed: {error}")))?;
++						(stream, Some(feed))
+ 					},
+ 					ToolRoute::Remote => {
+ 						return Err(DynFault::new("device is owned by the remote environment host"));
+ 					},
+ 					ToolRoute::Worker { site, name: worker } => {
+-						self
++						let stream = self
+ 							.invoker
+ 							.invoke(DeviceInvokeRequest {
+ 								path,
+@@ -401,10 +404,12 @@ impl ShellDynHost for DynHost {
+ 								deadline: Duration::new(5, DurationUnit::Minutes),
+ 								args_json,
+ 							})
+-							.await
++							.await;
++						(stream, None)
+ 					},
+ 				};
+-				consume(&registry, &self.blobs, &identity, &mut stream, cancellation).await
++				consume(&registry, &self.blobs, &identity, &mut stream, feed.as_ref(), cancellation)
++					.await
+ 			}
+ 			.await;
+ 			if let Ok(call) = &result {
+@@ -420,6 +425,7 @@ async fn consume(
+ 	blobs: &BlobHost,
+ 	identity: &ToolIdentity,
+ 	stream: &mut ErasedStream<'_>,
++	feed: Option<&InvocationFeed>,
+ 	cancellation: CancellationToken,
+ ) -> Result<DynCallOutput, DynFault> {
+ 	let mut diags = Vec::new();
+@@ -427,6 +433,21 @@ async fn consume(
+ 		let event = tokio::select! {
+ 			biased;
+ 			() = cancellation.cancelled() => {
++				if let Some(feed) = feed {
++					let _ = feed.interrupt(Interrupt {
++						class: sf!("immediate"),
++						reason: sf!("dynamic device invocation was cancelled"),
++					});
++					// Poll cooperative cleanup before dropping the stream. Browser and
++					// computer tools relay this interrupt to their resource owners.
++					let _ = tokio::time::timeout(std::time::Duration::from_millis(250), async {
++						while let Some(Ok(event)) = stream.next().await {
++							if matches!(event, ErasedEv::Done(_)) {
++								break;
++							}
++						}
++					}).await;
++				}
+ 				return Err(DynFault::new("dynamic device invocation was cancelled"));
+ 			},
+ 			event = stream.next() => event,
+@@ -547,14 +568,12 @@ fn output_error_message(output: DynOutput) -> Str {
+ }
+ 
+ fn faulted(verdict: &[u8]) -> bool {
+-	serde_json::from_slice::<Value>(verdict)
+-		.ok()
+-		.is_some_and(|value| {
+-			value
+-				.get("kind")
+-				.and_then(Value::as_str)
+-				.is_some_and(|kind| matches!(kind, "fault" | "faulted"))
+-		})
++	!matches!(
++		serde_json::from_slice::<omp_tool::CallOutcome<serde::de::IgnoredAny, serde::de::IgnoredAny>>(
++			verdict
++		),
++		Ok(omp_tool::CallOutcome::Ok(_))
++	)
+ }
+ 
+ fn device_event_json(device: omp_tool::MountedDevice<'_>) -> Value {
+@@ -646,6 +665,199 @@ mod tests {
+ 		}
+ 	}
+ 
++	struct WaitingDevice {
++		observe_interrupts: bool,
++		spec:               ToolSpec,
++		started:            flume::Sender<()>,
++		complete:           flume::Receiver<()>,
++		interrupted:        Arc<AtomicUsize>,
++	}
++
++	impl Tool for WaitingDevice {
++		type Fault = Value;
++		type Params = Value;
++		type Payload = Value;
++		type Update = Value;
++
++		fn spec(&self) -> &ToolSpec {
++			&self.spec
++		}
++
++		fn call<'c>(
++			&'c self,
++			mut incoming: IncomingParams<'c>,
++		) -> impl Stream<Item = Ev<Value, Value, Value>> + Send + 'c {
++			async_stream::stream! {
++				incoming.committed().await.expect("committed device arguments");
++				self.started.send(()).expect("test observes execution");
++				tokio::select! {
++					biased;
++					interrupt = incoming.next_interrupt(), if self.observe_interrupts => {
++						let abort = match interrupt {
++							Ok(interrupt) => {
++								self.interrupted.fetch_add(1, Ordering::Relaxed);
++								omp_tool::Abort::Interrupted { reason: interrupt.reason }
++							},
++							Err(_) => omp_tool::Abort::InputDropped,
++						};
++						yield Ev::Aborted(abort);
++					},
++					_ = self.complete.recv_async() => {
++						yield Ev::Done(omp_tool::ToolTerminal::Done {
++							result: Ok(json!({"ok": true})),
++							useless: false,
++						});
++					},
++				}
++			}
++		}
++
++		fn prompt(&self, view: Result<&Value, &Value>, _caps: &PromptCaps) -> Vec<Part> {
++			vec![Part::Json { json: Bytes::from(serde_json::to_vec(view.unwrap()).unwrap()) }]
++		}
++	}
++
++	fn waiting_device_host(
++		scratch: &std::path::Path,
++		observe_interrupts: bool,
++	) -> (DynHost, Arc<Registry>, flume::Receiver<()>, flume::Sender<()>, Arc<AtomicUsize>) {
++		let (started, observed) = flume::bounded(1);
++		let (complete, completion) = flume::bounded(1);
++		let interrupted = Arc::new(AtomicUsize::new(0));
++		let mut registry = Registry::new();
++		registry
++			.register(
++				WaitingDevice {
++					observe_interrupts,
++					spec: ToolSpec {
++						name:            sf!("waiting"),
++						rev:             Rev { family: sf!("test"), n: 1 },
++						description:     sf!("Device that waits for completion or cancellation"),
++						schema:          Bytes::from_static(br#"{"type":"object","properties":{}}"#),
++						constraint:      Constraint::None,
++						effects:         Effects::empty(),
++						projection_code: [1; 32],
++					},
++					started,
++					complete: completion,
++					interrupted: Arc::clone(&interrupted),
++				},
++				Presentation::Device,
++				Claims {
++					precedence: Precedence::ENHANCEMENT,
++					claimant:   sf!("omp/test"),
++					replaces:   None,
++				},
++			)
++			.expect("register waiting device");
++		let catalog = DeviceCatalog::default();
++		let registry = Arc::new(registry);
++		catalog
++			.install_registry(Arc::clone(&registry))
++			.expect("install catalog");
++		let mcp = McpManager::new(
++			McpService::open(scratch.join("mcp.sqlite3")).expect("MCP service"),
++			Arc::new(ProductionConnector::new(scratch.to_path_buf())),
++			Arc::from([]),
++			scratch.join("local"),
++		);
++		let host = DynHost::new(
++			catalog,
++			Arc::new(NoWorker),
++			StagedProposalRegistry::new(),
++			Arc::new(HookGate::channel().0),
++			BlobHost::open(scratch.join("blobs")).expect("blobs"),
++			mcp,
++			DynamicAdmission::new(ApprovalMode::Yolo, Default::default(), None),
++		);
++		(host, registry, observed, complete, interrupted)
++	}
++
++	#[tokio::test]
++	async fn native_device_keeps_committed_input_alive_until_completion() {
++		let scratch = tempfile::tempdir().expect("scratch");
++		let (host, _registry, started, complete, interrupted) =
++			waiting_device_host(scratch.path(), true);
++		let invocation = tokio::spawn(async move {
++			ShellDynHost::call(&host, "waiting", json!({}), CancellationToken::new()).await
++		});
++		tokio::time::timeout(std::time::Duration::from_secs(2), started.recv_async())
++			.await
++			.expect("device starts")
++			.expect("start notification");
++		complete.send(()).expect("complete device");
++		let result = tokio::time::timeout(std::time::Duration::from_secs(2), invocation)
++			.await
++			.expect("device settles")
++			.expect("invocation task")
++			.expect("successful device");
++		assert_eq!(result.output, DynOutput::Json(json!({"ok": true})));
++		assert_eq!(interrupted.load(Ordering::Relaxed), 0);
++	}
++
++	#[tokio::test]
++	async fn native_device_relays_cancellation_before_releasing_input() {
++		let scratch = tempfile::tempdir().expect("scratch");
++		let (host, _registry, started, _complete, interrupted) =
++			waiting_device_host(scratch.path(), true);
++		let cancellation = CancellationToken::new();
++		let call_cancellation = cancellation.clone();
++		let invocation = tokio::spawn(async move {
++			ShellDynHost::call(&host, "waiting", json!({}), call_cancellation).await
++		});
++		tokio::time::timeout(std::time::Duration::from_secs(2), started.recv_async())
++			.await
++			.expect("device starts")
++			.expect("start notification");
++		cancellation.cancel();
++		let result = tokio::time::timeout(std::time::Duration::from_secs(2), invocation)
++			.await
++			.expect("cancellation settles")
++			.expect("invocation task");
++		assert!(result.is_err(), "cancelled device must fail its shell invocation");
++		assert_eq!(interrupted.load(Ordering::Relaxed), 1);
++	}
++
++	#[tokio::test]
++	async fn native_device_cancellation_does_not_wait_forever_for_cleanup() {
++		let scratch = tempfile::tempdir().expect("scratch");
++		let (host, _registry, started, _complete, interrupted) =
++			waiting_device_host(scratch.path(), false);
++		let cancellation = CancellationToken::new();
++		let call_cancellation = cancellation.clone();
++		let invocation = tokio::spawn(async move {
++			ShellDynHost::call(&host, "waiting", json!({}), call_cancellation).await
++		});
++		tokio::time::timeout(std::time::Duration::from_secs(2), started.recv_async())
++			.await
++			.expect("device starts")
++			.expect("start notification");
++		cancellation.cancel();
++		let result = tokio::time::timeout(std::time::Duration::from_secs(2), invocation)
++			.await
++			.expect("uncooperative device cancellation is bounded")
++			.expect("invocation task");
++		assert!(result.is_err());
++		assert_eq!(interrupted.load(Ordering::Relaxed), 0);
++	}
++
++	#[test]
++	fn unsuccessful_device_verdicts_are_errors() {
++		assert!(!faulted(br#"{"kind":"ok","value":{}}"#));
++		assert!(faulted(br#"{"kind":"faulted","value":{}}"#));
++		assert!(faulted(br#"{"kind":"fault","value":{}}"#));
++		let aborted = omp_tool::CallOutcome::<Value, Value>::aborted(omp_tool::Abort::InputDropped);
++		assert!(faulted(&serde_json::to_vec(&aborted).expect("abort verdict")));
++		let rejected = omp_tool::CallOutcome::<Value, Value>::ArgsRejected(omp_tool::ArgIssue {
++			path:     Vec::new(),
++			expected: sf!("valid input"),
++			kind:     omp_tool::ArgIssueKind::Malformed,
++			example:  None,
++			found:    None,
++		});
++		assert!(faulted(&serde_json::to_vec(&rejected).expect("argument verdict")));
++	}
++
+ 	#[derive(Clone)]
+ 	struct NoWorker;
+ 

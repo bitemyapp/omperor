@@ -1,0 +1,54 @@
+{
+  "schema": "omperor.perf.fingerprint.v1",
+  "captured_at": "2026-09-01T21:31:48Z",
+  "host": {
+    "product": "MacBook Pro",
+    "model_identifier": "Mac17,6",
+    "cpu": "Apple M5 Max",
+    "logical_cores": 18,
+    "memory_bytes": 137438953472,
+    "architecture": "arm64",
+    "power": "AC",
+    "battery_percent": 80
+  },
+  "operating_system": {
+    "name": "macOS",
+    "version": "26.6.2",
+    "build": "25G83",
+    "kernel": "Darwin 25.6.0"
+  },
+  "toolchain": {
+    "rustc": "1.99.0-nightly (1a98b1e13 2026-08-07)",
+    "cargo": "1.99.0-nightly (c79e8f894 2026-08-04)"
+  },
+  "source": {
+    "omperor_git_sha": "9c037b38441d9fba4b7cf7cf6fa5eb41a3aa455e",
+    "omperor_state": "instrumentation changes in working tree",
+    "omp_git_sha": "fbe3ac390e6938a43dbd82099694b2bcaf5657bc",
+    "omp_state": "clean source; ignored staging linker shim selected lld@22"
+  },
+  "linker": {
+    "release_omp": "Homebrew LLD 22.1.8 from lld@22",
+    "unversioned_homebrew_lld": "Homebrew LLD 23.1.0"
+  },
+  "binaries": {
+    "gui": {
+      "path": "target/Omperor.app/Contents/MacOS/omperor",
+      "bytes": 32018928,
+      "sha256": "fd8c338c7adc562b66e5d68bdeac84962bdb06ba461d4c6ca3532eccac5e1ece"
+    },
+    "omp_debug": {
+      "path": "vendor/oh-my-pi/target/debug/omp",
+      "bytes": 936648912,
+      "sha256": "bfc940b42dfe7b4ceadb1bb97a02ad5487a2f7454cc7d4be67ccbff8c703068a"
+    },
+    "omp_release": {
+      "path": "vendor/oh-my-pi/target/release/omp",
+      "bytes": 277753760,
+      "sha256": "0893a8a152fb0cb829019ac5a1719c44a2b1ab951b20d1ab97a2069a6ce9f203"
+    }
+  },
+  "run_order": ["debug", "release"],
+  "cache_state": "warm local build outputs; no cache flush",
+  "os_tuning": "none"
+}

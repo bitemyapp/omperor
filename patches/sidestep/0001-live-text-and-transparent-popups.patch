@@ -1,0 +1,267 @@
+From 05d0142b20bc46ff3843ffea86b7d01fd90128df Mon Sep 17 00:00:00 2001
+From: Chris Allen <cma@bitemyapp.com>
+Date: Fri, 2 Oct 2026 00:31:01 -0500
+Subject: [PATCH 1/6] Fix live text field values and transparent popup drawing
+
+Signed-off-by: Chris Allen <cma@bitemyapp.com>
+---
+ crates/sidestep-appkit/Cargo.toml             |   5 +
+ .../sidestep-appkit/src/controls/control.rs   |   5 +
+ .../src/controls/text_field.rs                |   6 +-
+ crates/sidestep-appkit/src/popup_button.rs    |   2 +-
+ .../src/textkit/field_editor.rs               |   4 +-
+ .../sidestep-appkit/tests/control_editing.rs  | 150 ++++++++++++++++++
+ 6 files changed, 168 insertions(+), 4 deletions(-)
+ create mode 100644 crates/sidestep-appkit/tests/control_editing.rs
+
+diff --git a/crates/sidestep-appkit/Cargo.toml b/crates/sidestep-appkit/Cargo.toml
+index c2dcd0e..38220e6 100644
+--- a/crates/sidestep-appkit/Cargo.toml
++++ b/crates/sidestep-appkit/Cargo.toml
+@@ -124,6 +124,11 @@ harness = false
+ name = "field_editor"
+ harness = false
+ 
++# Live control values and rendering while a field editor owns the text.
++[[test]]
++name = "control_editing"
++harness = false
++
+ # Image views taking drops and pastes, and animating, through testing hooks
+ # (Linux only).
+ [[test]]
+diff --git a/crates/sidestep-appkit/src/controls/control.rs b/crates/sidestep-appkit/src/controls/control.rs
+index 1bdd545..4bd35fc 100644
+--- a/crates/sidestep-appkit/src/controls/control.rs
++++ b/crates/sidestep-appkit/src/controls/control.rs
+@@ -343,6 +343,8 @@ define_class!(
+ 
+         #[unsafe(method_id(stringValue))]
+         fn string_value(&self) -> Retained<NSString> {
++            // AppKit validates the field editor before reading the cell.
++            self.as_control().validateEditing();
+             match self.the_cell() {
+                 Some(c) => c.stringValue(),
+                 None => self.loose_value().string(),
+@@ -351,6 +353,9 @@ define_class!(
+ 
+         #[unsafe(method(setStringValue:))]
+         fn set_string_value(&self, string: &NSString) {
++            // A programmatic replacement ends editing, discarding the
++            // unvalidated editor text before changing the cell's value.
++            self.as_control().abortEditing();
+             match self.the_cell() {
+                 Some(c) => c.setStringValue(string),
+                 None => self.set_loose(Value::String(string.copy())),
+diff --git a/crates/sidestep-appkit/src/controls/text_field.rs b/crates/sidestep-appkit/src/controls/text_field.rs
+index a383006..9884a48 100644
+--- a/crates/sidestep-appkit/src/controls/text_field.rs
++++ b/crates/sidestep-appkit/src/controls/text_field.rs
+@@ -489,8 +489,10 @@ fn draw_field_frame(cell: &NSTextFieldCellImpl, frame: NSRect, _view: &NSView) {
+ /// runs turn light, and so does a text color with the label color's value,
+ /// while other colors and the placeholder stay, as on macOS
+ /// (`conformance/tests/cell_backgrounds.rs`, `emphasized_text`).
+-fn draw_field_text(cell: &NSTextFieldCellImpl, title: NSRect, _view: &NSView) {
+-    if !theme::paint::recording() {
++fn draw_field_text(cell: &NSTextFieldCellImpl, title: NSRect, view: &NSView) {
++    // The field editor draws the live text over this view. The cell still
++    // draws its frame, but neither its old value nor its placeholder.
++    if !theme::paint::recording() || crate::textkit::field_editor::current_editor(view).is_some() {
+         return;
+     }
+     let p = theme::palette();
+diff --git a/crates/sidestep-appkit/src/popup_button.rs b/crates/sidestep-appkit/src/popup_button.rs
+index 1f22186..86abf30 100644
+--- a/crates/sidestep-appkit/src/popup_button.rs
++++ b/crates/sidestep-appkit/src/popup_button.rs
+@@ -860,7 +860,7 @@ fn title_rect(cell: &NSPopUpButtonCellImpl, bounds: NSRect) -> NSRect {
+ }
+ 
+ fn draw(cell: &NSPopUpButtonCellImpl, frame: NSRect, view: &NSView) {
+-    if !theme::paint::recording() {
++    if cell.isTransparent() || !theme::paint::recording() {
+         return;
+     }
+     let base = cell::imp(as_cell(cell));
+diff --git a/crates/sidestep-appkit/src/textkit/field_editor.rs b/crates/sidestep-appkit/src/textkit/field_editor.rs
+index 92fa708..f05a68d 100644
+--- a/crates/sidestep-appkit/src/textkit/field_editor.rs
++++ b/crates/sidestep-appkit/src/textkit/field_editor.rs
+@@ -289,6 +289,7 @@ pub(crate) fn begin(
+         }
+     });
+     editor.scrollRangeToVisible(sel);
++    control.setNeedsDisplay(true);
+ }
+ 
+ /// Take `editor` out of the control it edits in, if it is in one.
+@@ -315,8 +316,9 @@ fn end_session(editor: &NSTextView, session: Session) {
+         // nothing that may have gone.
+         editor.removeFromSuperview();
+     }
+-    if session.control.load().is_some() {
++    if let Some(control) = session.control.load() {
+         session.clip.removeFromSuperview();
++        control.setNeedsDisplay(true);
+     }
+     if let Some(v) = as_impl(editor) {
+         v.reset_editing();
+diff --git a/crates/sidestep-appkit/tests/control_editing.rs b/crates/sidestep-appkit/tests/control_editing.rs
+new file mode 100644
+index 0000000..835dd38
+--- /dev/null
++++ b/crates/sidestep-appkit/tests/control_editing.rs
+@@ -0,0 +1,150 @@
++//! Live field editing and transparent popup drawing through the public
++//! AppKit methods. Runs on the main thread without a desktop connection.
++
++fn main() {
++    #[cfg(not(target_vendor = "apple"))]
++    linux::run();
++}
++
++#[cfg(not(target_vendor = "apple"))]
++mod linux {
++    use objc2::rc::Retained;
++    use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
++    use objc2_app_kit::{
++        NSBackingStoreType, NSBitmapFormat, NSBitmapImageRep, NSCell, NSDeviceRGBColorSpace, NSGraphicsContext,
++        NSPopUpButton, NSTextField, NSTextInputClient, NSTextView, NSView, NSWindow, NSWindowStyleMask,
++    };
++    use objc2_foundation::{NSNotFound, NSPoint, NSRange, NSRect, NSSize, NSString};
++
++    fn rect(w: f64, h: f64) -> NSRect {
++        NSRect::new(NSPoint::ZERO, NSSize::new(w, h))
++    }
++
++    fn field(mtm: MainThreadMarker) -> (Retained<NSWindow>, Retained<NSTextField>) {
++        let window = unsafe {
++            NSWindow::initWithContentRect_styleMask_backing_defer(
++                NSWindow::alloc(mtm),
++                rect(300.0, 100.0),
++                NSWindowStyleMask::Titled,
++                NSBackingStoreType::Buffered,
++                true,
++            )
++        };
++        unsafe { window.setReleasedWhenClosed(false) };
++        let content = NSView::initWithFrame(NSView::alloc(mtm), rect(300.0, 100.0));
++        window.setContentView(Some(&content));
++        let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(240.0, 30.0));
++        field.setBezeled(false);
++        field.setDrawsBackground(false);
++        field.setEditable(true);
++        field.setPlaceholderString(Some(&NSString::from_str("Placeholder")));
++        content.addSubview(&field);
++        (window, field)
++    }
++
++    fn start(field: &NSTextField) -> Retained<NSTextView> {
++        unsafe { field.selectText(None) };
++        field.currentEditor().expect("active editor").downcast().expect("text view")
++    }
++
++    fn type_text(editor: &NSTextView, text: &str) {
++        unsafe {
++            NSTextInputClient::insertText_replacementRange(
++                editor,
++                &NSString::from_str(text),
++                NSRange::new(NSNotFound as usize, 0),
++            )
++        };
++    }
++
++    /// The getter validates the active editor; the setter aborts it.
++    fn live_values(mtm: MainThreadMarker) {
++        let (_window, field) = field(mtm);
++        let editor = start(&field);
++        type_text(&editor, "Typed prompt");
++        assert_eq!(editor.string().to_string(), "Typed prompt");
++        assert_eq!(field.stringValue().to_string(), "Typed prompt", "read the active editor");
++        assert_eq!(field.cell().unwrap().stringValue().to_string(), "Typed prompt", "validate the cell");
++        type_text(&editor, " uncommitted");
++        field.setStringValue(&NSString::from_str("Replacement"));
++        assert!(field.currentEditor().is_none(), "setting a value ends editing");
++        assert_eq!(field.stringValue().to_string(), "Replacement");
++        let editor = start(&field);
++        assert_eq!(editor.string().to_string(), "Replacement");
++        type_text(&editor, "Discard this");
++        assert!(field.abortEditing());
++        assert_eq!(field.stringValue().to_string(), "Replacement", "abort keeps the last validated value");
++    }
++
++    /// Draw a cell alone, so any ink is its own, not the editor's.
++    fn ink(cell: &NSCell, view: &NSView, interior: bool) -> usize {
++        let rep = unsafe {
++            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
++                NSBitmapImageRep::alloc(), std::ptr::null_mut(), 240, 30, 8, 4,
++                true, false, NSDeviceRGBColorSpace, NSBitmapFormat::empty(), 0, 32,
++            )
++        }.expect("bitmap");
++        let len = rep.bytesPerRow() as usize * rep.pixelsHigh() as usize;
++        unsafe { std::ptr::write_bytes(rep.bitmapData(), 0, len) };
++        let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep).unwrap();
++        NSGraphicsContext::saveGraphicsState_class();
++        NSGraphicsContext::setCurrentContext(Some(&context));
++        if interior {
++            cell.drawInteriorWithFrame_inView(view.bounds(), view);
++        } else {
++            cell.drawWithFrame_inView(view.bounds(), view);
++        }
++        context.flushGraphics();
++        NSGraphicsContext::restoreGraphicsState_class();
++        let pixels = unsafe { std::slice::from_raw_parts(rep.bitmapData(), len) };
++        pixels.as_chunks::<4>().0.iter().filter(|p| p[3] != 0).count()
++    }
++
++    fn editor_owns_text(mtm: MainThreadMarker) {
++        for initial in ["", "Old text"] {
++            let (_window, field) = field(mtm);
++            field.setStringValue(&NSString::from_str(initial));
++            let cell = field.cell().unwrap();
++            assert!(ink(&cell, &field, true) > 0, "idle field draws its value or placeholder");
++            let editor = start(&field);
++            type_text(&editor, "New text");
++            assert_eq!(ink(&cell, &field, true), 0, "the active editor owns text drawing");
++            field.setBezeled(true);
++            assert!(ink(&cell, &field, false) > 0, "editing still draws the field frame");
++            field.setBezeled(false);
++            assert!(field.abortEditing());
++            assert!(ink(&cell, &field, true) > 0, "ending editing restores cell drawing");
++        }
++    }
++
++    fn transparent_popup(mtm: MainThreadMarker) {
++        let popup = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), rect(240.0, 30.0), false);
++        popup.addItemWithTitle(&NSString::from_str("Selected item"));
++        let cell = popup.cell().unwrap();
++        assert!(ink(&cell, &popup, false) > 0);
++        popup.setTransparent(true);
++        assert_eq!(ink(&cell, &popup, false), 0, "transparent popup draws no title, arrows or bezel");
++        assert_eq!(popup.titleOfSelectedItem().unwrap().to_string(), "Selected item");
++        popup.setTransparent(false);
++        assert!(ink(&cell, &popup, false) > 0);
++    }
++
++    pub fn run() {
++        sidestep_appkit::testing::use_null_backend();
++        let mtm = MainThreadMarker::new().expect("main thread");
++        let mut failed = false;
++        for (name, test) in [
++            ("live_values", live_values as fn(MainThreadMarker)),
++            ("editor_owns_text", editor_owns_text),
++            ("transparent_popup", transparent_popup),
++        ] {
++            if std::panic::catch_unwind(|| test(mtm)).is_ok() {
++                println!("test {name} ... ok");
++            } else {
++                failed = true;
++                println!("test {name} ... FAILED");
++            }
++        }
++        assert!(!failed, "control editing regressions");
++    }
++}
+-- 
+2.56.0
+

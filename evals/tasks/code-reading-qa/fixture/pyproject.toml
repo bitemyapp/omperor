@@ -1,0 +1,9 @@
+[project]
+name = "jobq"
+version = "0.9.2"
+description = "A small persistent job queue with retries, leases and cron schedules."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+jobq = "jobq.cli:main"

@@ -1,0 +1,23 @@
+description = "Git: conclude an in-progress merge whose conflicts span code, tests and changelog, keeping both branches' behaviour; graded on the committed merge."
+tags = ["coding", "git", "python"]
+timeout_secs = 900
+prompt = """I'm in the middle of merging `feature/max-length` into `main` in this repo and it stopped with \
+conflicts. Can you finish it for me?
+
+We want both changes: the accent transliteration that landed on main and the new `max_length` option from \
+the branch, working together. Transliterate first and then apply the length limit, so accented titles are \
+cut correctly too. Keep both sides' tests and both changelog entries. Make sure \
+`python3 -m unittest discover -s tests` passes, then conclude the merge with a normal merge commit on main. \
+Don't abort and redo it as a rebase or squash, don't touch the feature branch or rewrite history, and don't \
+push."""
+
+[workspace]
+# The repository, its branches and the conflicted merge are built by a setup
+# script kept in the task directory, out of the agent's sight.
+git_init = false
+setup = [["bash", "{task}/setup/build.sh", "{task}/setup"]]
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 60

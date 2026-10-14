@@ -1,0 +1,1038 @@
+diff --git a/crates/app/src/chat_cmd.rs b/crates/app/src/chat_cmd.rs
+index f7120cef26..364e5baa56 100644
+--- a/crates/app/src/chat_cmd.rs
++++ b/crates/app/src/chat_cmd.rs
+@@ -286,6 +286,7 @@ impl Launch {
+ 			prewalk,
+ 			no_prewalk,
+ 			prewalk_into,
++			computer_use,
+ 			config,
+ 			add_dir,
+ 			skills,
+@@ -336,6 +337,7 @@ impl Launch {
+ 			.map(|root| fs::canonicalize(root).into_diagnostic())
+ 			.collect::<miette::Result<Vec<_>>>()?;
+ 		apply_launch_convars(&ctx, &LaunchConvars {
++			computer_use,
+ 			hide_thinking,
+ 			service_tier,
+ 			external_thinking,
+@@ -711,6 +713,9 @@ impl omp_chat::commands::prompts::SkillExpander for InteractivePrompts {
+ /// invocation's archive-layer overrides (ADR 0012: the convar is the live
+ /// setting; the kernel and every projection read it from here).
+ pub(crate) struct LaunchConvars<'a> {
++	/// Explicit host choice, applied after cfg overlays without resetting other
++	/// tools.
++	pub computer_use:      Option<bool>,
+ 	pub hide_thinking:     bool,
+ 	pub service_tier:      Option<omp_catalog::settings::TierSetting>,
+ 	pub external_thinking: bool,
+@@ -732,6 +737,15 @@ pub(crate) fn apply_launch_convars(
+ 	ctx: &omp_con::Ctx,
+ 	flags: &LaunchConvars<'_>,
+ ) -> omp_con::ConResult<()> {
++	if let Some(enabled) = flags.computer_use {
++		let mut tools = omp_envd::tool_settings::SV_TOOLS_ENABLED.get(ctx);
++		tools.0.retain(|(name, _)| name.as_str() != "computer");
++		tools
++			.0
++			.push((Str::new_static("computer"), omp_con::Value::Bool(enabled)));
++		omp_envd::tool_settings::SV_TOOLS_ENABLED.set(ctx, tools)?;
++		omp_tools::settings::SV_COMPUTER_ENABLED.set(ctx, enabled)?;
++	}
+ 	if flags.hide_thinking {
+ 		omp_chat::settings::CL_SHOWTHINKING.set(ctx, false)?;
+ 	}
+@@ -1256,6 +1270,76 @@ mod tests {
+ 		LaunchEnv { data_dir: root.join("data"), home: root.join("home"), catalog: embedded() }
+ 	}
+ 
++	#[tokio::test]
++	async fn computer_use_override_wins_over_cfg_without_resetting_other_tools() {
++		for desired in [false, true] {
++			let dir = tempfile::tempdir().unwrap();
++			let overlay = dir.path().join("computer.cfg");
++			fs::write(
++				&overlay,
++				format!(
++					"sv_computer_enabled {}\nsv_tools_enabled {{ computer {} read false browser true \
++					 }}\n",
++					!desired, !desired,
++				),
++			)
++			.unwrap();
++			let before = fs::read(&overlay).unwrap();
++			let mut args = ChatArgs::default_interactive();
++			args.model = Some(Str::new_static("openai/gpt-5"));
++			args.project = dir.path().to_path_buf();
++			args.config = vec![overlay.clone()];
++			args.computer_use = Some(desired);
++			let ctx = Arc::new(omp_con::Ctx::new());
++			// Stand in for process_ctx's earlier user/project config load.
++			ctx.exec(
++				"sv_computer_enabled true\nsv_tools_enabled { computer true write false }\n",
++				omp_con::Source::Config(Str::new_static("user.cfg")),
++			)
++			.unwrap();
++			Launch::prepare(args, Arc::clone(&ctx), test_env(dir.path()))
++				.await
++				.unwrap();
++			let settings = omp_envd::tool_settings::ToolSettings::from_con(&ctx);
++			assert_eq!(settings.enabled("computer"), desired);
++			assert_eq!(omp_tools::settings::SV_COMPUTER_ENABLED.get(&ctx), desired);
++			assert!(!settings.enabled("read"), "the overlay's unrelated deny survives");
++			assert!(settings.enabled("browser"), "the overlay's unrelated allow survives");
++			let overrides = omp_envd::tool_settings::SV_TOOLS_ENABLED.get(&ctx);
++			assert_eq!(overrides.0.len(), 3, "only the existing computer entry is replaced");
++			assert_eq!(fs::read(&overlay).unwrap(), before, "launch overrides are not persisted");
++		}
++	}
++
++	#[tokio::test]
++	async fn computer_use_omission_preserves_configured_capability() {
++		for configured in [false, true] {
++			let dir = tempfile::tempdir().unwrap();
++			let mut args = ChatArgs::default_interactive();
++			args.model = Some(Str::new_static("openai/gpt-5"));
++			args.project = dir.path().to_path_buf();
++			let ctx = Arc::new(omp_con::Ctx::new());
++			ctx.exec(
++				&format!(
++					"sv_computer_enabled {}\nsv_tools_enabled {{ computer {configured} read false }}\n",
++					!configured
++				),
++				omp_con::Source::Config(Str::new_static("user.cfg")),
++			)
++			.unwrap();
++			let before = omp_envd::tool_settings::SV_TOOLS_ENABLED.get(&ctx);
++			Launch::prepare(args, Arc::clone(&ctx), test_env(dir.path()))
++				.await
++				.unwrap();
++			assert_eq!(omp_envd::tool_settings::SV_TOOLS_ENABLED.get(&ctx), before);
++			assert_eq!(
++				omp_envd::tool_settings::ToolSettings::from_con(&ctx).enabled("computer"),
++				configured
++			);
++			assert_eq!(omp_tools::settings::SV_COMPUTER_ENABLED.get(&ctx), !configured);
++		}
++	}
++
+ 	/// Every parsed `ChatArgs` field is consumed: the lowering destructures
+ 	/// the struct exhaustively (compile-time), and this launch sets every
+ 	/// launch-shaped flag and checks it reached its convar, `KernelOptions`
+@@ -1285,6 +1369,7 @@ mod tests {
+ 		args.plan_yolo = true;
+ 		args.plan_yolo_into = Some(Str::new_static("openai/gpt-5:minimal"));
+ 		args.prewalk_into = Some(Str::new_static("openai/gpt-5"));
++		args.computer_use = Some(true);
+ 		args.config = vec![overlay];
+ 		args.add_dir = vec![extra.clone()];
+ 		args.skills = Some(SelectorList(vec![Str::new_static("rust*")]));
+@@ -1331,6 +1416,8 @@ mod tests {
+ 		);
+ 
+ 		assert_eq!(omp_agent::AI_COMPACT_THRESHOLD.get(&ctx), 0.5, "--config overlay ran");
++		assert!(omp_tools::settings::SV_COMPUTER_ENABLED.get(&ctx));
++		assert!(omp_envd::tool_settings::ToolSettings::from_con(&ctx).enabled("computer"));
+ 		assert_eq!(omp_catalog::settings::AI_TIER_OPENAI.get(&ctx), TierSetting::Priority);
+ 		assert!(omp_ai::settings::AI_EXTERNAL_THINKING.get(&ctx));
+ 		assert!(omp_ai::settings::AI_ADVISOR_ENABLED.get(&ctx));
+@@ -1589,6 +1676,7 @@ mod tests {
+ 			.set(&ctx, true)
+ 			.unwrap();
+ 		apply_launch_convars(&ctx, &LaunchConvars {
++			computer_use:      None,
+ 			hide_thinking:     false,
+ 			service_tier:      None,
+ 			external_thinking: false,
+diff --git a/crates/app/src/cli.rs b/crates/app/src/cli.rs
+index b114441cdf..cdbbc4b06c 100644
+--- a/crates/app/src/cli.rs
++++ b/crates/app/src/cli.rs
+@@ -1442,6 +1442,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
+ 			| "--provider-session-id"
+ 			| "--prompt-cache-key"
+ 			| "--config"
++			| "--computer-use"
+ 			| "--add-dir"
+ 			| "--smol"
+ 			| "--slow"
+@@ -1770,6 +1771,10 @@ pub struct ChatArgs {
+ 	/// Model selector used when prewalk begins.
+ 	#[arg(long)]
+ 	pub prewalk_into:        Option<Str>,
++	/// Override computer capability for this launch without changing other tool
++	/// settings.
++	#[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
++	pub computer_use:        Option<bool>,
+ 	/// Read-only command-stream cfg overlays in precedence order.
+ 	#[arg(long = "config", value_name = "PATH")]
+ 	pub config:              Vec<PathBuf>,
+@@ -1878,6 +1883,7 @@ impl ChatArgs {
+ 			prewalk:             false,
+ 			no_prewalk:          false,
+ 			prewalk_into:        None,
++			computer_use:        None,
+ 			config:              Vec::new(),
+ 			add_dir:             Vec::new(),
+ 			skills:              None,
+@@ -3663,6 +3669,27 @@ mod tests {
+ 		OmpCli::try_parse_from(arguments).expect("valid command")
+ 	}
+ 
++	#[test]
++	fn parses_explicit_computer_use_launch_override() {
++		for (value, expected) in [("true", true), ("false", false)] {
++			for command in ["rpc", "rpc-ui"] {
++				let parsed = parse(&["omp", command, "--computer-use", value]);
++				let Some(Command::Rpc(args) | Command::RpcUi(args)) = parsed.command else {
++					panic!("RPC launch command");
++				};
++				assert_eq!(args.launch.computer_use, Some(expected));
++			}
++		}
++		let Some(Command::Rpc(args)) = parse(&["omp", "rpc"]).command else {
++			panic!("RPC launch command");
++		};
++		assert_eq!(args.launch.computer_use, None);
++		assert!(OmpCli::try_parse_from(["omp", "rpc", "--computer-use", "maybe"]).is_err());
++		assert!(OmpCli::try_parse_from(["omp", "rpc", "--computer-use"]).is_err());
++		assert_eq!(launch_option(&OsString::from("--computer-use")), Some(true));
++		assert_eq!(launch_option(&OsString::from("--computer-use=false")), Some(false));
++	}
++
+ 	#[test]
+ 	fn parses_hidden_managed_relay_mode_and_ipv6_bind() {
+ 		let Some(Command::BrowserRelay(args)) =
+diff --git a/crates/envd/src/computer.rs b/crates/envd/src/computer.rs
+--- a/crates/envd/src/computer.rs
++++ b/crates/envd/src/computer.rs
+@@ -1,8 +1,9 @@
+ //! Admission-routed native desktop session host.
+ 
+ use std::{
++	future::Future,
+ 	sync::{
+-		Arc,
++		Arc, OnceLock,
+ 		atomic::{AtomicBool, Ordering},
+ 	},
+ 	time::Duration,
+@@ -80,6 +81,107 @@
+ 	}
+ }
+ 
++tokio::task_local! {
++	static COMPUTER_ACCESS: ComputerAccess;
++}
++
++/// One connection's desktop permission and lazily initialized desktop state.
++#[derive(Clone)]
++pub(crate) struct ComputerAccess(Arc<ComputerAccessState>);
++
++struct ComputerAccessState {
++	enabled: AtomicBool,
++	host:    OnceLock<Arc<ComputerSessionHost>>,
++}
++
++impl Drop for ComputerAccessState {
++	fn drop(&mut self) {
++		if let Some(host) = self.host.get() {
++			host.release();
++		}
++	}
++}
++
++impl ComputerAccess {
++	pub(crate) fn new(enabled: bool) -> Self {
++		Self(Arc::new(ComputerAccessState {
++			enabled: AtomicBool::new(enabled),
++			host:    OnceLock::new(),
++		}))
++	}
++
++	pub(crate) fn current() -> Self {
++		COMPUTER_ACCESS
++			.try_with(Clone::clone)
++			.unwrap_or_else(|_| Self::new(false))
++	}
++
++	pub(crate) fn current_enabled() -> bool {
++		COMPUTER_ACCESS.try_with(Self::enabled).unwrap_or(false)
++	}
++
++	pub(crate) fn enabled(&self) -> bool {
++		self.0.enabled.load(Ordering::Acquire)
++	}
++
++	pub(crate) fn revoke(&self) {
++		self.0.enabled.store(false, Ordering::Release);
++		if let Some(host) = self.0.host.get() {
++			host.release();
++		}
++	}
++
++	pub(crate) async fn scope<T>(self, future: impl Future<Output = T>) -> T {
++		COMPUTER_ACCESS.scope(self, future).await
++	}
++}
++
++/// Shared daemon route; each connection retains its own permission and desktop
++/// handles. Constructing the route does not initialize a desktop backend.
++pub(crate) struct ComputerConnectionHost {
++	blobs:    BlobHost,
++	settings: ComputerSettings,
++}
++
++impl ComputerConnectionHost {
++	pub(crate) fn new(blobs: BlobHost, con: &Ctx) -> Arc<Self> {
++		Arc::new(Self { blobs, settings: ComputerSettings::from_con(con) })
++	}
++}
++
++#[async_trait]
++impl ComputerHost for ComputerConnectionHost {
++	async fn execute(
++		&self,
++		params: Params,
++		cancellation: CancellationToken,
++		updates: flume::Sender<Update>,
++	) -> Result<Payload, Fault> {
++		let access = ComputerAccess::current();
++		if !access.enabled() {
++			return Err(fault(
++				FaultCode::PermissionDenied,
++				"computer use is disabled for this session",
++				None,
++			));
++		}
++		let host = access
++			.0
++			.host
++			.get_or_init(|| ComputerSessionHost::new(self.blobs.clone(), &self.settings));
++		if !access.enabled() {
++			host.release();
++			return Err(fault(FaultCode::PermissionDenied, "computer session is disconnected", None));
++		}
++		host.execute(params, cancellation, updates).await
++	}
++
++	fn release(&self) {
++		// The connection owns and releases desktop state; the shared route owns
++		// none.
++	}
++}
++
+ /// Persistent native desktop owner shared by every `computer` invocation in a
+ /// session-scoped Environment registry.
+ pub(crate) struct ComputerSessionHost {
+@@ -93,8 +195,7 @@
+ }
+ 
+ impl ComputerSessionHost {
+-	pub(crate) fn new(blobs: BlobHost, con: &Ctx) -> Arc<Self> {
+-		let settings = ComputerSettings::from_con(con);
++	fn new(blobs: BlobHost, settings: &ComputerSettings) -> Arc<Self> {
+ 		Arc::new(Self {
+ 			session: DesktopSession::new(Some(DesktopSessionOptions {
+ 				display: Some(settings.display.to_string()),
+@@ -1743,14 +1844,45 @@
+ 
+ #[cfg(test)]
+ mod tests {
++	use std::sync::Arc;
++
+ 	use omp_con::Ctx;
+ 	use omp_core::Str;
+ 	use serde_json::{Map, json};
+ 
+ 	use super::{
+-		ComputerSettings, Operation, SV_COMPUTER_DISPLAY, SV_COMPUTER_MAX_HEIGHT,
++		ComputerAccess, ComputerSettings, Operation, SV_COMPUTER_DISPLAY, SV_COMPUTER_MAX_HEIGHT,
+ 		SV_COMPUTER_MAX_WIDTH, Statement, bounded_cap, evaluate_assertion, parse_program,
+ 	};
++
++	#[tokio::test]
++	async fn computer_use_context_is_isolated_and_absent_context_denies() {
++		assert!(!ComputerAccess::current().enabled());
++		let yes = ComputerAccess::new(true);
++		let no = ComputerAccess::new(false);
++		let (enabled, disabled) = tokio::join!(
++			yes.clone().scope(async {
++				tokio::task::yield_now().await;
++				ComputerAccess::current().enabled()
++			}),
++			no.scope(async {
++				tokio::task::yield_now().await;
++				ComputerAccess::current().enabled()
++			}),
++		);
++		assert!(enabled);
++		assert!(!disabled);
++		assert!(!ComputerAccess::current().enabled());
++		let other = ComputerAccess::new(true);
++		assert!(
++			!Arc::ptr_eq(&yes.0, &other.0),
++			"separate enabled connections cannot share retained desktop handles"
++		);
++		assert!(yes.0.host.get().is_none(), "permission alone must not initialize the desktop");
++		yes.revoke();
++		assert!(!yes.enabled());
++		assert!(other.enabled(), "disconnect must not revoke another connection");
++	}
+ 
+ 	#[test]
+ 	fn computer_settings_project_from_typed_convars() {
+diff --git a/crates/envd/src/devices_host.rs b/crates/envd/src/devices_host.rs
+--- a/crates/envd/src/devices_host.rs
++++ b/crates/envd/src/devices_host.rs
+@@ -86,6 +86,13 @@
+ 	/// Binds or clears the session's live approval route for nested calls.
+ 	pub(crate) fn bind_approval_route(&self, route: Option<ApprovalRoute>) {
+ 		self.admission.bind_route(route);
++	}
++
++	pub(crate) fn with_computer_access(
++		self: Arc<Self>,
++		access: crate::computer::ComputerAccess,
++	) -> Arc<dyn ShellDynHost> {
++		Arc::new(ConnectionDynHost { host: self, access })
+ 	}
+ 
+ 	fn invocation_id(&self) -> Str {
+@@ -257,6 +264,42 @@
+ 	})
+ }
+ 
++// The shell clones builtin closures into command substitutions, pipelines,
++// and background tasks, which do not inherit Tokio task-local state.
++struct ConnectionDynHost {
++	host:   Arc<DynHost>,
++	access: crate::computer::ComputerAccess,
++}
++
++impl ShellDynHost for ConnectionDynHost {
++	fn list(&self) -> DynFuture<'_, Vec<DynDevice>> {
++		Box::pin(self.access.clone().scope(self.host.list()))
++	}
++
++	fn schema(&self, name: &str) -> DynFuture<'_, DynSchema> {
++		Box::pin(self.access.clone().scope(self.host.schema(name)))
++	}
++
++	fn call(
++		&self,
++		name: &str,
++		args: Value,
++		cancellation: CancellationToken,
++	) -> DynFuture<'_, DynCallOutput> {
++		Box::pin(
++			self
++				.access
++				.clone()
++				.scope(self.host.call(name, args, cancellation)),
++		)
++	}
++}
++
++fn computer_device_allowed(name: &str) -> bool {
++	!DevicePath::parse(name).is_ok_and(|path| path.root() == "computer")
++		|| crate::computer::ComputerAccess::current_enabled()
++}
++
+ impl ShellDynHost for DynHost {
+ 	fn list(&self) -> DynFuture<'_, Vec<DynDevice>> {
+ 		Box::pin(async move {
+@@ -273,6 +316,7 @@
+ 					description: Some(device.summary.clone()),
+ 				})
+ 				.chain(mcp)
++				.filter(|device| computer_device_allowed(device.name.as_str()))
+ 				.filter(|device| {
+ 					visible
+ 						.as_ref()
+@@ -300,6 +344,9 @@
+ 	fn schema(&self, name: &str) -> DynFuture<'_, DynSchema> {
+ 		let name = Str::new(name);
+ 		Box::pin(async move {
++			if !computer_device_allowed(name.as_str()) {
++				return Err(DynFault::new("computer use is disabled for this session"));
++			}
+ 			if let Some(schema) = Self::proposal_schema(name.as_str()) {
+ 				return Ok(schema);
+ 			}
+@@ -329,6 +376,9 @@
+ 		let name = Str::new(name);
+ 		Box::pin(async move {
+ 			let result = async {
++				if !computer_device_allowed(name.as_str()) {
++					return Err(DynFault::new("computer use is disabled for this session"));
++				}
+ 				if matches!(name.as_str(), "resolve" | "reject") {
+ 					if cancellation.is_cancelled() {
+ 						return Err(DynFault::new("staged proposal finalization was cancelled"));
+diff --git a/crates/envd/src/eval/process.rs b/crates/envd/src/eval/process.rs
+--- a/crates/envd/src/eval/process.rs
++++ b/crates/envd/src/eval/process.rs
+@@ -333,7 +333,8 @@
+ 		let host = Arc::clone(&self.inner.host);
+ 		let blobs = self.inner.blobs.clone();
+ 		let interrupt_grace = self.inner.interrupt_grace;
+-		tokio::spawn(async move {
++		let computer_access = crate::computer::ComputerAccess::current();
++		tokio::spawn(computer_access.scope(async move {
+ 			let _gate = gate;
+ 			if task_cancelled.is_cancelled() {
+ 				if forced_reset {
+@@ -445,7 +446,7 @@
+ 					},
+ 				}
+ 			}
+-		});
++		}));
+ 		Ok(ProcessEvalRun { events, cancelled, terminal: false, effective_reset })
+ 	}
+ }
+@@ -961,7 +962,8 @@
+ 					let task_owner = Str::new(owner);
+ 					let task_session = session.clone();
+ 					let task_events = bridge_events_tx.clone();
+-					bridge_tasks.spawn(async move {
++					let computer_access = crate::computer::ComputerAccess::current();
++					bridge_tasks.spawn(computer_access.scope(async move {
+ 						let progress = ProgressChannel { request_id, events: task_events.clone() };
+ 						let response = task_timeout
+ 							.host_wait(task_host.call_for(
+@@ -977,7 +979,7 @@
+ 							Err(error) => (None, Some(Str::from(error.to_string()))),
+ 						};
+ 						let _ = task_events.send(BridgeTaskEvent::Response { request_id, value, error });
+-					});
++					}));
+ 				},
+ 				ChildFrame::Fatal { message } => {
+ 					needs_reset.store(true, Ordering::Release);
+diff --git a/crates/envd/src/exec.rs b/crates/envd/src/exec.rs
+--- a/crates/envd/src/exec.rs
++++ b/crates/envd/src/exec.rs
+@@ -467,6 +467,7 @@
+ 
+ #[derive(Clone)]
+ struct SessionCommand {
++	computer_access: crate::computer::ComputerAccess,
+ 	host: Weak<HostInner>,
+ 	exec: Bytes,
+ 	source: Str,
+@@ -963,6 +964,7 @@
+ 			events: Arc::downgrade(&events),
+ 		});
+ 		let command = SessionCommand {
++			computer_access: crate::computer::ComputerAccess::current(),
+ 			host: Arc::downgrade(&self.inner),
+ 			exec: exec.clone(),
+ 			source,
+@@ -2281,6 +2283,20 @@
+ }
+ 
+ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool {
++	// Bind the immutable command scope into the cloneable builtin closure.
++	// Existing background subshells retain their own scope when the next
++	// command reuses this persistent shell from another connection.
++	if let Some(host) = command
++		.host
++		.upgrade()
++		.and_then(|host| host.devices.lock().clone())
++	{
++		let mut registration = omp_shell_builtins::dyn_builtin(
++			host.with_computer_access(command.computer_access.clone()),
++		);
++		registration.disabled = shell.builtins().get("dyn").is_some_and(|old| old.disabled);
++		shell.register_builtin("dyn", registration);
++	}
+ 	let started_at = Instant::now();
+ 	match command.cancel_rx.try_recv() {
+ 		Ok(_) | Err(flume::TryRecvError::Disconnected) => {
+@@ -2377,10 +2393,13 @@
+ 			}
+ 		};
+ 		tokio::pin!(timeout);
+-		let execution = crate::devices_host::scope_exec_diags(
+-			Arc::clone(&command.diags),
+-			shell.run_string(command.source.to_string(), &source_info, &params),
+-		);
++		let execution = command
++			.computer_access
++			.clone()
++			.scope(crate::devices_host::scope_exec_diags(
++				Arc::clone(&command.diags),
++				shell.run_string(command.source.to_string(), &source_info, &params),
++			));
+ 		tokio::pin!(execution);
+ 		tokio::select! {
+ 			  result = &mut execution => match result {
+diff --git a/crates/envd/src/lib.rs b/crates/envd/src/lib.rs
+--- a/crates/envd/src/lib.rs
++++ b/crates/envd/src/lib.rs
+@@ -1029,8 +1029,14 @@
+ 		}
+ 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
+ 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, abort_tasks, server };
+-		if let Err(error) =
+-			hello_attached_session(&client, approval_mode, has_edit_repair, edit_model.as_ref()).await
++		if let Err(error) = hello_attached_session(
++			&client,
++			approval_mode,
++			has_edit_repair,
++			edit_model.as_ref(),
++			tool_settings::ToolSettings::from_con(&con).enabled("computer"),
++		)
++		.await
+ 		{
+ 			drop(lifecycle);
+ 			return Err(error);
+@@ -1547,10 +1553,15 @@
+ 	approval_mode: Option<ApprovalMode>,
+ 	edit_repair: bool,
+ 	edit_model: Option<&Str>,
++	computer_use: bool,
+ ) -> Result<ServerHello, EnvdError> {
+-	Ok(client
+-		.hello(client_hello(approval_mode, edit_repair, edit_model))
+-		.await?)
++	let mut hello = client_hello(approval_mode, edit_repair, edit_model);
++	hello
++		.props
++		.get_or_insert_with(ValueMap::default)
++		.fields
++		.insert("computer-use".to_owned(), Value { kind: Some(value::Kind::Bool(computer_use)) });
++	Ok(client.hello(hello).await?)
+ }
+ 
+ fn client_hello(
+diff --git a/crates/envd/src/server.rs b/crates/envd/src/server.rs
+--- a/crates/envd/src/server.rs
++++ b/crates/envd/src/server.rs
+@@ -469,6 +469,7 @@
+ 	capabilities:  BTreeSet<Str>,
+ 	props:         Option<ValueMap>,
+ 	approval_mode: Option<ApprovalMode>,
++	computer_use:  Option<bool>,
+ }
+ 
+ fn approval_mode_from_wire(value: i32) -> Result<Option<ApprovalMode>, i32> {
+@@ -2571,6 +2572,7 @@
+ 			ext_hosts.as_ref(),
+ 			interrupt_grace,
+ 			py_eval,
++			false,
+ 			&host_settings.tools,
+ 			&browser_settings,
+ 			&shell_settings,
+@@ -2858,6 +2860,7 @@
+ 			ext_hosts.as_ref(),
+ 			interrupt_grace,
+ 			py_eval,
++			doc_connections.is_some(),
+ 			&host_settings.tools,
+ 			&browser_settings,
+ 			&shell_settings,
+@@ -3884,8 +3887,9 @@
+ 					while let Ok(done) = finished.try_recv() {
+ 						connection.finish(done);
+ 					}
+-					self
+-						.dispatch(*frame, &responses, &finished_tx, &mut connection, &policy)
++					let computer_access = connection.computer_access.clone();
++					computer_access
++						.scope(self.dispatch(*frame, &responses, &finished_tx, &mut connection, &policy))
+ 						.await;
+ 				},
+ 			}
+@@ -3959,6 +3963,24 @@
+ 					0,
+ 					pb::ProtocolErrorCode::InvalidArgument,
+ 					"ClientHello approval_mode is unknown",
++				)
++				.await;
++				return None;
++			},
++		};
++		let computer_use = match hello
++			.props
++			.as_ref()
++			.and_then(|props| props.fields.get("computer-use"))
++		{
++			None => None,
++			Some(Value { kind: Some(value::Kind::Bool(enabled)) }) => Some(*enabled),
++			Some(_) => {
++				send_error(
++					responses,
++					0,
++					pb::ProtocolErrorCode::InvalidArgument,
++					"ClientHello computer-use must be a boolean",
+ 				)
+ 				.await;
+ 				return None;
+@@ -4004,6 +4026,7 @@
+ 				capabilities: hello.capabilities.into_iter().map(Str::from).collect(),
+ 				props: hello.props,
+ 				approval_mode,
++				computer_use,
+ 			})
+ 	}
+ 
+@@ -4376,7 +4399,9 @@
+ 				.as_ref()
+ 				.filter(|scope| !scope.invocation_id.is_empty())
+ 				.is_some_and(|scope| {
+-					let pending = self.blobs.is_pending_verdict(scope.invocation_id.as_str(), request);
++					let pending = self
++						.blobs
++						.is_pending_verdict(scope.invocation_id.as_str(), request);
+ 					tracing::debug!(
+ 						invocation_id = %scope.invocation_id,
+ 						session_id = %scope.session_id,
+@@ -5520,8 +5545,7 @@
+ 					},
+ 				};
+ 				if !authorize_data_operation(
+-					connection, scope, operation, "env.exec", responses, request_id,
+-					false,
++					connection, scope, operation, "env.exec", responses, request_id, false,
+ 				)
+ 				.await
+ 				{
+@@ -6145,8 +6169,10 @@
+ 			},
+ 			_ => unreachable!("DAP dispatch receives only DAP request arms"),
+ 		};
+-		if !authorize_data_operation(connection, scope, operation, capability, responses, request_id, false)
+-			.await
++		if !authorize_data_operation(
++			connection, scope, operation, capability, responses, request_id, false,
++		)
++		.await
+ 		{
+ 			return;
+ 		}
+@@ -8303,6 +8329,7 @@
+ 	requests:         HashMap<u64, RequestState>,
+ 	invocation_ids:   HashMap<Str, u64>,
+ 	tool_settings:    ToolSettings,
++	computer_access:  crate::computer::ComputerAccess,
+ 	exec_host:        ExecHost,
+ 	document_leases:  HashMap<Bytes, DocumentLease>,
+ 	grants:           Grants,
+@@ -8455,14 +8482,21 @@
+ 			},
+ 		);
+ 		let quotas = QuotaAccount::new(Arc::clone(&authority), policy.host.clone());
+-		let tool_settings = base_settings
++		let mut tool_settings = base_settings
+ 			.clone()
+ 			.with_approval_mode_override(hello.approval_mode);
++		if let Some(enabled) = hello.computer_use {
++			tool_settings
++				.enabled
++				.insert(Str::new_static("computer"), enabled);
++		}
++		let computer_access = crate::computer::ComputerAccess::new(tool_settings.enabled("computer"));
+ 		Self {
+ 			owner,
+ 			requests: HashMap::new(),
+ 			invocation_ids: HashMap::new(),
+ 			tool_settings,
++			computer_access,
+ 			exec_host,
+ 			document_leases: HashMap::new(),
+ 			grants: hello.grants,
+@@ -9007,6 +9041,7 @@
+ 	}
+ 
+ 	fn cancel_all(&mut self, exec_host: &ExecHost) {
++		self.computer_access.revoke();
+ 		for (_, state) in mem::take(&mut self.requests) {
+ 			match state {
+ 				RequestState::Invocation(InvocationState::Native {
+@@ -9134,12 +9169,13 @@
+ 	responses: flume::Sender<pb::ServerFrame>,
+ 	finished: flume::Sender<Finished>,
+ ) {
++	let computer_access = crate::computer::ComputerAccess::current();
+ 	let (started, start) = flume::bounded(1);
+ 	let retention_session = session_id.clone();
+ 	// A client that asks for no env deadline owns the invocation's lifetime:
+ 	// the tools it runs must not detach the invocation on their own clock.
+ 	let client_owns_lifetime = deadline.is_none();
+-	tokio::spawn(with_invocation_scope(
++	tokio::spawn(computer_access.scope(with_invocation_scope(
+ 		pty_denied,
+ 		with_output_request_scope(
+ 			output_request,
+@@ -9321,7 +9357,7 @@
+ 				),
+ 			),
+ 		),
+-	));
++	)));
+ 	let _ = start.recv_async().await;
+ }
+ 
+@@ -12643,7 +12679,13 @@
+ 	}
+ 
+ 	fn accepted_hello(grants: Grants, approval_mode: Option<ApprovalMode>) -> AcceptedHello {
+-		AcceptedHello { grants, capabilities: BTreeSet::new(), props: None, approval_mode }
++		AcceptedHello {
++			grants,
++			capabilities: BTreeSet::new(),
++			props: None,
++			approval_mode,
++			computer_use: None,
++		}
+ 	}
+ 
+ 	#[test]
+@@ -13794,6 +13836,191 @@
+ 	}
+ 
+ 	#[test]
++	fn computer_use_is_connection_scoped_through_native_and_shell_protocols() {
++		// Joined daemon composition needs more stack than Rust's 2 MiB test
++		// thread in unoptimized builds, like the normal application runtime.
++		std::thread::Builder::new()
++			.stack_size(16 * 1024 * 1024)
++			.spawn(|| {
++				tokio::runtime::Builder::new_current_thread()
++					.enable_all()
++					.build()
++					.unwrap()
++					.block_on(computer_owner_protocol_case());
++			})
++			.unwrap()
++			.join()
++			.unwrap();
++	}
++
++	async fn computer_owner_protocol_case() {
++		use omp_env::InvocationEvent;
++		let root = tempfile::tempdir().unwrap();
++		let state = tempfile::tempdir().unwrap();
++		let con = Arc::new(Ctx::new());
++		assert!(!ToolSettings::from_con(&con).enabled("computer"));
++		let convars = Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
++		let (connections, _watch) = watch::channel(0);
++		let server = Arc::new(
++			Box::pin(EnvServer::open_project(
++				root.path(),
++				state.path(),
++				&state.path().join("doc.sock"),
++				Registry::new(),
++				ExtHostConfig::new(
++					PathBuf::from("unused"),
++					Principal::new(sf!("test"), sf!("Test")),
++					sf!("computer-test"),
++					1,
++				),
++				Some(connections),
++				true,
++				None,
++				&con,
++				convars,
++				RegistryBridges::default(),
++			))
++			.await
++			.unwrap(),
++		);
++		assert!(
++			server.registry().live_identity("computer").is_some(),
++			"daemon route must exist even when its own cfg disables computer"
++		);
++		let mut clients = Vec::new();
++		let mut tasks = Vec::new();
++		for enabled in [false, true] {
++			let (client, transport) = EnvClient::in_process(64);
++			let owner = Arc::clone(&server);
++			tasks.push(tokio::spawn(async move { owner.serve_in_process(transport).await }));
++			client
++				.hello(pb::ClientHello {
++					client: "computer-scope-test".to_owned(),
++					schema_rev: omp_proto::SCHEMA_REV,
++					props: Some(ValueMap {
++						fields: [("computer-use".to_owned(), Value {
++							kind: Some(value::Kind::Bool(enabled)),
++						})]
++						.into_iter()
++						.collect(),
++					}),
++					..pb::ClientHello::default()
++				})
++				.await
++				.unwrap();
++			let cwd =
++				EnvPath::new(Url::from_directory_path(root.path()).unwrap().to_string()).unwrap();
++			let opened = client
++				.open_session(&cwd, pb::OpenSessionRequest::default())
++				.await
++				.unwrap();
++			clients.push((client, opened.session));
++		}
++		let computer_rev = server
++			.registry()
++			.live_identity("computer")
++			.unwrap()
++			.1
++			.to_string();
++		// No desktop operation is executed: assert(true) is evaluated by the
++		// computer-language parser and uses only cached (unprobed) capabilities.
++		for (enabled, reuse_other_shell) in
++			[(false, false), (true, false), (false, true), (true, true)]
++		{
++			let (client, own_session) = &clients[usize::from(enabled)];
++			let session = if reuse_other_shell {
++				&clients[usize::from(!enabled)].1
++			} else {
++				own_session
++			};
++			for script in [
++				"dyn computer --action run --code 'assert(true)'",
++				"result=$(dyn computer --action run --code 'assert(true)'); result_status=$?; printf \
++				 '%s' \"$result\"; (exit \"$result_status\")",
++				"set -o pipefail; { dyn computer --action run --code 'assert(true)'; } | cat",
++				"set -o pipefail; probe() { dyn computer --action run --code 'assert(true)'; }; probe \
++				 | cat",
++			] {
++				let mut run = client
++					.exec(pb::ExecRequest {
++						session: session.clone(),
++						source: Some(pb::Script { text: script.to_owned(), ..pb::Script::default() }),
++						..pb::ExecRequest::default()
++					})
++					.await
++					.unwrap();
++				let mut output = Vec::new();
++				let status = time::timeout(Duration::from_secs(10), async {
++					loop {
++						match run.next_event().await.unwrap().unwrap() {
++							ClientExecEvent::Started(_) => {},
++							ClientExecEvent::Output(frame) => output.extend_from_slice(&frame.data),
++							ClientExecEvent::Exit(exit) => break exit.status.unwrap(),
++						}
++					}
++				})
++				.await
++				.unwrap();
++				assert_eq!(
++					status.exit_code,
++					Some(if enabled { 0 } else { 1 }),
++					"{}",
++					String::from_utf8_lossy(&output)
++				);
++				if !enabled {
++					assert!(String::from_utf8_lossy(&output).contains("computer use is disabled"));
++				}
++			}
++
++			let mut invocation = client
++				.invoke(pb::InvokeTool {
++					invocation_id: format!("computer-native-{enabled}"),
++					name: "computer".to_owned(),
++					rev: computer_rev.clone(),
++					..pb::InvokeTool::default()
++				})
++				.await
++				.unwrap();
++			assert!(matches!(
++				invocation.next_event().await.unwrap(),
++				Some(InvocationEvent::Accepted(_))
++			));
++			invocation
++				.commit_args(
++					Bytes::from_static(br#"{"action":"run","code":"assert(true)"}"#),
++					Bytes::from_static(b"computer-test"),
++					1000,
++					None,
++				)
++				.await
++				.unwrap();
++			let verdict = time::timeout(Duration::from_secs(10), async {
++				loop {
++					match invocation.next_event().await.unwrap().unwrap() {
++						InvocationEvent::Verdict(verdict) => break verdict,
++						InvocationEvent::Update(_) => {},
++						other => panic!("unexpected event {other:?}"),
++					}
++				}
++			})
++			.await
++			.unwrap();
++			assert_eq!(verdict.is_error, !enabled, "{}", String::from_utf8_lossy(&verdict.json));
++		}
++		assert!(
++			!server.tool_settings.enabled("computer"),
++			"no connection mutates the shared daemon settings"
++		);
++		drop(clients);
++		for task in tasks {
++			time::timeout(Duration::from_secs(10), task)
++				.await
++				.unwrap()
++				.unwrap();
++		}
++	}
++
++	#[test]
+ 	fn approval_overrides_are_connection_local() {
+ 		let grants = Grants::all();
+ 		let authority = Arc::new(AuthorityTable::default());
+diff --git a/crates/envd/src/tools.rs b/crates/envd/src/tools.rs
+--- a/crates/envd/src/tools.rs
++++ b/crates/envd/src/tools.rs
+@@ -83,7 +83,7 @@
+ 	EnvdError,
+ 	admission::DynamicAdmission,
+ 	blobs::BlobHost,
+-	computer::ComputerSessionHost,
++	computer::ComputerConnectionHost,
+ 	devices_host::DynHost,
+ 	docs::{DocumentHost, ResourceMutationServices},
+ 	document_cache,
+@@ -4282,6 +4282,7 @@
+ 	workers: &ExtHostSupervisor,
+ 	interrupt_grace: Duration,
+ 	py_eval: bool,
++	connection_computer: bool,
+ 	tool_settings: &ToolSettings,
+ 	browser_settings: &BrowserSettings,
+ 	shell_settings: &ShellSettings,
+@@ -4356,8 +4357,8 @@
+ 			builtin_device_claims(),
+ 		)?;
+ 	}
+-	if tool_settings.enabled("computer") {
+-		let computer = ComputerSessionHost::new(blobs.clone(), con);
++	if connection_computer || tool_settings.enabled("computer") {
++		let computer = ComputerConnectionHost::new(blobs.clone(), con);
+ 		environment_registry(
+ 			&mut registry,
+ 			omp_tools::computer::tool(computer),
+diff --git a/justfile b/justfile
+--- a/justfile
++++ b/justfile
+@@ -327,3 +327,15 @@
+ test-omperor-native-projection:
+     cargo nextest run -p omp-envd --lib --locked -E 'test(server::tests::native_verdict_)'
+     cargo test --doc -p omp-envd --locked
++
++# Launch-owned computer capability wins over user settings without resetting other tools.
++[group('test')]
++test-omperor-computer-use:
++    cargo nextest run -p omp-app --lib --locked -E 'test(computer_use) | test(chat_cmd::tests::every_parsed_chat_arg_reaches_its_seam)'
++    cargo test --doc -p omp-app --locked
++
++# Computer permission is transported per connection through the shared owner.
++[group('test')]
++test-omperor-computer-owner:
++    cargo nextest run -p omp-envd --lib --locked -E 'test(computer_use_) | test(devices_host::tests::)'
++    cargo test --doc -p omp-envd --locked

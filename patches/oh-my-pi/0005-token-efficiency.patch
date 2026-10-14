@@ -1,0 +1,1419 @@
+diff --git a/crates/agent/src/directors/compaction.rs b/crates/agent/src/directors/compaction.rs
+--- a/crates/agent/src/directors/compaction.rs
++++ b/crates/agent/src/directors/compaction.rs
+@@ -16,7 +16,7 @@
+ use omp_dom::{Dom, Handle, KnownTag, Node, PropId, PropKey, Tag, Value};
+ use omp_journal::{EntryId, data::Compaction};
+ use omp_proto::toolhost::v1::HookEventId;
+-use omp_session::{project_thread, project_thread_through};
++use omp_session::{project_thread, project_thread_through, projection::project_thread_after};
+ 
+ use crate::{
+ 	AI_COMPACT_THRESHOLD, KernelEvent, LifecycleHookError, LifecycleHooks,
+@@ -206,14 +206,10 @@
+ 		}
+ 		// Thread items map one-to-one onto request messages, so whatever the
+ 		// request holds before the projected thread is the live system prompt;
+-		// the projected items past the previous summary and the hidden run are
+-		// the tail kept verbatim.
++		// the kept tail includes verbatim instructions from a partially kept turn.
+ 		let thread = project_thread(dom);
+ 		let system_prefix = request.messages.len().saturating_sub(thread.len());
+-		let kept_from = usize::from(previous.is_some())
+-			.saturating_add(hidden.len())
+-			.min(thread.len());
+-		let kept = Message::from_thread_items(&thread[kept_from..])?;
++		let kept = Message::from_thread_items(&project_thread_after(dom, cut.boundary))?;
+ 		let plan = Plan { cut, epoch: compaction_count(dom), context_tokens, target_tokens };
+ 		let (summary, warning) = match cx.hooks {
+ 			Some(hooks) => {
+@@ -313,7 +309,7 @@
+ 			"suggested_first_kept": first_kept_id(dom, plan.cut.first_kept),
+ 			"to_summarize": refs(hidden, 0),
+ 			"to_retain": refs(kept, hidden.len()),
+-			"split_turn": false,
++			"split_turn": plan.cut.first_kept.and_then(|h| dom.get(h)).is_some_and(|n| n.tag != Tag::Known(KnownTag::Turn)),
+ 			"previous_summary": previous_summary,
+ 			"previous_preserve": serde_json::Value::Null,
+ 			"custom_instructions": self.focus.as_deref(),
+@@ -603,6 +599,11 @@
+ 	keep_recent_tokens: u64,
+ 	keep_current: bool,
+ ) -> Option<Cut> {
++	if keep_current
++		&& let Some(cut) = cut_within_turn(dom, current, previous_boundary, keep_recent_tokens)
++	{
++		return Some(cut);
++	}
+ 	let mut accumulated = 0_u64;
+ 	let mut first_kept = None;
+ 	for turn in dom.children(dom.body()).iter().rev() {
+@@ -629,6 +630,61 @@
+ 		None => head,
+ 	};
+ 	Some(Cut { boundary, first_kept })
++}
++
++/// Cuts only between complete assistant/tool rounds. Keeps at least the last
++/// two rounds and the recent-token tail; user instructions are retained by
++/// projection. This prevents a single long tool loop defeating compaction.
++fn cut_within_turn(
++	dom: &Dom,
++	current: Handle,
++	previous: Option<EntryId>,
++	keep: u64,
++) -> Option<Cut> {
++	let children = dom.children(current);
++	let starts: Vec<usize> = children
++		.iter()
++		.enumerate()
++		.filter_map(|(index, child)| {
++			dom.get(*child)
++				.filter(|node| {
++					node.tag == Tag::Known(KnownTag::Assistant) && after_boundary(node, previous)
++				})
++				.map(|_| index)
++		})
++		.collect();
++	if starts.len() < 3 {
++		return None;
++	}
++	let mut tokens = 0_u64;
++	let mut first = children.len();
++	for (rounds, start) in starts.iter().rev().enumerate() {
++		for child in &children[*start..first] {
++			tokens = tokens
++				.saturating_add(
++					dom.get(*child)
++						.map_or(0, |node| node_bytes(node).div_ceil(BYTES_PER_TOKEN)),
++				)
++				.saturating_add(turn_estimate_tokens(dom, *child))
++				.saturating_add(MESSAGE_OVERHEAD_TOKENS);
++		}
++		first = *start;
++		if rounds >= 1 && tokens >= keep {
++			break;
++		}
++	}
++	if first <= starts[0] {
++		return None;
++	}
++	let node = dom.get(children[first.checked_sub(1)?])?;
++	let boundary = prop_text(node, PropId::Order)
++		.or_else(|| prop_text(node, PropId::Id))
++		.or_else(|| prop_text(node, PropId::Cause))
++		.and_then(|id| EntryId::from_str(id).ok())?;
++	if previous.is_some_and(|previous| boundary <= previous) {
++		return None;
++	}
++	Some(Cut { boundary, first_kept: Some(children[first]) })
+ }
+ 
+ /// Whether the turn already ran inference (an assistant message exists), the
+diff --git a/crates/agent/src/dispatch.rs b/crates/agent/src/dispatch.rs
+--- a/crates/agent/src/dispatch.rs
++++ b/crates/agent/src/dispatch.rs
+@@ -383,6 +383,11 @@
+ 		approvals: crate::ApprovalDesk,
+ 	) -> Self {
+ 		Self { mailbox, turn, session, run, approvals }
++	}
++
++	/// Allowance inherited by tools that compose child inference.
++	pub fn tree_budget(&self) -> Option<Arc<crate::TreeBudget>> {
++		self.run.as_ref().and_then(crate::RunControl::tree_budget)
+ 	}
+ 
+ 	/// Receives the next mailbox message; pending forever once the kernel is
+diff --git a/crates/agent/src/lib.rs b/crates/agent/src/lib.rs
+--- a/crates/agent/src/lib.rs
++++ b/crates/agent/src/lib.rs
+@@ -19,6 +19,7 @@
+ pub mod prompt;
+ pub mod registry;
+ pub mod steering;
++pub mod tree_budget;
+ pub mod vars;
+ /// Image-input policy (`ai_vision`).
+ pub mod vision;
+@@ -39,4 +40,5 @@
+ pub use prompt::*;
+ pub use registry::*;
+ pub use steering::*;
++pub use tree_budget::TreeBudget;
+ pub use vars::*;
+diff --git a/crates/agent/src/loop.rs b/crates/agent/src/loop.rs
+--- a/crates/agent/src/loop.rs
++++ b/crates/agent/src/loop.rs
+@@ -100,6 +100,11 @@
+ 
+ /// Minimal inference capability required by the agent kernel.
+ pub trait Inference: Send {
++	/// Binds the shared allowance for ordinary and auxiliary calls in this run.
++	fn set_tree_budget(&mut self, budget: Option<Arc<crate::TreeBudget>>) {
++		let _ = budget;
++	}
++
+ 	/// Starts one canonical streaming chat operation.
+ 	fn chat(
+ 		&mut self,
+@@ -217,13 +222,33 @@
+ 	deadline:              Option<Instant>,
+ 	max_requests:          Option<u32>,
+ 	request_budget_notice: bool,
++	tree_budget:           Option<Arc<crate::TreeBudget>>,
+ }
+ 
+ impl RunControl {
+ 	/// Creates turn control from an external cancellation token and deadline.
+ 	#[must_use]
+ 	pub const fn new(cancellation: CancellationToken, deadline: Option<Instant>) -> Self {
+-		Self { cancellation, deadline, max_requests: None, request_budget_notice: true }
++		Self {
++			cancellation,
++			deadline,
++			max_requests: None,
++			request_budget_notice: true,
++			tree_budget: None,
++		}
++	}
++
++	/// Shares one finite allowance across all descendants of an explicit
++	/// request.
++	#[must_use]
++	pub fn with_tree_budget(mut self, budget: Option<Arc<crate::TreeBudget>>) -> Self {
++		self.tree_budget = budget;
++		self
++	}
++
++	/// Clones the allowance without creating another budget.
++	pub fn tree_budget(&self) -> Option<Arc<crate::TreeBudget>> {
++		self.tree_budget.clone()
+ 	}
+ 
+ 	/// Limits the number of provider requests this turn may start.
+@@ -260,11 +285,22 @@
+ 	pub fn is_expired(&self) -> bool {
+ 		self.cancellation.is_cancelled()
+ 			|| self
++				.tree_budget
++				.as_ref()
++				.is_some_and(|budget| budget.is_stopped())
++			|| self
+ 				.deadline
+ 				.is_some_and(|deadline| Instant::now() >= deadline)
+ 	}
+ 
+ 	pub(crate) async fn cancelled(&self) {
++		tokio::select! {
++			 () = self.cancelled_locally() => {},
++			 () = async { match &self.tree_budget { Some(budget) => budget.cancelled().await, None => std::future::pending().await } } => {},
++		}
++	}
++
++	async fn cancelled_locally(&self) {
+ 		if let Some(deadline) = self.deadline {
+ 			tokio::select! {
+ 				() = self.cancellation.cancelled() => {},
+@@ -956,6 +992,19 @@
+ 		self
+ 			.settle_reply_obligations(session, &turn_cancel, &control)
+ 			.await?;
++		let result = match result {
++			Ok(outcome) if outcome.stop == TurnStop::Cancelled => {
++				match control
++					.tree_budget
++					.as_ref()
++					.and_then(|budget| budget.failure())
++				{
++					Some(error) => Err(KernelError::Inference(error)),
++					None => Ok(outcome),
++				}
++			},
++			result => result,
++		};
+ 		self.finish_turn(session, turn, &submission_id, result)
+ 	}
+ 
+@@ -1102,6 +1151,19 @@
+ 		let result = self
+ 			.run_turn_body(session, turn, &turn_cancel, &control, Some(calls))
+ 			.await;
++		let result = match result {
++			Ok(outcome) if outcome.stop == TurnStop::Cancelled => {
++				match control
++					.tree_budget
++					.as_ref()
++					.and_then(|budget| budget.failure())
++				{
++					Some(error) => Err(KernelError::Inference(error)),
++					None => Ok(outcome),
++				}
++			},
++			result => result,
++		};
+ 		self.finish_turn(session, turn, &submission_id, result)
+ 	}
+ 
+@@ -1150,6 +1212,7 @@
+ 		control: &RunControl,
+ 		mut replay: Option<Vec<PreparedCall>>,
+ 	) -> Result<TurnOutcome, KernelError> {
++		self.client.set_tree_budget(control.tree_budget());
+ 		let mut directors = DirectorStack::from_dom(session.dom(), &self.director_registry);
+ 		if !self.runtime_flags.goal_enabled
+ 			&& let Some((goal, _)) = crate::find_director(session.dom(), "goal")
+@@ -2556,7 +2619,9 @@
+ 						);
+ 						session.receipt(receipt.clone())?;
+ 						self.apply_live_components(session)?;
+-						self.events.publish(KernelEvent::InferenceReceipt(Box::new(receipt)));
++						self
++							.events
++							.publish(KernelEvent::InferenceReceipt(Box::new(receipt)));
+ 						completed = true;
+ 						break Ok(Fold::Ended);
+ 					},
+diff --git a/crates/agent/src/tree_budget.rs b/crates/agent/src/tree_budget.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/agent/src/tree_budget.rs
+@@ -0,0 +1,211 @@
++//! Shared inference admission and usage for one user-requested task tree.
++use std::sync::{
++	Arc,
++	atomic::{AtomicU64, Ordering},
++};
++
++use omp_ai::{ChatEvent, ChatStream, Error, ErrorDetail, ErrorKind, ExecutionReceipt};
++use omp_core::Str;
++use tokio_util::sync::CancellationToken;
++
++/// One allowance shared by the parent, children, and auxiliary inference.
++/// A new explicit user request gets a new allowance; descendants cannot reset
++/// it.
++#[derive(Debug)]
++pub struct TreeBudget {
++	max_requests:        u64,
++	max_uncached_tokens: u64,
++	requests:            AtomicU64,
++	uncached_tokens:     AtomicU64,
++	cancellation:        CancellationToken,
++	failure:             parking_lot::Mutex<Option<Error>>,
++}
++impl TreeBudget {
++	/// Creates a finite shared allowance. Zero admits no requests.
++	pub fn new(max_requests: u64, max_uncached_tokens: u64) -> Self {
++		Self {
++			max_requests,
++			max_uncached_tokens,
++			requests: AtomicU64::new(0),
++			uncached_tokens: AtomicU64::new(0),
++			cancellation: CancellationToken::new(),
++			failure: parking_lot::Mutex::new(None),
++		}
++	}
++
++	/// Stops the entire task tree, including requests already in flight.
++	pub fn stop(&self) {
++		self.cancellation.cancel();
++	}
++
++	/// Cancels descendants even if their owning future is aborted or unwinds.
++	pub fn cancel_on_drop(&self) -> tokio_util::sync::DropGuard {
++		self.cancellation.clone().drop_guard()
++	}
++
++	/// Records the first provider or allowance failure, then cancels
++	/// descendants.
++	pub fn fail(&self, error: &Error) {
++		self.failure.lock().get_or_insert_with(|| error.clone());
++		self.stop();
++	}
++
++	/// The original failure, retained so cancellation does not hide its reason.
++	pub fn failure(&self) -> Option<Error> {
++		self.failure.lock().clone()
++	}
++
++	/// Whether an ancestor failed or the allowance was exhausted.
++	pub fn is_stopped(&self) -> bool {
++		self.cancellation.is_cancelled()
++	}
++
++	/// Resolves when all descendants must stop.
++	pub async fn cancelled(&self) {
++		self.cancellation.cancelled().await;
++	}
++
++	/// Atomically reserves a request before contacting a provider.
++	pub fn admit(&self) -> Result<(), Error> {
++		let used = self.uncached_tokens.load(Ordering::Acquire);
++		if self.is_stopped() {
++			return Err(self.failure().unwrap_or_else(|| {
++				Error::new(
++					ErrorKind::Cancelled,
++					omp_ai::ErrorPhase::Planning,
++					omp_ai::RetryAction::Never,
++					ExecutionReceipt::default(),
++				)
++			}));
++		}
++		if used >= self.max_uncached_tokens {
++			return Err(self.exhausted(
++				"task-tree uncached input tokens",
++				self.max_uncached_tokens,
++				used,
++			));
++		}
++		self
++			.requests
++			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
++				(n < self.max_requests).then(|| n + 1)
++			})
++			.map(|_| ())
++			.map_err(|used| self.exhausted("task-tree model requests", self.max_requests, used))
++	}
++
++	fn exhausted(&self, dimension: &'static str, limit: u64, observed: u64) -> Error {
++		let error = Error::planning(
++			ErrorKind::BudgetExhausted,
++			ErrorDetail::Budget {
++				dimension: Str::new_static(dimension),
++				limit:     u128::from(limit),
++				observed:  u128::from(observed),
++			},
++			ExecutionReceipt::default(),
++		);
++		self.fail(&error);
++		error
++	}
++
++	/// Charges the provider's uncached input once per completed response.
++	/// Cached input is a separate dimension and is never double counted.
++	pub fn record(&self, tokens: u64) {
++		let _ = self
++			.uncached_tokens
++			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(tokens)));
++	}
++
++	/// Preserves the provider stream and its control channel while observing
++	/// accounting.
++	pub fn observe(self: Arc<Self>, stream: ChatStream) -> ChatStream {
++		stream.inspect(move |event| match event {
++			Ok(ChatEvent::Completed(completion)) => self.record(completion.usage.input_tokens),
++			Err(error)
++				if matches!(
++					error.kind,
++					ErrorKind::RateLimited | ErrorKind::Authentication | ErrorKind::BudgetExhausted
++				) =>
++			{
++				self.fail(error)
++			},
++			_ => {},
++		})
++	}
++}
++
++#[cfg(test)]
++mod tests {
++	use super::*;
++	#[tokio::test]
++	async fn dropping_the_parent_task_cancels_its_tree() {
++		let budget = Arc::new(TreeBudget::new(20, 1000));
++		let child = budget.clone();
++		let (started, ready) = tokio::sync::oneshot::channel();
++		let parent = tokio::spawn(async move {
++			let _lifetime = child.cancel_on_drop();
++			started.send(()).unwrap();
++			std::future::pending::<()>().await;
++		});
++		ready.await.unwrap();
++		parent.abort();
++		assert!(parent.await.unwrap_err().is_cancelled());
++		assert!(budget.is_stopped());
++		assert_eq!(budget.admit().unwrap_err().kind, ErrorKind::Cancelled);
++	}
++
++	#[tokio::test]
++	async fn provider_failure_cancels_siblings_and_preserves_the_actual_error() {
++		use futures::StreamExt;
++		let budget = Arc::new(TreeBudget::new(20, 1000));
++		let error = Error::new(
++			ErrorKind::RateLimited,
++			omp_ai::ErrorPhase::Planning,
++			omp_ai::RetryAction::Never,
++			ExecutionReceipt::default(),
++		);
++		let mut stream = budget
++			.clone()
++			.observe(ChatStream::ordinary(Box::pin(futures::stream::iter([Err(error)]))));
++		assert!(stream.next().await.unwrap().is_err());
++		tokio::time::timeout(std::time::Duration::from_millis(100), budget.cancelled())
++			.await
++			.unwrap();
++		assert_eq!(budget.admit().unwrap_err().kind, ErrorKind::RateLimited);
++		assert_eq!(budget.failure().unwrap().kind, ErrorKind::RateLimited);
++	}
++
++	#[test]
++	fn concurrent_children_cannot_each_spend_the_parent_allowance() {
++		let budget = Arc::new(TreeBudget::new(20, 1_000));
++		let admitted = Arc::new(AtomicU64::new(0));
++		std::thread::scope(|scope| {
++			for _ in 0..8 {
++				let budget = budget.clone();
++				let admitted = admitted.clone();
++				scope.spawn(move || {
++					for _ in 0..10 {
++						if budget.admit().is_ok() {
++							admitted.fetch_add(1, Ordering::Relaxed);
++						}
++					}
++				});
++			}
++		});
++		assert_eq!(admitted.load(Ordering::Relaxed), 20);
++		assert!(budget.is_stopped());
++	}
++	#[test]
++	fn usage_and_parent_failure_stop_descendants_but_a_new_request_is_independent() {
++		let budget = TreeBudget::new(100, 1000);
++		budget.admit().unwrap();
++		budget.record(800);
++		budget.admit().unwrap();
++		budget.record(200);
++		assert!(budget.admit().is_err());
++		let next = TreeBudget::new(100, 1000);
++		assert!(next.admit().is_ok());
++		next.stop();
++		assert!(next.admit().is_err());
++	}
++}
+diff --git a/crates/agent/tests/compaction.rs b/crates/agent/tests/compaction.rs
+--- a/crates/agent/tests/compaction.rs
++++ b/crates/agent/tests/compaction.rs
+@@ -695,3 +695,115 @@
+ 		["small history", "later"]
+ 	);
+ }
++
++/// Regression for Omperor's 180k-token single turn. No model/network involved.
++#[tokio::test]
++async fn long_single_turn_compacts_complete_rounds_and_replays_the_user_goal() {
++	let directory = tempfile::tempdir().unwrap();
++	let (mut session, blobs) = open(directory.path());
++	session.begin_turn().unwrap();
++	session
++		.user("Implement the requested change; preserve my local edits.", Vec::new())
++		.unwrap();
++	let con = Ctx::new();
++	AI_COMPACTION_KEEP_RECENT_TOKENS.set(&con, 8_000).unwrap();
++	AI_COMPACTION_THRESHOLD_TOKENS.set(&con, 48_000).unwrap();
++	omp_ai::settings::AI_COMPACTION_MID_TURN_ENABLED
++		.set(&con, true)
++		.unwrap();
++	let append_round = |session: &mut Session, index: usize| {
++		session.assistant_start("mock", "mock", "mock").unwrap();
++		let call = session
++			.call(
++				"read",
++				1,
++				format!("call-{index}"),
++				None,
++				Some(serde_json::value::to_raw_value(&serde_json::json!({"path":"fixture"})).unwrap()),
++				None,
++			)
++			.unwrap();
++		session.assistant_end("tool_use").unwrap();
++		session
++			.settle(
++				call,
++				serde_json::value::to_raw_value(
++					&serde_json::json!({"text": "bounded fixture output ".repeat(1000)}),
++				)
++				.unwrap(),
++			)
++			.unwrap();
++	};
++	for round in 0..30 {
++		append_round(&mut session, round);
++	}
++	let mut inference =
++		FakeInference::with_reply("Files inspected; continue implementing and verify offline.");
++	inference
++		.replies
++		.push_back(Str::new_static("Implementation underway; run remaining checks."));
++	let route = route(200_000);
++	for epoch in 0..2 {
++		let mut input = request("unused");
++		input.messages = Message::from_thread_items(&project_thread(session.dom()))
++			.unwrap()
++			.into();
++		let before: usize = input.messages.iter().map(|m| format!("{m:?}").len()).sum();
++		let turn = turn_handle(&session);
++		let prepared = CompactionDirector::new()
++			.before_inference(
++				&mut MutDirectorCx {
++					session: &mut session,
++					inference: &mut inference,
++					blobs: &blobs,
++					route: &route,
++					turn,
++					director: None,
++					events: None,
++					con: Some(&con),
++					hooks: None,
++				},
++				&input,
++			)
++			.await
++			.unwrap();
++		assert_eq!(prepared, Prepared::Rebuild);
++		let projected = project_thread(session.dom());
++		let messages = Message::from_thread_items(&projected).unwrap();
++		let after: usize = messages.iter().map(|m| format!("{m:?}").len()).sum();
++		assert!(after * 4 < before, "context must fall by at least 75%: {before} -> {after}");
++		assert_eq!(
++			projected_texts(&session)
++				.iter()
++				.filter(|s| s.as_str() == "Implement the requested change; preserve my local edits.")
++				.count(),
++			1
++		);
++		let calls: Vec<_> = projected
++			.iter()
++			.filter_map(|i| match &i.kind {
++				Some(thread::item::Kind::ToolCall(c)) => Some(&c.id),
++				_ => None,
++			})
++			.collect();
++		let results: Vec<_> = projected
++			.iter()
++			.filter_map(|i| match &i.kind {
++				Some(thread::item::Kind::ToolResult(r)) => Some(&r.call_id),
++				_ => None,
++			})
++			.collect();
++		assert_eq!(calls, results, "no orphaned calls/results");
++		assert_eq!(calls.len(), 2, "retain two complete latest rounds");
++		let path = session.journal_path().to_path_buf();
++		drop(session);
++		session = Session::open(&path, ComponentRegistry::standard()).unwrap();
++		assert_eq!(project_thread(session.dom()), projected, "crash/reopen preserves projection");
++		if epoch == 0 {
++			for round in 30..60 {
++				append_round(&mut session, round);
++			}
++		}
++	}
++	assert_eq!(inference.requests.len(), 2);
++}
+diff --git a/crates/ai/src/answer.rs b/crates/ai/src/answer.rs
+--- a/crates/ai/src/answer.rs
++++ b/crates/ai/src/answer.rs
+@@ -54,6 +54,23 @@
+ 	/// Creates an ordinary one-way chat stream without allocating control state.
+ 	pub fn ordinary(events: OutputStream<ChatEvent>) -> Self {
+ 		Self { events, control: None }
++	}
++
++	/// Observes events without replacing or discarding the response control
++	/// channel.
++	pub fn inspect(
++		mut self,
++		mut observer: impl FnMut(&Result<ChatEvent, Error>) + Send + 'static,
++	) -> Self {
++		let events = std::mem::replace(&mut self.events, Box::pin(futures::stream::empty()));
++		let control = self.control.take();
++		Self {
++			events: Box::pin(events.map(move |event| {
++				observer(&event);
++				event
++			})),
++			control,
++		}
+ 	}
+ 
+ 	/// Creates a bidirectional chat stream over the provider's live response
+@@ -1393,7 +1410,7 @@
+ 			assert_eq!(response.invocation().as_str(), "invoke-1");
+ 			yield Ok(ChatEvent::TextDelta { index: 0, text: sf!("resumed") });
+ 		});
+-		let mut stream = ChatStream::duplex(events, responses);
++		let mut stream = ChatStream::duplex(events, responses).inspect(|_| {});
+ 		let control = stream.control().expect("duplex control");
+ 		assert!(matches!(
+ 			stream.next().await,
+diff --git a/crates/ai/src/client.rs b/crates/ai/src/client.rs
+--- a/crates/ai/src/client.rs
++++ b/crates/ai/src/client.rs
+@@ -164,6 +164,11 @@
+ 		self
+ 	}
+ 
++	/// Rebinds cache/session identity when the host selects a durable journal.
++	pub fn set_affinity(&mut self, affinity: crate::call::CallAffinity) {
++		self.affinity = affinity;
++	}
++
+ 	/// Borrows the affinity attached to subsequent calls.
+ 	pub const fn affinity(&self) -> &crate::call::CallAffinity {
+ 		&self.affinity
+diff --git a/crates/app/src/rpc_mode.rs b/crates/app/src/rpc_mode.rs
+--- a/crates/app/src/rpc_mode.rs
++++ b/crates/app/src/rpc_mode.rs
+@@ -654,7 +654,11 @@
+ /// reasoning items holds them as separate nodes, and gluing those ran one
+ /// item's closing `**` into the next one's opening `**` ("…icon****Planning…").
+ fn push_thinking_node(thinking: &mut String, value: &str) {
+-	if !thinking.is_empty() && !value.is_empty() && !thinking.ends_with('\n') && !value.starts_with('\n') {
++	if !thinking.is_empty()
++		&& !value.is_empty()
++		&& !thinking.ends_with('\n')
++		&& !value.starts_with('\n')
++	{
+ 		thinking.push_str("\n\n");
+ 	}
+ 	thinking.push_str(value);
+@@ -1387,19 +1391,19 @@
+ {
+ 	let (mut kernel, mut session) = current.take().expect("idle RPC owns kernel and session");
+ 	let turn_tx = turn_tx.clone();
++	let budget = omp_driver::efficiency::enabled()
++		.then(|| Arc::new(omp_agent::TreeBudget::new(160, 1_000_000)));
++	let control = RunControl::default().with_tree_budget(budget.clone());
+ 	drop(tokio::spawn(async move {
++		let _tree_lifetime = budget.as_ref().map(|budget| budget.cancel_on_drop());
+ 		let result = match input {
+-			RpcTurnInput::Plain(input) => {
+-				kernel
+-					.run_turn(&mut session, input, RunControl::default())
+-					.await
+-			},
+-			RpcTurnInput::Skill(prompt) => {
+-				kernel
+-					.run_skill_turn(&mut session, prompt, RunControl::default())
+-					.await
+-			},
++			RpcTurnInput::Plain(input) => kernel.run_turn(&mut session, input, control.clone()).await,
++			RpcTurnInput::Skill(prompt) => kernel.run_skill_turn(&mut session, prompt, control).await,
+ 		};
++		// Finished or interrupted parents cannot leave unobserved workers spending.
++		if let Some(budget) = budget {
++			budget.stop();
++		}
+ 		let _ = turn_tx.send_async((kernel, session, result)).await;
+ 	}));
+ 	outgoing_tx
+@@ -3146,7 +3150,10 @@
+ 		let mut thinking = String::new();
+ 		push_thinking_node(&mut thinking, "**Planning rasterization for icon**");
+ 		push_thinking_node(&mut thinking, "**Planning SVG crown generation**");
+-		assert_eq!(thinking, "**Planning rasterization for icon**\n\n**Planning SVG crown generation**");
++		assert_eq!(
++			thinking,
++			"**Planning rasterization for icon**\n\n**Planning SVG crown generation**"
++		);
+ 		// A node that already ends or begins on a line break needs no second one.
+ 		let mut thinking = String::from("first\n\n");
+ 		push_thinking_node(&mut thinking, "second");
+diff --git a/crates/driver/src/headless/kernel.rs b/crates/driver/src/headless/kernel.rs
+--- a/crates/driver/src/headless/kernel.rs
++++ b/crates/driver/src/headless/kernel.rs
+@@ -214,6 +214,7 @@
+ /// environment and authentication stack alive.
+ pub struct ProductionInference {
+ 	client:             Client<ProviderService, Router>,
++	tree_budget:        Option<Arc<omp_agent::TreeBudget>>,
+ 	/// Call metadata as composed at launch; `ai_model` re-targets a copy.
+ 	meta:               CallMeta,
+ 	/// Model the client is currently targeted at.
+@@ -1014,7 +1015,15 @@
+ 							},
+ 						};
+ 						if parts.is_empty() {
+-							parts = structured_parts(&outcome);
++									 // Native envd verdicts contain the typed payload but
++									 // no rendered parts. Materialize useful content and
++									 // send it through the normal bounded-output gate.
++									 parts = structured_parts(&outcome);
++									 yield ExternalDispatchEvent::Done {
++										  outcome, parts, is_error: verdict.is_error,
++										  source_artifact: Some(source_artifact),
++									 };
++									 return;
+ 						}
+ 						yield ExternalDispatchEvent::DoneProjected {
+ 							outcome,
+@@ -1057,7 +1066,7 @@
+ 			return vec![ToolPart::Text { text: abort.render() }];
+ 		},
+ 	};
+-	value
++	let parts: Vec<_> = value
+ 		.get("parts")
+ 		.and_then(serde_json::Value::as_array)
+ 		.into_iter()
+@@ -1072,7 +1081,12 @@
+ 				.map(|json| ToolPart::Json { json: Bytes::from(json.to_string()) }),
+ 			_ => None,
+ 		})
+-		.collect()
++		.collect();
++	if parts.is_empty() {
++		vec![ToolPart::Text { text: Str::new(value.to_string()) }]
++	} else {
++		parts
++	}
+ }
+ 
+ fn tool_output_projection(
+@@ -1367,6 +1381,8 @@
+ 	Production(ProductionInference),
+ 	/// Remote inference gateway plus its local project-tool authority.
+ 	Gateway {
++		/// Task-tree inference allowance.
++		tree_budget:        Option<Arc<omp_agent::TreeBudget>>,
+ 		/// Raw gateway turn adapter.
+ 		inference:          GatewayInference,
+ 		/// Environment owner retained for local tool execution.
+@@ -1496,14 +1512,43 @@
+ }
+ 
+ impl omp_agent::Inference for ComposedInference {
++	fn set_tree_budget(&mut self, budget: Option<Arc<omp_agent::TreeBudget>>) {
++		match self {
++			Self::Production(p) => p.tree_budget = budget,
++			Self::Gateway { tree_budget, .. } => *tree_budget = budget,
++		}
++	}
++
+ 	fn chat(
+ 		&mut self,
+ 		request: ChatRequest,
+ 	) -> impl Future<Output = Result<ChatStream, omp_ai::Error>> + Send {
+ 		async move {
+-			match self {
++			let budget = match self {
++				Self::Production(p) => p.tree_budget.clone(),
++				Self::Gateway { tree_budget, .. } => tree_budget.clone(),
++			};
++			if let Some(budget) = &budget {
++				budget.admit()?;
++			}
++			let result = match self {
+ 				Self::Production(inference) => inference.chat(request).await,
+ 				Self::Gateway { inference, .. } => inference.chat(request).await,
++			};
++			match (result, budget) {
++				(Ok(stream), Some(budget)) => Ok(budget.observe(stream)),
++				(Err(error), Some(budget)) => {
++					if matches!(
++						error.kind,
++						omp_ai::ErrorKind::RateLimited
++							| omp_ai::ErrorKind::Authentication
++							| omp_ai::ErrorKind::BudgetExhausted
++					) {
++						budget.fail(&error);
++					}
++					Err(error)
++				},
++				(result, None) => result,
+ 			}
+ 		}
+ 	}
+@@ -1514,15 +1559,42 @@
+ 		request: ChatRequest,
+ 	) -> impl Future<Output = Result<ChatStream, omp_ai::Error>> + Send {
+ 		async move {
+-			match self {
++			let budget = match self {
++				Self::Production(p) => p.tree_budget.clone(),
++				Self::Gateway { tree_budget, .. } => tree_budget.clone(),
++			};
++			if let Some(budget) = &budget {
++				budget.admit()?;
++			}
++			let result = match self {
+ 				Self::Production(inference) => inference.chat_on(selector, request).await,
+ 				Self::Gateway { inference, .. } => inference.chat_on(selector, request).await,
++			};
++			match (result, budget) {
++				(Ok(stream), Some(budget)) => Ok(budget.observe(stream)),
++				(Err(error), Some(budget)) => {
++					if matches!(
++						error.kind,
++						omp_ai::ErrorKind::RateLimited
++							| omp_ai::ErrorKind::Authentication
++							| omp_ai::ErrorKind::BudgetExhausted
++					) {
++						budget.fail(&error);
++					}
++					Err(error)
++				},
++				(result, None) => result,
+ 			}
+ 		}
+ 	}
+ 
+ 	fn set_debug_session(&mut self, session: Option<Str>) {
+ 		if let Self::Production(inference) = self {
++			inference.client.set_affinity(session_affinity(
++				inference.client.affinity().clone(),
++				inference.meta.debug_session.as_ref(),
++				session.clone(),
++			));
+ 			inference.meta.debug_session = session;
+ 			inference.client.set_call_meta(inference.meta.clone());
+ 		}
+@@ -1649,7 +1721,7 @@
+ 	project_root: &Path,
+ 	model_selector: &str,
+ 	ctx: Arc<omp_con::Ctx>,
+-	options: KernelOptions,
++	mut options: KernelOptions,
+ ) -> Result<(Kernel<ComposedInference>, Session, PromptSource), HeadlessError> {
+ 	let project_root = fs::canonicalize(project_root)?;
+ 	let state_dir = omp_env::project_state::directory(data_dir, &project_root)?;
+@@ -1881,6 +1953,7 @@
+ 			bridge.bind_remote(channel.clone())?;
+ 		}
+ 		ComposedInference::Gateway {
++			tree_budget:        None,
+ 			inference:          GatewayInference::new(channel, model.as_str()),
+ 			_environment:       environment,
+ 			_agent_control:     Mutex::new(None),
+@@ -1925,6 +1998,7 @@
+ 			})
+ 			.with_account_pins(options.account_pins.clone().unwrap_or_default());
+ 		ComposedInference::Production(ProductionInference {
++			tree_budget: None,
+ 			client,
+ 			meta,
+ 			model: omp_catalog::ModelKey::from(model.as_str()),
+@@ -1953,6 +2027,11 @@
+ 		.and_then(|name| name.to_str())
+ 		.map(Str::new);
+ 	if let ComposedInference::Production(production) = &mut inference {
++		production.client.set_affinity(session_affinity(
++			production.client.affinity().clone(),
++			None,
++			debug_session.clone(),
++		));
+ 		production.meta.debug_session = debug_session;
+ 		production.client.set_call_meta(production.meta.clone());
+ 	}
+@@ -1974,6 +2053,9 @@
+ 	};
+ 	let con_journal = Arc::new(con_journal::ConJournal::attach(Arc::clone(&ctx), session.dom()));
+ 	apply_model_override(&ctx, model.as_str(), options.model_override)?;
++	if crate::efficiency::enabled() {
++		crate::efficiency::apply(&ctx, &mut options.prompt).map_err(HeadlessError::Con)?;
++	}
+ 	install_prompt_facts(
+ 		&mut session,
+ 		&project_root,
+@@ -2179,17 +2261,20 @@
+ 		// A child at the recursion ceiling never sees `task`,
+ 		// so it cannot plan a delegation the spawner would refuse.
+ 		if !crate::subagent::settings::task_withheld(&ctx) {
+-			kernel = kernel.with_session_tool(Arc::new(crate::subagent::spawn::TaskSessionTool::new(
+-				data_dir.to_path_buf(),
+-				project_root.clone(),
+-				sessions_dir.clone(),
+-				Arc::clone(&live_sessions),
+-				Arc::clone(&ctx),
+-				Arc::clone(&cfg),
+-				hub_environment.clone(),
+-				name.clone(),
+-				model,
+-			)));
++			kernel = kernel.with_session_tool(Arc::new(
++				crate::subagent::spawn::TaskSessionTool::new(
++					data_dir.to_path_buf(),
++					project_root.clone(),
++					sessions_dir.clone(),
++					Arc::clone(&live_sessions),
++					Arc::clone(&ctx),
++					Arc::clone(&cfg),
++					hub_environment.clone(),
++					name.clone(),
++					model,
++				)
++				.with_account_pins(options.account_pins.clone()),
++			));
+ 		}
+ 		kernel = kernel.with_session_tool(Arc::new(crate::subagent::hub::HubSessionTool::new(
+ 			hub_environment,
+@@ -3668,3 +3753,55 @@
+ 		assert_eq!(options.approval_mode, Some(omp_envd::tool_settings::ApprovalMode::AlwaysAsk));
+ 	}
+ }
++
++#[cfg(test)]
++mod native_output_regression {
++	use super::*;
++	#[test]
++	fn cache_affinity_survives_resume_and_changes_on_session_switch() {
++		let first =
++			session_affinity(omp_ai::CallAffinity::default(), None, Some(Str::new_static("first")));
++		let resumed = session_affinity(
++			first.clone(),
++			Some(&Str::new_static("first")),
++			Some(Str::new_static("first")),
++		);
++		assert_eq!(first.prompt_cache, resumed.prompt_cache);
++		let switched =
++			session_affinity(first, Some(&Str::new_static("first")), Some(Str::new_static("second")));
++		assert_eq!(switched.prompt_cache.as_deref(), Some("second"));
++		let explicit = omp_ai::CallAffinity {
++			prompt_cache:     Some(Str::new_static("explicit")),
++			provider_session: None,
++		};
++		assert_eq!(
++			session_affinity(explicit, None, Some(Str::new_static("first")))
++				.prompt_cache
++				.as_deref(),
++			Some("explicit")
++		);
++	}
++
++	#[test]
++	fn native_payloads_without_parts_are_visible_to_the_model() {
++		let outcome = CallOutcome::Ok(serde_json::json!({"stdout":"build passed", "exit_code":0}));
++		let parts = structured_parts(&outcome);
++		assert!(matches!(&parts[..], [ToolPart::Text { text }] if text.contains("build passed")));
++	}
++}
++
++/// Stable per-journal affinity survives resume; switching journals gets a new
++/// identity. Explicit caller overrides remain intact.
++fn session_affinity(
++	mut affinity: omp_ai::CallAffinity,
++	previous: Option<&Str>,
++	session: Option<Str>,
++) -> omp_ai::CallAffinity {
++	if affinity.prompt_cache.is_none() || affinity.prompt_cache.as_ref() == previous {
++		affinity.prompt_cache = session.clone();
++	}
++	if affinity.provider_session.is_none() || affinity.provider_session.as_ref() == previous {
++		affinity.provider_session = session;
++	}
++	affinity
++}
+diff --git a/crates/driver/src/headless/mod.rs b/crates/driver/src/headless/mod.rs
+--- a/crates/driver/src/headless/mod.rs
++++ b/crates/driver/src/headless/mod.rs
+@@ -14,6 +14,9 @@
+ /// Typed failure while composing a journal-first headless session.
+ #[derive(Debug, thiserror::Error)]
+ pub enum HeadlessError {
++	/// Host inference policy could not be applied.
++	#[error("host inference policy failed")]
++	Con(#[from] omp_con::ConError),
+ 	/// Filesystem state could not be prepared or inspected.
+ 	#[error("headless session filesystem operation failed")]
+ 	Io(#[from] std::io::Error),
+diff --git a/crates/driver/src/lib.rs b/crates/driver/src/lib.rs
+--- a/crates/driver/src/lib.rs
++++ b/crates/driver/src/lib.rs
+@@ -11,6 +11,8 @@
+ pub mod commit;
+ pub mod compress;
+ pub mod discovery;
++/// Opt-in native-host inference limits and context policy.
++pub mod efficiency;
+ pub mod ext_updates;
+ pub mod headless;
+ pub mod prompt_input;
+diff --git a/crates/driver/src/subagent/hub.rs b/crates/driver/src/subagent/hub.rs
+--- a/crates/driver/src/subagent/hub.rs
++++ b/crates/driver/src/subagent/hub.rs
+@@ -437,7 +437,10 @@
+ 	peek: bool,
+ ) -> Result<Response, omp_agent::SessionToolError> {
+ 	let steering = steering_queue(session)?;
+-	let peers = peer_messages(session, steering);
++	let peers = peer_messages(session, steering)
++		.into_iter()
++		.take(32)
++		.collect::<Vec<_>>();
+ 	let messages = peers
+ 		.iter()
+ 		.map(|(_, text)| text.as_str())
+@@ -509,11 +512,9 @@
+ 	let deadline =
+ 		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
+ 	loop {
+-		if let Some(message) = pop_inbox_message(session)? {
+-			return Ok(Response {
+-				text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
+-				useless: false,
+-			});
++		let batch = inbox(session, false)?;
++		if !batch.useless {
++			return Ok(batch);
+ 		}
+ 		let sleep = async {
+ 			match deadline {
+@@ -563,20 +564,21 @@
+ 				.map(|job| job.id)
+ 				.collect()
+ 		});
+-	let timeout = params.timeout_ms.unwrap_or(if selected.is_empty() {
+-		message_timeout_ms
+-	} else {
+-		120_000
+-	});
++	let timeout = efficient_wait_timeout(
++		params.timeout_ms.unwrap_or(if selected.is_empty() {
++			message_timeout_ms
++		} else {
++			120_000
++		}),
++		crate::efficiency::enabled(),
++	);
+ 	let deadline =
+ 		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
+ 	loop {
+ 		jobs.poll(session)?;
+-		if let Some(message) = pop_inbox_message(session)? {
+-			return Ok(Response {
+-				text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
+-				useless: false,
+-			});
++		let batch = inbox(session, false)?;
++		if !batch.useless {
++			return Ok(batch);
+ 		}
+ 		if !selected.is_empty()
+ 			&& let Some(job) = selected_settled_job(jobs, Some(&selected))
+@@ -627,31 +629,20 @@
+ 	}
+ }
+ 
++/// Zero remains an indefinite wait; finite polling waits get an idle floor.
++fn efficient_wait_timeout(requested: u64, efficient: bool) -> u64 {
++	if efficient && requested != 0 {
++		requested.max(30_000)
++	} else {
++		requested
++	}
++}
++
+ fn selected_settled_job(jobs: &JobBoard, ids: Option<&[Str]>) -> Option<omp_agent::JobRecord> {
+ 	jobs.list().into_iter().find(|job| {
+ 		ids.is_none_or(|ids| ids.is_empty() || ids.contains(&job.id))
+ 			&& !matches!(job.status.as_str(), "running" | "starting")
+ 	})
+-}
+-
+-fn pop_inbox_message(
+-	session: &mut omp_session::Session,
+-) -> Result<Option<Str>, omp_agent::SessionToolError> {
+-	let steering = steering_queue(session)?;
+-	let Some((handle, message)) = peer_messages(session, steering).into_iter().next() else {
+-		return Ok(None);
+-	};
+-	let cause = session
+-		.head()
+-		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
+-			message: Str::new_static("session has no journal head"),
+-		})?;
+-	session.patch(Txn {
+-		cause,
+-		label: Some(Str::new_static("hub.wait.message")),
+-		ops: vec![Op::Rm(handle)],
+-	})?;
+-	Ok(Some(message))
+ }
+ 
+ async fn process_start(
+@@ -1434,11 +1425,9 @@
+ 					Ok(_) | Err(_) => return Err(replaced_process_wait(name, process.generation)),
+ 				}
+ 			}
+-			if let Some(message) = pop_inbox_message(session)? {
+-				return Ok(Response {
+-					text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
+-					useless: false,
+-				});
++			let batch = inbox(session, false)?;
++			if !batch.useless {
++				return Ok(batch);
+ 			}
+ 			continue;
+ 		};
+@@ -1722,6 +1711,13 @@
+ #[cfg(test)]
+ mod tests {
+ 	use super::*;
++	#[test]
++	fn efficient_waits_keep_idle_polling_local_and_preserve_unlimited_waits() {
++		assert_eq!(efficient_wait_timeout(1_000, true), 30_000);
++		assert_eq!(efficient_wait_timeout(120_000, true), 120_000);
++		assert_eq!(efficient_wait_timeout(0, true), 0);
++		assert_eq!(efficient_wait_timeout(1_000, false), 1_000);
++	}
+ 
+ 	#[test]
+ 	fn protocol_fields_are_removed_before_hub_validation() {
+diff --git a/crates/driver/src/subagent/spawn.rs b/crates/driver/src/subagent/spawn.rs
+--- a/crates/driver/src/subagent/spawn.rs
++++ b/crates/driver/src/subagent/spawn.rs
+@@ -223,6 +223,7 @@
+ 	owner:        Str,
+ 	model:        Str,
+ 	spec:         ToolSpec,
++	account_pins: Option<omp_ai::AccountPins>,
+ }
+ 
+ impl TaskSessionTool {
+@@ -250,7 +251,16 @@
+ 			owner,
+ 			model,
+ 			spec: omp_tools::task::spec(),
++			account_pins: None,
+ 		}
++	}
++}
++
++impl TaskSessionTool {
++	/// Keeps every descendant on the account selected by the host.
++	pub fn with_account_pins(mut self, pins: Option<omp_ai::AccountPins>) -> Self {
++		self.account_pins = pins;
++		self
+ 	}
+ }
+ 
+@@ -291,7 +301,7 @@
+ 					},
+ 				};
+ 				let cancel = cx.cancel.token().child_token();
+-				let prepared = match prepare_child(cx.session, SpawnRequest {
++				let mut prepared = match prepare_child(cx.session, SpawnRequest {
+ 					data_dir: &self.data_dir,
+ 					project_root: &self.project_root,
+ 					sessions_dir: &self.sessions_dir,
+@@ -314,6 +324,8 @@
+ 						return Ok(CallOutcome::Faulted(fault));
+ 					},
+ 				};
++				prepared.tree_budget = cx.control.and_then(omp_agent::CallControl::tree_budget);
++				prepared.account_pins = self.account_pins.clone();
+ 				let handle = prepared.handle;
+ 				let id = prepared.id.clone();
+ 				let agent = prepared.agent.clone();
+@@ -684,6 +696,8 @@
+ 	handle:       omp_dom::Handle,
+ 	/// Parent-derived initial runtime gate; the child journals its own copy.
+ 	paused:       bool,
++	tree_budget:  Option<Arc<omp_agent::TreeBudget>>,
++	account_pins: Option<omp_ai::AccountPins>,
+ }
+ 
+ struct ChildExecution {
+@@ -817,6 +831,8 @@
+ 		context: Str::new(request.context),
+ 		child: request.child,
+ 		parent: Str::new(request.owner),
++		tree_budget: None,
++		account_pins: None,
+ 		id,
+ 		agent,
+ 		session_path,
+@@ -858,6 +874,7 @@
+ 		.map_or_else(|| prepared.project_root.clone(), |isolation| isolation.root.clone());
+ 	let run = async {
+ 		let options = KernelOptions {
++			account_pins: prepared.account_pins.clone(),
+ 			session: Some(prepared.session_path.clone()),
+ 			sessions_dir: Some(prepared.sessions_dir.clone()),
+ 			sessions: Some(Arc::clone(&prepared.sessions)),
+@@ -901,6 +918,7 @@
+ 				&mut child_session,
+ 				TurnInput { text: Str::new(prompt), attachments: Vec::new() },
+ 				RunControl::new(prepared.cancel.token(), deadline)
++					.with_tree_budget(prepared.tree_budget.clone())
+ 					.with_request_budget(prepared.settings.soft_request_budget)
+ 					.with_request_budget_notice(prepared.settings.soft_request_budget_notice),
+ 			)
+diff --git a/crates/driver/src/subagent/autoreply.rs b/crates/driver/src/subagent/autoreply.rs
+--- a/crates/driver/src/subagent/autoreply.rs
++++ b/crates/driver/src/subagent/autoreply.rs
+@@ -54,6 +54,11 @@
+ 
+ impl AutoreplyClient {
+ 	fn from_composed(inference: &ComposedInference) -> Option<Self> {
++		// Ordinary peer messages still reach the live turn. Avoid spawning
++		// extra full-context completions merely to acknowledge them.
++		if crate::efficiency::enabled() {
++			return None;
++		}
+ 		if let Some(stack) = inference.production_stack() {
+ 			return Some(Self::Production {
+ 				registry: stack.registry.clone(),
+diff --git a/crates/driver/src/efficiency.rs b/crates/driver/src/efficiency.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/driver/src/efficiency.rs
+@@ -0,0 +1,50 @@
++//! Bounded defaults for native hosts that explicitly enable efficient
++//! inference.
++use omp_con::Ctx;
++
++use crate::headless::kernel::PromptOverrides;
++/// Whether the native host opted into the finite task-tree policy.
++pub fn enabled() -> bool {
++	std::env::var_os("OMP_TOKEN_EFFICIENT").is_some_and(|v| v == "1")
++}
++/// Applies host policy after persisted session settings have been restored.
++pub fn apply(ctx: &Ctx, prompt: &mut PromptOverrides) -> Result<(), omp_con::ConError> {
++	use crate::subagent::settings::*;
++	SV_TASK_MAX_CONCURRENCY.set(ctx, 2)?;
++	SV_TASK_MAX_RECURSION_DEPTH.set(ctx, 1)?;
++	SV_TASK_SOFT_REQUEST_BUDGET.set(ctx, 40)?;
++	SV_TASK_SOFT_REQUEST_BUDGET_NOTICE.set(ctx, true)?;
++	omp_ai::settings::AI_COMPACTION_ENABLED.set(ctx, true)?;
++	omp_ai::settings::AI_COMPACTION_MID_TURN_ENABLED.set(ctx, true)?;
++	omp_ai::settings::AI_COMPACTION_THRESHOLD_TOKENS.set(ctx, 48_000)?;
++	omp_ai::settings::AI_COMPACTION_KEEP_RECENT_TOKENS.set(ctx, 8_000)?;
++	const GUIDANCE: &str =
++		"Token efficiency: The task shares 160 inference calls and 1,000,000 uncached input tokens \
++		 across all agents; each worker has 40 calls plus a final handoff. Batch independent reads \
++		 and shell work. Keep tool output and coordination concise. Delegate only concrete \
++		 independent work; avoid overlapping assignments. Workers cannot delegate further. Read the \
++		 actual working directory before editing. Use hub wait with timeoutMs 30000 or longer; \
++		 completion messages wake it early. Consolidate peer messages and drain the inbox in \
++		 batches. Do not repeatedly read unchanged files or poll statuses. Respect the shared task \
++		 allowance; give a concise handoff when work cannot fit.";
++	let existing = prompt.append_prompt.take().unwrap_or_default();
++	prompt.append_prompt = Some(omp_core::sf!("{existing}\n\n{GUIDANCE}"));
++	Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++	use super::*;
++	#[test]
++	fn old_session_settings_cannot_restore_unbounded_fanout() {
++		use crate::subagent::settings::*;
++		let ctx = Ctx::new();
++		SV_TASK_MAX_CONCURRENCY.set(&ctx, 32).unwrap();
++		SV_TASK_MAX_RECURSION_DEPTH.set(&ctx, 2).unwrap();
++		let mut prompt = PromptOverrides::default();
++		apply(&ctx, &mut prompt).unwrap();
++		assert_eq!(SV_TASK_MAX_CONCURRENCY.get(&ctx), 2);
++		assert_eq!(SV_TASK_MAX_RECURSION_DEPTH.get(&ctx), 1);
++		assert_eq!(omp_ai::settings::AI_COMPACTION_THRESHOLD_TOKENS.get(&ctx), 48_000);
++	}
++}
+diff --git a/crates/session/src/projection.rs b/crates/session/src/projection.rs
+--- a/crates/session/src/projection.rs
++++ b/crates/session/src/projection.rs
+@@ -322,6 +322,15 @@
+ 	items
+ }
+ 
++/// Projects the kept tail after a proposed compaction boundary, without a
++/// summary. User instructions in a partially retained turn remain verbatim.
++#[must_use]
++pub fn project_thread_after(dom: &Dom, boundary: EntryId) -> Vec<Item> {
++	let mut items = Vec::new();
++	project_window(dom, Window { after: Some(boundary), through: None }, &mut items);
++	items
++}
++
+ /// Journal-entry window a projection admits: elements after `after` (the
+ /// newest compaction boundary) and, when set, at or before `through`.
+ #[derive(Clone, Copy)]
+@@ -340,6 +349,22 @@
+ 		// sees what ran as a user message.
+ 		let mut local = true;
+ 		let children = dom.children(*turn);
++		// A cut inside a turn must not erase its user's goal or steering.
++		// Whole hidden turns still disappear. The summarizer's `through`
++		// window never re-inserts these messages.
++		let split_turn = window.through.is_none()
++			&& window.after.is_some()
++			&& dom
++				.get(*turn)
++				.is_some_and(|node| !element_in_window(node, window))
++			&& children.iter().any(|child| {
++				dom.get(*child)
++					.is_some_and(|node| element_in_window(node, window))
++			});
++		let visible = |node: &Node| {
++			element_in_window(node, window)
++				|| (split_turn && matches!(node.tag, Tag::Known(KnownTag::User | KnownTag::Developer)))
++		};
+ 		let mut receipts = BTreeMap::new();
+ 		let mut awaiting_receipt = None;
+ 		// Assistants that issued at least one tool call stay in the projection
+@@ -351,7 +376,7 @@
+ 			let Some(node) = dom.get(*child) else {
+ 				continue;
+ 			};
+-			if !element_in_window(node, window) {
++			if !visible(node) {
+ 				continue;
+ 			}
+ 			match &node.tag {
+@@ -385,7 +410,7 @@
+ 			) {
+ 				local = false;
+ 			}
+-			if !element_in_window(node, window) {
++			if !visible(node) {
+ 				continue;
+ 			}
+ 			match &node.tag {
+diff --git a/justfile b/justfile
+--- a/justfile
++++ b/justfile
+@@ -279,3 +279,12 @@
+ # Reproduce the CI "format" + "rust" jobs locally before pushing (skips macOS/Linux-only Python-toolchain verification steps).
+ [group('housekeeping')]
+ ci: fmt-check-rust clippy test e2e
++
++# Offline Omperor regressions; model traffic is scripted or in-process only.
++[group('test')]
++test-omperor-efficiency:
++    cargo nextest run -p omp-agent --locked -E 'binary(compaction) | test(tree_budget::)'
++    cargo nextest run -p omp-driver --locked
++    cargo nextest run -p omp-session --test projection --locked
++    cargo nextest run -p omp-ai --lib --locked -E 'test(workflow_action_uses_the_live_response_sink_and_resumes_the_same_stream)'
++    cargo test --doc -p omp-agent -p omp-driver -p omp-session -p omp-ai --locked
+diff --git a/crates/session/tests/projection.rs b/crates/session/tests/projection.rs
+--- a/crates/session/tests/projection.rs
++++ b/crates/session/tests/projection.rs
+@@ -423,7 +423,7 @@
+ }
+ 
+ #[test]
+-fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
++fn projection_keeps_user_instructions_when_compaction_splits_a_turn() {
+ 	let directory = tempfile::tempdir().expect("temporary session directory");
+ 	let path = directory.path().join("compact.oms");
+ 	let store = BlobStore::open(directory.path()).expect("blob store opens");
+@@ -456,7 +456,7 @@
+ 	session.user("new", Vec::new()).expect("new user appends");
+ 
+ 	let items = project_thread(session.dom());
+-	assert_eq!(items.len(), 3);
++	assert_eq!(items.len(), 4);
+ 	let texts: Vec<_> = items
+ 		.iter()
+ 		.filter_map(|item| match item.kind.as_ref()? {
+@@ -467,7 +467,9 @@
+ 			_ => None,
+ 		})
+ 		.collect();
+-	assert_eq!(texts, ["summary of earlier turns", "after-boundary", "new"]);
++	// The cut splits the old turn. Retain its instructions alongside its
++	// assistant continuation; later user turns still follow in order.
++	assert_eq!(texts, ["summary of earlier turns", "old", "after-boundary", "new"]);
+ }
+ 
+ #[test]

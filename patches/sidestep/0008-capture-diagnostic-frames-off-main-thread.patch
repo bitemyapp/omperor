@@ -1,0 +1,159 @@
+diff --git a/crates/sidestep-appkit/src/backend/mod.rs b/crates/sidestep-appkit/src/backend/mod.rs
+--- a/crates/sidestep-appkit/src/backend/mod.rs
++++ b/crates/sidestep-appkit/src/backend/mod.rs
+@@ -589,6 +589,10 @@
+                 self.ca.clock = clock;
+                 self.present(window);
+             }
++            ToRender::CaptureWindow { reply, .. } => {
++                // Pixel capture is a null-backend diagnostic only.
++                let _ = reply.send(None);
++            }
+             ToRender::SetSelection { contents } => selection::set(self, contents),
+             ToRender::ReadSelection { mime, token, source, drag } => selection::read(self, mime, token, source, drag),
+             ToRender::SelectionData { token, data } => selection::provided(self, token, data),
+diff --git a/crates/sidestep-appkit/src/backend/null.rs b/crates/sidestep-appkit/src/backend/null.rs
+--- a/crates/sidestep-appkit/src/backend/null.rs
++++ b/crates/sidestep-appkit/src/backend/null.rs
+@@ -107,6 +107,24 @@
+             capture(window, &r.rects, &r.ops, glyphs);
+         }
+     }
++}
++
++/// Copy only the requested device pixels, on the render thread. An empty
++/// or out-of-bounds crop has no image; arithmetic overflow is out of bounds.
++fn cropped(window: WindowId, [x, y, width, height]: [u32; 4]) -> Option<(u32, u32, Vec<[u8; 4]>)> {
++    let all = PIXELS.lock().unwrap_or_else(|e| e.into_inner());
++    let (w, h, pixels) = all.as_ref()?.get(&window)?;
++    let right = x.checked_add(width)?;
++    let bottom = y.checked_add(height)?;
++    if width == 0 || height == 0 || right > *w || bottom > *h {
++        return None;
++    }
++    let mut out = Vec::with_capacity(width as usize * height as usize);
++    for row in y..bottom {
++        let start = row as usize * *w as usize;
++        out.extend(pixels[start + x as usize..start + right as usize].iter().map(|p| p.to_ne_bytes()));
++    }
++    Some((width, height, out))
+ }
+ 
+ pub(crate) fn request() {
+@@ -204,6 +222,11 @@
+                 }
+             }
+             ToRender::Composite { window, at } => composite(window, at, &mut glyphs),
++            ToRender::CaptureWindow { window, at, crop, reply } => {
++                composite(window, Some(at), &mut glyphs);
++                // A receiver may be dropped when its diagnostic is cancelled.
++                let _ = reply.send(cropped(window, crop));
++            }
+             ToRender::FrameTicks { window, on } => note(Seen::FrameTicks { window, on }),
+             ToRender::Request { window, request } => {
+                 note(Seen::Request { window, request: format!("{request:?}") });
+diff --git a/crates/sidestep-appkit/src/protocol.rs b/crates/sidestep-appkit/src/protocol.rs
+--- a/crates/sidestep-appkit/src/protocol.rs
++++ b/crates/sidestep-appkit/src/protocol.rs
+@@ -752,6 +752,14 @@
+         window: WindowId,
+         at: Option<f64>,
+     },
++    /// Composite and copy a crop on the null render thread, then answer
++    /// without involving the main thread. Other backends answer `None`.
++    CaptureWindow {
++        window: WindowId,
++        at: f64,
++        crop: [u32; 4],
++        reply: std::sync::mpsc::Sender<Option<(u32, u32, Vec<[u8; 4]>)>>,
++    },
+ }
+ 
+ /// Where a scroll is in a touchpad gesture; `None` for wheels and other
+diff --git a/crates/sidestep-appkit/src/testing.rs b/crates/sidestep-appkit/src/testing.rs
+--- a/crates/sidestep-appkit/src/testing.rs
++++ b/crates/sidestep-appkit/src/testing.rs
+@@ -425,6 +425,24 @@
+     Some((*w, *h, px.iter().map(|p| p.to_ne_bytes()).collect()))
+ }
+ 
++/// Ask the null render thread to composite at `t` and copy a crop, without
++/// waiting or locking the pixel buffer on the calling thread. `crop` is
++/// [x, y, width, height] in device pixels from the content's top left.
++/// The reply holds width, height and premultiplied RGBA pixels, or `None`
++/// if capture is disabled, the window/crop is invalid, or this isn't the
++/// null backend. Move the receiver to a worker for encoding or file I/O;
++/// never wait for its reply on the GUI thread. Enable `capture_pixels`
++/// before showing the window, and bound the number of requests in flight.
++pub fn request_window_pixels(
++    window: &NSWindow,
++    t: f64,
++    crop: [u32; 4],
++) -> std::sync::mpsc::Receiver<Option<(u32, u32, Vec<[u8; 4]>)>> {
++    let (reply, receiver) = std::sync::mpsc::channel();
++    crate::app::send(crate::protocol::ToRender::CaptureWindow { window: showing_id(window), at: t, crop, reply });
++    receiver
++}
++
+ /// Have the null render thread draw `window`'s layer trees as they show at
+ /// the media time `t` (as a frame would), and wait for it.
+ pub fn composite_at(window: &NSWindow, t: f64) {
+diff --git a/crates/sidestep-appkit/tests/linux_layers.rs b/crates/sidestep-appkit/tests/linux_layers.rs
+--- a/crates/sidestep-appkit/tests/linux_layers.rs
++++ b/crates/sidestep-appkit/tests/linux_layers.rs
+@@ -205,6 +205,32 @@
+         l
+     }
+ 
++    fn asynchronous_pixel_crops(mtm: MainThreadMarker) {
++        for scale in [1, 2] {
++            testing::use_null_backend_scale(scale);
++            let (w, painter) = shown(mtm);
++            let blue = blue_square(&painter.layer().unwrap());
++            show(&w);
++            let crop = [5 * scale, 65 * scale, 30 * scale, 30 * scale];
++            let reply = testing::request_window_pixels(&w, testing::media_time(), crop);
++            // The render thread can answer without any main-thread pumping.
++            let (width, height, pixels) = reply.recv_timeout(std::time::Duration::from_secs(5))
++                .expect("render thread answered").expect("valid crop");
++            assert_eq!((width, height), (crop[2], crop[3]));
++            assert_eq!(pixels.len(), (width * height) as usize);
++            near(pixels[0], [255, 0, 0, 255], 0);
++            near(pixels[((15 * scale) * width + 15 * scale) as usize], [0, 0, 255, 255], 0);
++            for invalid in [[0, 0, 0, 1], [0, 100 * scale, 1, 1], [200 * scale, 0, 1, 1], [u32::MAX, 0, 2, 1]] {
++                let reply = testing::request_window_pixels(&w, testing::media_time(), invalid);
++                assert!(reply.recv_timeout(std::time::Duration::from_secs(5)).expect("render thread answered").is_none());
++            }
++            blue.removeFromSuperlayer();
++            w.close();
++            testing::settle();
++        }
++        testing::use_null_backend_scale(1);
++    }
++
+     fn views_and_layers_composite(mtm: MainThreadMarker) {
+         let (w, painter) = shown(mtm);
+         // The view's drawing is its layer's canvas.
+@@ -257,6 +283,14 @@
+         // isn't asked for anything.
+         let p = testing::presented_layer(&blue, begin + LONG / 2.0).expect("on the render thread");
+         assert!((p.position[0] - 70.0).abs() < 1e-6, "{:?}", p.position);
++        // Queue distinct times before receiving either: each reply must
++        // own its frame, not the pixels from whichever composite ran last.
++        let middle = testing::request_window_pixels(&w, begin + LONG / 2.0, [70, 80, 1, 1]);
++        let end = testing::request_window_pixels(&w, begin + 2.0 * LONG, [70, 80, 1, 1]);
++        let middle = middle.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
++        let end = end.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
++        near(middle.2[0], [0, 0, 255, 255], 0);
++        near(end.2[0], [255, 0, 0, 255], 0);
+         testing::composite_at(&w, begin + LONG / 2.0);
+         near(px(&w, 70, 80), [0, 0, 255, 255], 0);
+         near(px(&w, 20, 80), [255, 0, 0, 255], 0);
+@@ -762,6 +796,7 @@
+         let aqua = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }).expect("Aqua");
+         NSApplication::sharedApplication(mtm).setAppearance(Some(&aqua));
+         let tests: &[Test] = &[
++            ("asynchronous_pixel_crops", asynchronous_pixel_crops),
+             ("views_and_layers_composite", views_and_layers_composite),
+             ("animations_draw_on_the_render_thread", animations_draw_on_the_render_thread),
+             (

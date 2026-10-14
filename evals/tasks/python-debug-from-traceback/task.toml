@@ -1,0 +1,35 @@
+description = "Python: a user's traceback surfaces in billing, but the cause is in the CSV loader; fix the cause, reject unreadable values with the line number, add a regression test."
+tags = ["coding", "python", "debugging"]
+timeout_secs = 900
+prompt = """Priya on the ops team hit this running the October invoices. She put the export she used in \
+samples/october.csv:
+
+```
+$ python3 -m invoicer render samples/october.csv --rates samples/rates.csv --client Northwind --month 2024-10
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/priya/src/invoicer/invoicer/__main__.py", line 3, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/Users/priya/src/invoicer/invoicer/cli.py", line 27, in main
+    invoice = build_invoice(entries, rates, args.client, args.month)
+  File "/Users/priya/src/invoicer/invoicer/billing.py", line 41, in build_invoice
+    lines.append(InvoiceLine(entry, rate, line_amount(entry.minutes, rate)))
+                                          ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/priya/src/invoicer/invoicer/billing.py", line 28, in line_amount
+    return (minutes * rate_cents + 30) // 60
+            ~~~~~~~~^~~~~~~~~~~~
+TypeError: unsupported operand type(s) for *: 'NoneType' and 'int'
+```
+
+September ran fine; the time tracker got an update at the start of October. Please fix the actual cause \
+rather than papering over the crash: the October invoice has to come out with the right amounts, and older \
+exports must keep working. If the tracker ever hands us a duration we can't read, the CLI should stop with \
+a clear error that includes the bad value and its line number in the CSV file. Never bill it as zero, and \
+no traceback. Add a regression test, keep it standard library only, and don't commit."""
+
+[[checks]]
+type = "command"
+argv = ["python3", "{task}/grade.py"]
+timeout_secs = 120

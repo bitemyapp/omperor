@@ -1,0 +1,22 @@
+PYO3_CONFIG_FILE="~/work/omperor/vendor/oh-my-pi/target/omperor-source/vendor/python-release/pyo3-config.txt" cargo build -p omp-app --bin omp --release --locked
+    Finished `release` profile [optimized] target(s) in 0.59s
+real 0.88
+user 0.24
+sys 0.20
+           245825536  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               23914  page reclaims
+                  22  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   5  signals received
+                  19  voluntary context switches
+                1243  involuntary context switches
+            70576563  instructions retired
+            35794210  cycles elapsed
+             2228560  peak memory footprint
