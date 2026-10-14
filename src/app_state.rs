@@ -1,5 +1,6 @@
 //! State namespaces are a build property, independent of optimization and bundle location.
-//! Path selection does no filesystem I/O and is safe before the GUI starts.
+//! Path selection is safe before the GUI starts. It does no filesystem I/O, except that on
+//! Linux one existence check, made once per root, keeps a root in its pre-XDG location.
 
 use std::{
     env,
@@ -46,9 +47,29 @@ pub(crate) fn root_for(channel: Channel) -> Result<PathBuf, Error> {
     resolve(
         channel,
         env::var_os("HOME").as_deref(),
+        env::var_os("XDG_DATA_HOME").as_deref(),
         env::var_os("OMPEROR_STATE_DIR").as_deref(),
         &env::temp_dir(),
+        &legacy_root_exists,
     )
+}
+
+/// Whether a Linux root is still in the macOS-style location that Linux
+/// builds used before they followed XDG. Asked once per root, so a process
+/// never changes its mind about where its state lives.
+fn legacy_root_exists(legacy: &Path) -> bool {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    static ANSWERS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let mut answers = ANSWERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *answers
+        .entry(legacy.to_path_buf())
+        .or_insert_with(|| legacy.is_dir())
 }
 
 pub(crate) fn root() -> Result<PathBuf, Error> {
@@ -104,8 +125,10 @@ pub(crate) fn dispatch(args: &[std::ffi::OsString]) -> Option<i32> {
 fn resolve(
     channel: Channel,
     home: Option<&OsStr>,
+    data_home: Option<&OsStr>,
     explicit: Option<&OsStr>,
     temporary: &Path,
+    legacy_exists: &dyn Fn(&Path) -> bool,
 ) -> Result<PathBuf, Error> {
     if channel == Channel::Preview {
         return Ok(temporary.join("omperor-design-preview"));
@@ -121,33 +144,54 @@ fn resolve(
     let home = home
         .filter(|value| !value.is_empty())
         .ok_or(Error::HomeUnavailable)?;
-    let name = if channel == Channel::Production {
-        "Omperor"
-    } else {
-        "Omperor Dev"
-    };
-    Ok(Path::new(home)
-        .join("Library/Application Support")
-        .join(name))
+    let production = channel == Channel::Production;
+    let name = if production { "Omperor" } else { "Omperor Dev" };
+    let apple = Path::new(home).join("Library/Application Support").join(name);
+    if cfg!(target_os = "macos") {
+        return Ok(apple);
+    }
+    // Linux follows the XDG base directories. Roots that Linux builds made
+    // in the macOS location before then stay where they are.
+    if legacy_exists(&apple) {
+        return Ok(apple);
+    }
+    let data_home = data_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| Path::new(home).join(".local/share"));
+    Ok(data_home.join(if production { "omperor" } else { "omperor-dev" }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn never(_: &Path) -> bool {
+        false
+    }
+
+    fn defaults(channel: Channel, home: Option<&OsStr>) -> Result<PathBuf, Error> {
+        resolve(channel, home, None, None, Path::new("/tmp"), &never)
+    }
+
     #[test]
     fn channels_keep_all_owned_state_in_disjoint_roots() {
         let home = Some(OsStr::new("/home/test"));
-        let production = resolve(Channel::Production, home, None, Path::new("/tmp")).unwrap();
-        let development = resolve(Channel::Development, home, None, Path::new("/tmp")).unwrap();
-        assert_eq!(
-            production,
-            Path::new("/home/test/Library/Application Support/Omperor")
-        );
-        assert_eq!(
-            development,
-            Path::new("/home/test/Library/Application Support/Omperor Dev")
-        );
+        let production = defaults(Channel::Production, home).unwrap();
+        let development = defaults(Channel::Development, home).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                production,
+                Path::new("/home/test/Library/Application Support/Omperor")
+            );
+            assert_eq!(
+                development,
+                Path::new("/home/test/Library/Application Support/Omperor Dev")
+            );
+        } else {
+            assert_eq!(production, Path::new("/home/test/.local/share/omperor"));
+            assert_eq!(development, Path::new("/home/test/.local/share/omperor-dev"));
+        }
         for owned in [
             "omperor.sqlite3",
             "omp/data",
@@ -160,34 +204,36 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_follows_xdg_data_home_and_keeps_existing_roots_in_place() {
+        let home = Some(OsStr::new("/home/test"));
+        let data_home = Some(OsStr::new("/data"));
+        let root = |data_home, legacy: &dyn Fn(&Path) -> bool| {
+            resolve(Channel::Development, home, data_home, None, Path::new("/tmp"), legacy)
+                .unwrap()
+        };
+        assert_eq!(root(data_home, &never), Path::new("/data/omperor-dev"));
+        // A relative XDG_DATA_HOME is invalid and ignored, as the spec says.
+        assert_eq!(
+            root(Some(OsStr::new("relative")), &never),
+            Path::new("/home/test/.local/share/omperor-dev")
+        );
+        let legacy = Path::new("/home/test/Library/Application Support/Omperor Dev");
+        assert_eq!(root(data_home, &|path| path == legacy), legacy);
+    }
+
     #[test]
     fn explicit_test_roots_are_absolute_and_do_not_need_a_home() {
-        let root = resolve(
-            Channel::Development,
-            None,
-            Some(OsStr::new("/tmp/run-state")),
-            Path::new("/tmp"),
-        )
-        .unwrap();
-        assert_eq!(root, Path::new("/tmp/run-state"));
-        assert!(
-            resolve(
-                Channel::Production,
-                None,
-                Some(OsStr::new("relative")),
-                Path::new("/tmp")
-            )
-            .is_err()
+        let explicit = |channel, home, value| {
+            resolve(channel, home, None, Some(OsStr::new(value)), Path::new("/tmp"), &never)
+        };
+        assert_eq!(
+            explicit(Channel::Development, None, "/tmp/run-state").unwrap(),
+            Path::new("/tmp/run-state")
         );
-        assert!(
-            resolve(
-                Channel::Development,
-                Some(OsStr::new("")),
-                None,
-                Path::new("/tmp")
-            )
-            .is_err()
-        );
+        assert!(explicit(Channel::Production, None, "relative").is_err());
+        assert!(defaults(Channel::Development, Some(OsStr::new(""))).is_err());
     }
 
     #[test]
@@ -195,8 +241,10 @@ mod tests {
         let root = resolve(
             Channel::Preview,
             None,
+            None,
             Some(OsStr::new("/real/state")),
             Path::new("/tmp"),
+            &|_| true,
         )
         .unwrap();
         assert_eq!(root, Path::new("/tmp/omperor-design-preview"));

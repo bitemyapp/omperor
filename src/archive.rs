@@ -881,7 +881,19 @@ mod tests {
         let blob = store.put(b"archived attachment bytes").unwrap();
         let path = request.sessions_dir.join("parent.oms");
         write_journal(&path, &[]);
-        let (mut journal, entries) = Journal::open(&path).unwrap();
+        // A process another test thread is starting holds a copy of the
+        // fixture's lock until it runs its program (see `housekeeping::lease`),
+        // so the lock just released can look held for a moment.
+        let mut tries = 0;
+        let (mut journal, entries) = loop {
+            match Journal::open(&path) {
+                Err(omp_journal::JournalError::Locked { .. }) if tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                opened => break opened.unwrap(),
+            }
+        };
         let turn = journal
             .append(EntryDraft {
                 kind: Kind::known(KindName::TurnStart),

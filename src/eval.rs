@@ -761,7 +761,9 @@ mod tests {
         );
         let start = Instant::now();
         assert!(
-            !run_grader(&["/bin/sleep".into(), "10".into()], 1, 1, &dir, &dir, &Default::default())
+            // From PATH: NixOS and others have no /bin/sleep, and a missing
+            // program would fail the grader without testing the deadline.
+            !run_grader(&["sleep".into(), "10".into()], 1, 1, &dir, &dir, &Default::default())
                 .unwrap()
                 .0
         );

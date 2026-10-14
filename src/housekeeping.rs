@@ -201,8 +201,9 @@ pub(crate) struct Lease {
     _file: File,
 }
 
-/// Takes a journal's writer lock without waiting. Fails if an OMP child,
-/// in this Omperor or another, has the session open.
+/// Takes a journal's writer lock, waiting at most `LEASE_RETRIES` short
+/// intervals. Fails if an OMP child, in this Omperor or another, has the
+/// session open. On a worker: it can sleep.
 pub(crate) fn lease(journal: &Path) -> Result<Lease, String> {
     let file = OpenOptions::new()
         .create(true)
@@ -211,14 +212,29 @@ pub(crate) fn lease(journal: &Path) -> Result<Lease, String> {
         .write(true)
         .open(lock_path(journal))
         .map_err(|error| format!("could not lock {}: {error}", journal.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Lease { _file: file }),
-        Err(TryLockError::WouldBlock) => Err("an OMP process has it open".into()),
-        Err(TryLockError::Error(error)) => {
-            Err(format!("could not lock {}: {error}", journal.display()))
+    let mut retries = 0;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Lease { _file: file }),
+            // A process that another thread is starting holds a copy of every
+            // descriptor until it runs its program, so a lock that was just
+            // released can look held for a moment. An OMP child holds its
+            // lock for as long as the session is open; a short wait tells
+            // the two apart.
+            Err(TryLockError::WouldBlock) if retries < LEASE_RETRIES => {
+                retries += 1;
+                std::thread::sleep(LEASE_RETRY_INTERVAL);
+            }
+            Err(TryLockError::WouldBlock) => return Err("an OMP process has it open".into()),
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("could not lock {}: {error}", journal.display()));
+            }
         }
     }
 }
+
+const LEASE_RETRIES: u32 = 5;
+const LEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The sub-agent ids a journal names, on every branch of its history, so a
 /// rewind cannot bring back a reference to a journal that was deleted.
@@ -860,7 +876,7 @@ pub(crate) mod tests {
             let repo = dir.join("repo");
             fs::create_dir(&repo).unwrap();
             let git = |args: &[&str]| {
-                let output = Command::new("/usr/bin/git")
+                let output = Command::new(crate::workspace::git())
                     .arg("-C")
                     .arg(&repo)
                     .args(args)

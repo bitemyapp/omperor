@@ -2181,6 +2181,7 @@ impl AppDelegate {
             }
             settings_separator(&card, CARD_FOOTER, mtm);
             let working = busy.contains(&manifest.id);
+            let reveal = format!("Show in {FILE_MANAGER}");
             for (title, frame, action) in [
                 (
                     "Restore",
@@ -2188,7 +2189,7 @@ impl AppDelegate {
                     sel!(settingsRestoreArchive:),
                 ),
                 (
-                    "Show in Finder",
+                    reveal.as_str(),
                     rect(122.0, 12.0, 130.0, 30.0),
                     sel!(settingsRevealArchive:),
                 ),

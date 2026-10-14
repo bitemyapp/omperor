@@ -8,7 +8,21 @@ use std::{
 use crate::perf;
 
 const MAX_DIFF_BYTES: usize = 512 * 1024;
-const GIT: &str = "/usr/bin/git";
+
+/// Git, by absolute path, which keeps the spawn atomic (see
+/// `eval::resolve_program`). On macOS that is `/usr/bin/git`, since an app
+/// opened from the Finder has a minimal PATH; elsewhere, the `git` on PATH,
+/// as NixOS and others have no `/usr/bin/git`. Found once, on a worker.
+pub(crate) fn git() -> &'static Path {
+    static GIT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    GIT.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            PathBuf::from("/usr/bin/git")
+        } else {
+            crate::eval::resolve_program("git", &Default::default())
+        }
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceChange {
@@ -164,7 +178,7 @@ pub(crate) fn add_worktree(
             source,
         })?;
     }
-    let output = Command::new(GIT)
+    let output = Command::new(git())
         .arg("-C")
         .arg(directory)
         .args(["worktree", "add", "-b", branch])
@@ -420,7 +434,7 @@ pub(crate) fn diff(
 }
 
 fn git_output(project: &Path, arguments: &[&str]) -> Result<std::process::Output, WorkspaceError> {
-    Command::new(GIT)
+    Command::new(git())
         .arg("-C")
         .arg(project)
         .args(arguments)
@@ -436,7 +450,7 @@ fn git_output_path(
     arguments: &[&str],
     path: &Path,
 ) -> Result<std::process::Output, WorkspaceError> {
-    Command::new(GIT)
+    Command::new(git())
         .arg("-C")
         .arg(project)
         .args(arguments)
@@ -606,7 +620,7 @@ mod tests {
     static NEXT_REPOSITORY: AtomicU64 = AtomicU64::new(0);
 
     fn git(directory: &Path, arguments: &[&str]) {
-        let status = Command::new("/usr/bin/git")
+        let status = Command::new(super::git())
             .arg("-C")
             .arg(directory)
             .args(arguments)
@@ -687,7 +701,7 @@ mod tests {
         );
         assert!(!clean.exists());
         // The branch, and the commit only it had, survive.
-        let log = Command::new("/usr/bin/git")
+        let log = Command::new(super::git())
             .arg("-C")
             .arg(&repository)
             .args(["log", "--format=%s", "omperor/clean", "-1"])
@@ -739,7 +753,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&scratch).expect("workspace fixture directory");
-        let initialized = Command::new("/usr/bin/git")
+        let initialized = Command::new(super::git())
             .arg("init")
             .arg("--quiet")
             .arg(&scratch)

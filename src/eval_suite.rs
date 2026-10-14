@@ -1415,7 +1415,13 @@ fn apply_reference(task: &Task, workspace: &Path) -> Result<(), String> {
         git(Some(workspace), &["apply", "--whitespace=nowarn", &patch.to_string_lossy()])?;
     }
     if let Some(script) = &task.reference_script {
-        let mut command = Command::new("/bin/bash");
+        // NixOS and others have no /bin/bash.
+        let bash = if cfg!(target_os = "macos") {
+            PathBuf::from("/bin/bash")
+        } else {
+            crate::eval::resolve_program("bash", &task.env)
+        };
+        let mut command = Command::new(bash);
         command
             .arg(script)
             .current_dir(workspace)

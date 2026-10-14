@@ -137,6 +137,8 @@ use typography_settings::TextSizeSettingsUi;
 
 const WINDOW_WIDTH: f64 = 1440.0;
 const WINDOW_HEIGHT: f64 = 900.0;
+/// What the desktop's file manager is called in menus and buttons.
+const FILE_MANAGER: &str = if cfg!(target_os = "macos") { "Finder" } else { "Files" };
 /// Most file rows the `@` reference picker shows at once.
 const FILE_PICKER_MAX_ROWS: usize = 8;
 const FILE_PICKER_ROW_HEIGHT: f64 = 30.0;
@@ -4715,7 +4717,7 @@ impl AppDelegate {
         sessions_path_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         data_card.addSubview(&sessions_path_label);
         let reveal_sessions = settings_button(
-            "Show in Finder",
+            &format!("Show in {FILE_MANAGER}"),
             rect(452.0, 196.0, 124.0, 30.0),
             self,
             sel!(revealOmperorSessions:),
@@ -4739,7 +4741,7 @@ impl AppDelegate {
         data_path_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         data_card.addSubview(&data_path_label);
         let reveal_data = settings_button(
-            "Show in Finder",
+            &format!("Show in {FILE_MANAGER}"),
             rect(452.0, 76.0, 124.0, 30.0),
             self,
             sel!(revealOmpData:),
@@ -5942,7 +5944,7 @@ impl AppDelegate {
             ("arrow.clockwise", "Refresh", sel!(refreshWorkspace:), 44.0),
             (
                 "folder",
-                "Reveal the project in the Finder",
+                &format!("Reveal the project in {}", if cfg!(target_os = "macos") { "the Finder" } else { "Files" }),
                 sel!(revealProject:),
                 72.0,
             ),
@@ -6222,7 +6224,7 @@ impl AppDelegate {
             );
         }
 
-        let footer = text_label("This Mac", 12.0, false, mtm);
+        let footer = text_label(if cfg!(target_os = "macos") { "This Mac" } else { "This computer" }, 12.0, false, mtm);
         footer.setTextColor(Some(&theme::secondary_text()));
         footer.setFrame(rect(20.0, 22.0, 110.0, 18.0));
         view.addSubview(&footer);
@@ -6493,7 +6495,7 @@ impl AppDelegate {
         let items: [(String, objc2::runtime::Sel); 5] = [
             (format!("Open in {editor}"), sel!(openChangeInEditor:)),
             (format!("Open {terminal} Here"), sel!(openChangeInTerminal:)),
-            ("Reveal in Finder".to_owned(), sel!(revealChange:)),
+            (format!("Reveal in {FILE_MANAGER}"), sel!(revealChange:)),
             ("Copy Path".to_owned(), sel!(copyChangePath:)),
             (
                 "Copy Relative Path".to_owned(),
@@ -6596,11 +6598,12 @@ impl AppDelegate {
         let mtm = self.mtm();
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Session"));
         menu.setAutoenablesItems(false);
+        let reveal = format!("Reveal Journal in {FILE_MANAGER}");
         let items: [(&str, objc2::runtime::Sel); 4] = [
             ("Timeline…", sel!(showSessionTimeline:)),
             ("Copy Session ID", sel!(copySessionId:)),
             ("Copy Journal Path", sel!(copySessionJournalPath:)),
-            ("Reveal Journal in Finder", sel!(revealSessionJournal:)),
+            (&reveal, sel!(revealSessionJournal:)),
         ];
         for (index, (title, action)) in items.into_iter().enumerate() {
             if index == 1 || index == 2 {
@@ -17097,7 +17100,7 @@ fn install_main_menu(app: &NSApplication, delegate: &AppDelegate, mtm: MainThrea
     };
     let reveal = unsafe {
         file_menu.addItemWithTitle_action_keyEquivalent(
-            ns_string!("Reveal Project in Finder"),
+            &NSString::from_str(&format!("Reveal Project in {FILE_MANAGER}")),
             Some(sel!(revealProject:)),
             ns_string!("R"),
         )
