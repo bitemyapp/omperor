@@ -2,7 +2,7 @@
 //! worker whenever a tool may have changed files or the folder's watcher
 //! says something did, and the diff of the file selected.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use aizome_kit::prelude::*;
 use super::{App, Diff, Msg, Panel};
 use crate::file_watcher::{ChangeFilter, ProjectWatcher};
 use crate::live_sessions::{LiveSession, SessionKey};
+use crate::markdown::picture::Source;
 use crate::workspace;
 
 /// How long the folder must be quiet before it is read again.
@@ -199,13 +200,21 @@ impl App {
             cx.open_url(target);
             return;
         }
-        // A path the agent wrote: relative to the session's folder.
-        let session = self.session();
-        let path = target.strip_prefix("file://").unwrap_or(target);
-        let path = path.split_once('#').map_or(path, |(p, _)| p);
-        let path = Path::new(path);
-        let path = if path.is_relative() { session.current_project.borrow().join(path) } else { path.to_owned() };
+        // A path the agent wrote, from the session's folder: pictures and
+        // PDFs open in the desktop's viewer, the rest in the editor.
+        const VIEWED: &[&str] =
+            &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico", "svg", "pdf"];
+        let base = self.picture_base(self.session().key);
+        let Source::File(path) = Source::of(target, base.as_deref()) else { return };
+        let viewed = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| VIEWED.contains(&e.to_ascii_lowercase().as_str()));
         let target = target.to_owned();
-        cx.spawn(move || if path.exists() { Msg::OpenInEditor(path) } else { Msg::OpenUrl(target) });
+        cx.spawn(move || match path.exists() {
+            true if viewed => Msg::OpenUrl(format!("file://{}", path.display())),
+            true => Msg::OpenInEditor(path),
+            false => Msg::OpenUrl(target),
+        });
     }
 }

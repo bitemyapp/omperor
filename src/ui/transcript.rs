@@ -21,7 +21,12 @@ pub(super) fn look(app: &App, role: Role) -> Look<Msg> {
         scale: app.preferences.chat_text_size.scale() * 1.08,
         open: Rc::new(Msg::OpenLink),
         copy: Rc::new(Msg::Copy),
-        images: app.images.clone(),
+        pictures: app.preferences.show_inline_images.then(|| md::Pictures {
+            read: app.pictures.clone(),
+            base: app.picture_base(app.session().key),
+            load: Rc::new(Msg::LoadPicture),
+            show: Rc::new(Msg::OpenUrl),
+        }),
         role,
     }
 }

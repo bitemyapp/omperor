@@ -1308,7 +1308,7 @@ mod tests {
             "<kbd>", "<details>", "\\\n", "- [x]", "3. ", "> > ", "> [!NOTE]", "```rust", "```diff",
             "```json", "\n    An indented", "| :--- | :---: | ---: |", "\n---\n", "$$", "```math",
             "flowchart", "sequenceDiagram", "classDiagram", "stateDiagram", "erDiagram", "xychart",
-            "![The crowned gate](markdown-stress.png)",
+            "![The crowned gate](data:image/svg+xml;base64,",
         ] {
             assert!(STRESS_DOCUMENT.contains(construct), "{construct:?}");
         }

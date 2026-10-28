@@ -11,6 +11,7 @@ use aizome_kit::Cx;
 use super::{App, DRAIN_BUDGET, Msg, Row};
 use crate::chat::TranscriptMessageKind;
 use crate::live_sessions::{Lifecycle, LiveSession, SessionHistoryLoad, SessionKey};
+use crate::markdown::picture::{Picture, Source};
 use crate::markdown::{self, Block, Doc};
 use crate::omp_runtime::{self, AuthProvider, OmpRuntime, TurnOutcome, UiEvent};
 use crate::preferences::{self, SessionRecord};
@@ -609,8 +610,8 @@ impl App {
         doc: Arc<Doc>,
         cx: &mut Cx<Msg>,
     ) {
-        let base = self.live.get(key).and_then(|s| s.chat_image_base.borrow().clone());
-        self.request_images(&doc, base, cx);
+        let base = self.picture_base(key);
+        self.request_pictures(&doc, base.as_deref(), cx);
         let Some(view) = self.views.get_mut(&key) else { return };
         let rows = match &agent {
             Some(id) => match view.agent_rows.get_mut(id) {
@@ -626,38 +627,58 @@ impl App {
         }
     }
 
-    /// Load the pictures a document shows, when the preferences allow.
-    fn request_images(&mut self, doc: &Doc, base: Option<std::path::PathBuf>, cx: &mut Cx<Msg>) {
+    /// Read the pictures a document shows that aren't read yet, as the
+    /// preferences allow: each on a worker, shown as loading meanwhile.
+    fn request_pictures(&mut self, doc: &Doc, base: Option<&std::path::Path>, cx: &mut Cx<Msg>) {
         if !self.preferences.show_inline_images {
             return;
         }
-        let mut urls = Vec::new();
-        collect_images(&doc.blocks, &mut urls);
-        for url in urls {
-            if self.images.contains_key(&url) || !self.images_loading.insert(url.clone()) {
-                continue;
+        let mut places = Vec::new();
+        collect_images(&doc.blocks, &mut places);
+        for place in places {
+            let source = Source::of(&place, base);
+            match self.pictures.get(&source.key()) {
+                Some(Picture::Blocked) if self.preferences.load_remote_images => {}
+                Some(_) => continue,
+                None => {}
             }
-            let remote = url.starts_with("http://") || url.starts_with("https://");
-            if remote && !self.preferences.load_remote_images {
-                self.images_loading.remove(&url);
-                continue;
+            if source.is_web() && !self.preferences.load_remote_images {
+                Rc::make_mut(&mut self.pictures).insert(source.key(), Picture::Blocked);
+            } else {
+                self.load_picture(source, cx);
             }
-            let base = base.clone();
-            cx.spawn(move || {
-                let picture = if remote {
-                    load_remote(&url)
-                } else {
-                    let path = url.strip_prefix("file://").unwrap_or(&url);
-                    let path = std::path::Path::new(path);
-                    let path = match (&base, path.is_relative()) {
-                        (Some(base), true) => base.join(path),
-                        _ => path.to_owned(),
-                    };
-                    aizome_kit::Image::open(path).ok()
-                };
-                Msg::ImageLoaded(url, picture)
-            });
         }
+    }
+
+    /// Read `source` on a worker: from the web too, when the reader asks.
+    pub(crate) fn load_picture(&mut self, source: Source, cx: &mut Cx<Msg>) {
+        let key = source.key();
+        Rc::make_mut(&mut self.pictures).insert(key, Picture::Loading);
+        cx.spawn(move || Msg::PictureLoaded(key, source.load()));
+    }
+
+    /// Every open transcript's pictures, once the preferences let more show.
+    pub(crate) fn request_all_pictures(&mut self, cx: &mut Cx<Msg>) {
+        let mut docs = Vec::new();
+        for (key, view) in &self.views {
+            let base = self.picture_base(*key);
+            for row in view.rows.iter().chain(view.agent_rows.values().flatten()) {
+                if let Some((_, doc)) = &row.doc {
+                    docs.push((doc.clone(), base.clone()));
+                }
+            }
+        }
+        for (doc, base) in docs {
+            self.request_pictures(&doc, base.as_deref(), cx);
+        }
+    }
+
+    /// Where a session's answers' relative paths start: the folder its
+    /// agent works in.
+    pub(crate) fn picture_base(&self, key: SessionKey) -> Option<std::path::PathBuf> {
+        let session = self.live.get(key)?;
+        let base = session.chat_image_base.borrow().clone();
+        base.or_else(|| Some(session.current_project.borrow().clone()))
     }
 }
 
@@ -683,14 +704,6 @@ fn collect_images(blocks: &[Block], urls: &mut Vec<String>) {
             _ => {}
         }
     }
-}
-
-/// Fetch a picture from the web (only with Load remote images on).
-fn load_remote(url: &str) -> Option<aizome_kit::Image> {
-    const MAX_BYTES: u64 = 16 * 1024 * 1024;
-    let response = ureq::get(url).call().ok()?;
-    let bytes = response.into_body().with_config().limit(MAX_BYTES).read_to_vec().ok()?;
-    aizome_kit::Image::decode(bytes)
 }
 
 impl App {

@@ -163,7 +163,7 @@ fn a_turn_streams_its_tools_and_answer_and_the_composer_comes_back() {
     run.shot("markdown");
     // Its math and its diagrams, each section scrolled to the top.
     // (The transcript makes only the rows it shows: scroll until it's there.)
-    for (heading, name) in [("Math", "math"), ("Diagrams", "diagrams")] {
+    for (heading, name) in [("Math", "math"), ("Diagrams", "diagrams"), ("Images and HTML", "pictures-in-answers")] {
         let mut found = run.h.find(w, heading);
         for _ in 0..80 {
             if found.is_some_and(|at| at.y0 > 0.0) {
@@ -188,6 +188,11 @@ fn a_turn_streams_its_tools_and_answer_and_the_composer_comes_back() {
             run.h.command(w, 'c');
             let copied = run.h.platform.clipboard.clone().unwrap_or_default();
             assert!(copied.contains("Inline $e^{i\\pi} + 1 = 0$ and $\\sum_{k=1}^{n} k"), "{copied}");
+        }
+        if name == "pictures-in-answers" {
+            // The crown the answer holds, as an SVG in a data: URL.
+            let at = run.h.find_id(w, "picture").expect("the picture shows");
+            assert!((at.width() - 162.0).abs() < 1.0 && (at.height() - 162.0).abs() < 1.0, "{at:?}");
         }
     }
     // ↑ in the empty composer brings the prompt back.
@@ -456,4 +461,44 @@ fn a_pasted_picture_is_read_and_attached_on_a_worker() {
     assert_eq!(attachments.items[0].name, "Pasted image.png");
     assert!(!attachments.blocked(), "{:?}", attachments.items[0].result);
     assert!(run.h.program().view_of(session.key).unwrap().editor.text().is_empty(), "no text was pasted");
+}
+
+#[test]
+fn pictures_in_messages_show_from_the_session_s_folder_and_open_with_a_click() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut run = boot("pictures");
+    let project = run.h.program().session().current_project.borrow().clone();
+    image::RgbaImage::from_pixel(240, 120, image::Rgba([122, 162, 247, 255])).save(project.join("plot.png")).unwrap();
+    let w = run.w;
+    run.prompt("![the plot](plot.png)");
+    let shown = |app: &App| {
+        let key = crate::markdown::picture::Source::File(project.join("plot.png")).key();
+        matches!(app.pictures.get(&key), Some(crate::markdown::picture::Picture::Shown(_)))
+    };
+    run.until("the picture is read", shown);
+    run.h.advance(Duration::from_millis(20));
+    let at = run.h.find_id(w, "picture").expect("the picture shows");
+    assert!((at.width() - 242.0).abs() < 1.0 && (at.height() - 122.0).abs() < 1.0, "as large as it is: {at:?}");
+    run.h.click(w, at.center());
+    assert_eq!(run.h.platform.opened, [format!("file://{}", project.join("plot.png").display())]);
+
+    // One that isn't there, and one on the web, say why they don't show.
+    run.until("the turn is done", |app| !app.session().chat_busy.get());
+    let composer = run.h.find_id(w, "composer").expect("the composer");
+    run.h.click(w, composer.center());
+    run.prompt("![gone](gone.png)");
+    run.until("the missing picture is tried", |app| {
+        app.pictures.values().any(|p| matches!(p, crate::markdown::picture::Picture::Failed(_)))
+    });
+    run.until("the turn is done", |app| !app.session().chat_busy.get());
+    run.h.click(w, composer.center());
+    run.prompt("![remote](https://example.test/remote.png)");
+    run.until("the web picture is kept off", |app| {
+        app.pictures.values().any(|p| matches!(p, crate::markdown::picture::Picture::Blocked))
+    });
+    run.h.advance(Duration::from_millis(20));
+    let texts = run.texts();
+    assert!(texts.contains("There's no file at") && texts.contains("gone.png"), "{texts}");
+    assert!(texts.contains("Settings keeps answers from loading pictures from the web"), "{texts}");
+    run.shot("pictures");
 }

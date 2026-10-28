@@ -73,13 +73,15 @@ from these sources:
   Omperor's environment.
 - **Agent tools** reach whatever hosts the agent's commands and browser
   contact.
-- **Images in the transcript.** With Settings → Appearance → **Show images**
-  on (the default), Omperor itself fetches any `http` or `https` image that
-  appears in a message's Markdown, including the agent's replies, with a
-  plain GET request. The image's host sees your IP address, and anything the
-  agent placed in the URL. With the setting on, Markdown images that name an
-  absolute local path or a `file://` URL are also read from disk and
-  displayed. Turn the setting off to stop both.
+- **Pictures in the transcript.** With Settings ▸ General ▸ **Show pictures
+  in answers** on (the default), Omperor reads the files that Markdown
+  images in messages name, the agent's replies included: relative paths from
+  the session's folder, absolute paths, `~/` and `file://` URLs, as well as
+  pictures held in `data:` URLs. It fetches `http` and `https` pictures only
+  with **Load pictures from the web** on (off by default), or when you press
+  a picture's **Load** button, with a plain GET request: the picture's host
+  sees your IP address and anything the agent placed in the URL. Turn Show
+  pictures off to stop all of it.
 - **Links and sign-in pages** open in your default browser only when you click
   them or start a sign-in.
 

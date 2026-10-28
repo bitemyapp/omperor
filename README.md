@@ -60,11 +60,14 @@ fonts installed.
   file tree and highlighted diffs, and opens a file in your editor or a
   terminal in its folder.
 - **Rendering.** Answers are Markdown, drawn by the app: headings, lists,
-  tables, quotes and callouts, code highlighted in the theme's colours, and
-  pictures. Math (between `$`s, `$$`s, `\(…\)` or `\[…\]`) is set as KaTeX
-  sets it, in its lines or on its own, and copying a formula gives back its
-  LaTeX. Mermaid diagrams are laid out as Mermaid lays them out and drawn in
-  the desktop's type and colours.
+  tables, quotes and callouts, and code highlighted in the theme's colours.
+  Pictures show from files (a relative path is read from the session's
+  folder), from `data:` URLs, and from the web when Settings allows it or
+  you ask for one; SVGs stay sharp at any size, and a click opens a
+  picture in its viewer. Math (between `$`s, `$$`s, `\(…\)` or `\[…\]`)
+  is set as KaTeX sets it, in its lines or on its own, and copying a
+  formula gives back its LaTeX. Mermaid diagrams are laid out as Mermaid
+  lays them out and drawn in the desktop's type and colours.
 - **Looking back.** A session's Timeline puts every prompt, response and tool
   call on one clock with how long each took, filtered by kind, model, a
   minimum duration or a search. Its Usage window breaks the tokens into

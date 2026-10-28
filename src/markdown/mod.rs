@@ -14,6 +14,8 @@
 pub(crate) mod diagram;
 pub(crate) mod highlight;
 pub(crate) mod math;
+pub(crate) mod picture;
+pub(crate) mod svg;
 pub(crate) mod view;
 
 use std::borrow::Cow;

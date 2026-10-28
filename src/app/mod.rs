@@ -42,6 +42,7 @@ use crate::chat::TranscriptMessage;
 use crate::housekeeping;
 use crate::live_sessions::{LiveSession, LiveSessions, SessionKey};
 use crate::markdown::Doc;
+use crate::markdown::picture::{Picture, Source};
 use crate::omp_runtime::{AccountUsage, AuthMethod, AuthPrompt, AuthProvider};
 use crate::preferences::{self, Preferences, Project, SessionRecord, StoredAccount};
 use crate::rules::{AccountEntry, SessionSourceFilter};
@@ -337,9 +338,8 @@ pub(crate) struct App {
     pub(crate) sign_in_generation: u64,
     // Archives.
     pub(crate) archives: Option<Result<Vec<archive::Listing>, String>>,
-    // Images loaded for answers, by path.
-    pub(crate) images: Rc<HashMap<String, Image>>,
-    pub(crate) images_loading: HashSet<String>,
+    // Pictures in answers, by where they come from (Source::key).
+    pub(crate) pictures: Rc<HashMap<u64, Picture>>,
     // Work and time.
     pub(crate) jobs: HashMap<u64, Job>,
     pub(crate) next_job: u64,
@@ -448,7 +448,9 @@ pub(crate) enum Msg {
     OpenLink(String),
     /// Hand `target` to the desktop as it is.
     OpenUrl(String),
-    ImageLoaded(String, Option<Image>),
+    PictureLoaded(u64, Picture),
+    /// Read a picture on the web that Settings keeps answers from reading.
+    LoadPicture(Source),
     // The panel beside the conversation.
     ShowPanel(Panel),
     TogglePanel,
@@ -569,8 +571,7 @@ impl App {
             sign_in: None,
             sign_in_generation: 0,
             archives: None,
-            images: Rc::new(HashMap::new()),
-            images_loading: HashSet::new(),
+            pictures: Rc::new(HashMap::new()),
             jobs: HashMap::new(),
             next_job: 0,
             frame: None,
@@ -931,12 +932,10 @@ impl Program for App {
             }
             Msg::OpenLink(target) => self.open_link(&target, cx),
             Msg::OpenUrl(target) => cx.open_url(&target),
-            Msg::ImageLoaded(url, picture) => {
-                self.images_loading.remove(&url);
-                if let Some(picture) = picture {
-                    Rc::make_mut(&mut self.images).insert(url, picture);
-                }
+            Msg::PictureLoaded(key, picture) => {
+                Rc::make_mut(&mut self.pictures).insert(key, picture);
             }
+            Msg::LoadPicture(source) => self.load_picture(source, cx),
             // The panel.
             Msg::ShowPanel(panel) => self.show_panel(panel, cx),
             Msg::TogglePanel => {
@@ -1027,10 +1026,12 @@ impl Program for App {
             Msg::SetInlineImages(on) => {
                 self.preferences.show_inline_images = on;
                 self.store_preferences(cx);
+                self.request_all_pictures(cx);
             }
             Msg::SetRemoteImages(on) => {
                 self.preferences.load_remote_images = on;
                 self.store_preferences(cx);
+                self.request_all_pictures(cx);
             }
             Msg::SetLauncher(kind, index) => self.set_launcher(kind, index, cx),
             Msg::SetDefaultModel(model) => {

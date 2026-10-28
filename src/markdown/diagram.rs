@@ -1,18 +1,16 @@
 //! Mermaid diagrams, laid out as Mermaid lays them out (merman), in the
 //! desktop's type and colours. merman writes SVG for a theme made from
-//! Aizome's palette, its labels measured in Archivo as the kit sets it;
-//! usvg reads the SVG, setting the labels in Archivo and turning them into
-//! outlines; and what it holds becomes shapes the kit fills and strokes at
-//! any size. Each diagram is drawn in every palette as its answer is
-//! parsed (a worker's job), so Night and Day switch without drawing again,
-//! and a diagram drawn once is kept.
+//! Aizome's palette, its labels measured in Archivo as the kit sets it,
+//! and the SVG becomes shapes the kit draws at any size ([`super::svg`]).
+//! Each diagram is drawn in every palette as its answer is parsed (a
+//! worker's job), so Night and Day switch without drawing again, and a
+//! diagram drawn once is kept.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use aizome_kit::sidestep_ui::kurbo::{Affine, BezPath, Point, Size};
-use aizome_kit::sidestep_ui::{Canvas, Font, LineCap, LineJoin, StrokeStyle, TextStyle};
+use aizome_kit::sidestep_ui::TextStyle;
 use aizome_kit::theme::ThemeName;
 use aizome_kit::{Color, FontSpec, Role, Theme};
 use merman::svg::{
@@ -20,6 +18,8 @@ use merman::svg::{
     TextMeasurementPolicy, TextMeasurementProfile, TextMeasurementProfileIdentity, ThemeRole,
 };
 use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgEnvironment, SvgRequest};
+
+use super::svg::Picture;
 
 /// The palettes a diagram is drawn in, in [`Diagram::drawn`]'s order.
 const PALETTES: [ThemeName; 3] = [ThemeName::Night, ThemeName::Day, ThemeName::HighContrast];
@@ -63,34 +63,6 @@ impl Diagram {
             .find(|l| !l.is_empty() && !l.starts_with("%%") && !l.starts_with("---") && !l.contains(':'))
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or("mermaid")
-    }
-}
-
-/// A diagram in one palette: its size in points, and its shapes.
-pub(crate) struct Picture {
-    pub(crate) size: Size,
-    shapes: Vec<Shape>,
-}
-
-enum Shape {
-    /// Filled (by the even-odd rule when it says so).
-    Fill(BezPath, Color, bool),
-    Stroke(BezPath, StrokeStyle, Color),
-}
-
-impl Picture {
-    /// Draw it with its top left at `origin`, `scale` times its size.
-    pub(crate) fn paint(&self, canvas: &mut Canvas, origin: Point, scale: f64) {
-        canvas.saved(|c| {
-            c.concat(Affine::translate(origin.to_vec2()) * Affine::scale(scale));
-            for shape in &self.shapes {
-                match shape {
-                    Shape::Fill(path, color, false) => c.fill(path, *color),
-                    Shape::Fill(path, color, true) => c.fill_even_odd(path, *color),
-                    Shape::Stroke(path, style, color) => c.stroke(path, style, *color),
-                }
-            }
-        });
     }
 }
 
@@ -188,12 +160,7 @@ fn picture(source: &str, palette: ThemeName) -> Result<Picture, String> {
     };
     let output = renderer.render(RenderRequest::svg(source, OperationControl::new(), request)).map_err(|e| e.to_string())?;
     let RenderOutput::Svg(Some(svg)) = output else { return Err("This isn't a diagram Mermaid knows.".into()) };
-    let options = usvg::Options { fontdb: fonts(), font_family: ui_family(&t), ..usvg::Options::default() };
-    let tree = usvg::Tree::from_str(svg.svg(), &options).map_err(|e| e.to_string())?;
-    let mut shapes = Vec::new();
-    collect(tree.root(), 1.0, &mut shapes);
-    let size = tree.size();
-    Ok(Picture { size: Size::new(f64::from(size.width()), f64::from(size.height())), shapes })
+    super::svg::read(svg.svg().as_bytes(), Some(&ui_family(&t)))
 }
 
 /// Labels measured as the kit lays text out, in the face it draws them in.
@@ -220,103 +187,10 @@ fn measured_as_drawn(t: &Theme) -> Result<TextMeasurementPolicy, String> {
     Ok(TextMeasurementPolicy::uniform(TextMeasurementProfile::new(identity, measurer)))
 }
 
-/// The faces usvg sets labels in: Aizome's, where the kit finds them, then
-/// the system's. Read once, by the first diagram.
-fn fonts() -> Arc<usvg::fontdb::Database> {
-    static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
-    FONTS
-        .get_or_init(|| {
-            let mut db = usvg::fontdb::Database::new();
-            if let Some(dir) = std::env::var_os("AIZOME_FONT_DIR") {
-                db.load_fonts_dir(dir);
-            }
-            for dir in aizome_kit::fonts::font_dirs() {
-                db.load_fonts_dir(dir);
-            }
-            db.load_system_fonts();
-            db.set_sans_serif_family(Font::system(LABEL_SIZE).family_name());
-            Arc::new(db)
-        })
-        .clone()
-}
-
-/// The shapes `group` holds, as drawn, at `opacity`.
-fn collect(group: &usvg::Group, opacity: f32, shapes: &mut Vec<Shape>) {
-    let opacity = opacity * group.opacity().get();
-    for node in group.children() {
-        match node {
-            usvg::Node::Group(g) => collect(g, opacity, shapes),
-            usvg::Node::Text(t) => collect(t.flattened(), opacity, shapes),
-            usvg::Node::Path(p) if p.is_visible() => {
-                let t = p.abs_transform();
-                let place = Affine::new([t.sx, t.ky, t.kx, t.sy, t.tx, t.ty].map(f64::from));
-                let path = place * bez(p.data());
-                let fill = p.fill().and_then(|f| {
-                    let color = color(f.paint(), f.opacity().get() * opacity)?;
-                    Some(Shape::Fill(path.clone(), color, f.rule() == usvg::FillRule::EvenOdd))
-                });
-                let stroke = p.stroke().and_then(|s| {
-                    let color = color(s.paint(), s.opacity().get() * opacity)?;
-                    let scale = place.determinant().abs().sqrt();
-                    let mut style = StrokeStyle::new(f64::from(s.width().get()) * scale)
-                        .with_cap(match s.linecap() {
-                            usvg::LineCap::Butt => LineCap::Butt,
-                            usvg::LineCap::Round => LineCap::Round,
-                            usvg::LineCap::Square => LineCap::Square,
-                        })
-                        .with_join(match s.linejoin() {
-                            usvg::LineJoin::Round => LineJoin::Round,
-                            usvg::LineJoin::Bevel => LineJoin::Bevel,
-                            _ => LineJoin::Miter,
-                        });
-                    if let Some(dashes) = s.dasharray() {
-                        let dashes = dashes.iter().map(|d| f64::from(*d) * scale).collect();
-                        style = style.with_dash(dashes, f64::from(s.dashoffset()) * scale);
-                    }
-                    Some(Shape::Stroke(path.clone(), style, color))
-                });
-                let both = match p.paint_order() {
-                    usvg::PaintOrder::FillAndStroke => [fill, stroke],
-                    usvg::PaintOrder::StrokeAndFill => [stroke, fill],
-                };
-                shapes.extend(both.into_iter().flatten());
-            }
-            _ => {}
-        }
-    }
-}
-
-/// A paint's colour (a gradient's first), at `opacity`.
-fn color(paint: &usvg::Paint, opacity: f32) -> Option<Color> {
-    let (c, a) = match paint {
-        usvg::Paint::Color(c) => (*c, 1.0),
-        usvg::Paint::LinearGradient(g) => g.stops().first().map(|s| (s.color(), s.opacity().get()))?,
-        usvg::Paint::RadialGradient(g) => g.stops().first().map(|s| (s.color(), s.opacity().get()))?,
-        usvg::Paint::Pattern(_) => return None,
-    };
-    let alpha = (a * opacity).clamp(0.0, 1.0);
-    (alpha > 0.0).then(|| Color::rgba8(c.red, c.green, c.blue, (alpha * 255.0).round() as u8))
-}
-
-fn bez(path: &usvg::tiny_skia_path::Path) -> BezPath {
-    use usvg::tiny_skia_path::PathSegment;
-    let p = |p: usvg::tiny_skia_path::Point| (f64::from(p.x), f64::from(p.y));
-    let mut out = BezPath::new();
-    for segment in path.segments() {
-        match segment {
-            PathSegment::MoveTo(a) => out.move_to(p(a)),
-            PathSegment::LineTo(a) => out.line_to(p(a)),
-            PathSegment::QuadTo(a, b) => out.quad_to(p(a), p(b)),
-            PathSegment::CubicTo(a, b, c) => out.curve_to(p(a), p(b), p(c)),
-            PathSegment::Close => out.close_path(),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::svg::Shape;
 
     #[test]
     fn a_flowchart_is_drawn_in_every_palette_with_its_labels() {
