@@ -29,7 +29,7 @@ const OPENAI_API_PROVIDER: &str = "openai";
 const ANTHROPIC_PROVIDER: &str = "anthropic";
 const OMP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 // Serialize shared-store initialization, not interactive sessions. Acquired only
-// asynchronously on RPC workers, never on the AppKit thread.
+// asynchronously on RPC workers, never on the interface thread.
 static STARTUP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Native tool roster for GUI sessions, restricted to names the journal-first
 /// OMP registry validates at launch.
@@ -915,7 +915,7 @@ impl UiEventSender {
         let sent = self.0.send((std::time::Instant::now(), event)).is_ok();
         #[cfg(not(test))]
         if sent && wake {
-            crate::gui_wake::notify();
+            crate::wake::notify();
         }
         #[cfg(test)]
         let _ = wake;
@@ -1435,7 +1435,7 @@ async fn run_client(
             StartupWait::Released => return ClientExit::Released,
             StartupWait::Shutdown => return ClientExit::Shutdown,
         };
-    // Startup owns filesystem initialization on the runtime worker, never AppKit.
+    // Startup owns filesystem initialization on the runtime worker, never the interface thread.
     // A fresh application HOME has no OMP directories or credential key yet.
     for directory in [&launch.data_dir, &launch.session_dir] {
         if let Err(error) = std::fs::create_dir_all(directory) {
@@ -2568,52 +2568,23 @@ fn credential_source(configured: Option<String>) -> String {
         .unwrap_or_else(|| "local-file".into())
 }
 
-/// Evals share Dev's store, so prefer its exact packaged helper identity too.
-/// Called by the headless dispatcher; filesystem probes never run on AppKit.
-pub(crate) fn eval_executable() -> PathBuf {
-    if let Some(path) = env::var_os("OMPEROR_OMP_EXECUTABLE").filter(|value| !value.is_empty()) {
-        return path.into();
-    }
-    if let Ok(current) = env::current_exe()
-        && let Some(contents) = current.parent().and_then(Path::parent)
-        && contents.file_name().is_some_and(|name| name == "Contents")
-        && let Some(parent) = contents.parent().and_then(Path::parent)
-    {
-        let development = parent.join("Omperor Dev.app/Contents/Helpers/omp");
-        if development.is_file() {
-            return development;
-        }
-    }
-    let source = Path::new(option_env!("OMPEROR_SOURCE_DIR").unwrap_or(env!("CARGO_MANIFEST_DIR")));
-    let development = source.join("target/Omperor Dev.app/Contents/Helpers/omp");
-    if development.is_file() {
-        return development;
-    }
-    omp_executable()
-}
-
-fn omp_executable() -> PathBuf {
+/// The OMP helper to run: `OMPEROR_OMP_EXECUTABLE`, else the installed one
+/// beside the binary (`<prefix>/libexec/omperor/omp` for
+/// `<prefix>/bin/omperor`), else the one `scripts/build-omp-helper.sh`
+/// built in the source tree. Called from workers; it probes the disk.
+pub(crate) fn omp_executable() -> PathBuf {
     if let Some(path) = env::var_os("OMPEROR_OMP_EXECUTABLE").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
     }
     if let Ok(current) = env::current_exe()
-        && let Some(contents) = current.parent().and_then(Path::parent)
+        && let Some(prefix) = current.parent().and_then(Path::parent)
     {
-        let bundled = contents.join("Helpers/omp");
-        if bundled.is_file() {
-            return bundled;
+        let installed = prefix.join("libexec/omperor/omp");
+        if installed.is_file() {
+            return installed;
         }
     }
-    // Prefer this channel's packaged helper so bare launches use the same
-    // patched runtime as the GUI. State namespaces isolate environment services.
     let source = Path::new(option_env!("OMPEROR_SOURCE_DIR").unwrap_or(env!("CARGO_MANIFEST_DIR")));
-    let packaged = source.join(format!(
-        "target/{}.app/Contents/Helpers/omp",
-        crate::app_state::Channel::current().app_name(),
-    ));
-    if packaged.is_file() {
-        return packaged;
-    }
     source.join("target/omperor-helpers/omp")
 }
 
@@ -2835,8 +2806,8 @@ fn turn_error_reason(event: &RpcEvent, raw: &str) -> String {
             }
         }
     };
-    if encoding_failed {
-        if let Some(code) = text("errorCode").filter(|code| {
+    if encoding_failed
+        && let Some(code) = text("errorCode").filter(|code| {
             code.len() <= 128
                 && code
                     .bytes()
@@ -2844,7 +2815,6 @@ fn turn_error_reason(event: &RpcEvent, raw: &str) -> String {
         }) {
             reason.push_str(&format!(" [{code}]"));
         }
-    }
     if let Some(status) = event.get("errorStatus").and_then(Value::as_u64) {
         reason.push_str(&format!(" (HTTP {status})"));
     }

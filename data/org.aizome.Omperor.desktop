@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Omperor
+GenericName=Coding Agents
+Comment=Give a coding agent a project and a task, and follow its work as it happens
+Keywords=agent;ai;coding;llm;omp;assistant;programming;
+Categories=Development;IDE;
+Icon=org.aizome.Omperor
+Exec=omperor %F
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.aizome.Omperor
+DBusActivatable=false

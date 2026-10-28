@@ -2,6 +2,8 @@
 
 Status: living product specification. Owner: Christopher Allen. Updated: 2026-09-17. This document records the product goals supplied by the owner, the design interpretation guiding the current prototype, and backend requirements that remain future work. Paragraphs intentionally have no internal line breaks so the document is easy to edit.
 
+_Note, October 2026: Omperor is now a native Aizome app. The Agent Observatory described below is realized as the Agents panel beside the conversation (agents by state with a search and an attention lens, one opened with its recorded work, and Discuss quoting it into the draft); side-by-side comparison of several agents is not carried over yet. Per-context chat font sizes gave way to the desktop's own Size setting and one text-size choice for conversations._
+
 ## Purpose
 
 Omperor is ChatGPT for power users and oh-my-pi for the rest of us: a beautiful, native, readable environment for working with capable agents, from one conversation to large distributed workloads. Its advantage should be greater productivity, efficiency, control, and legibility without requiring users to become terminal multiplexer operators. The emperor pun is intentional; the interface should communicate capability through useful information and direct control, not military language or a command-and-conquer metaphor.
@@ -73,13 +75,13 @@ Typography must work on high-density desktop displays without crowding the inter
 
 ### Visual quality of design prototypes
 
-A native design mock must meet a high visual standard even when inference and remote execution are simulated. AppKit widgets need deliberate composition, clear controls, accurate alignment, intentional truncation, readable hierarchy, and finished visual treatments. Review the actual app in both appearances, at ordinary and minimum window sizes, and with small and large workloads before presenting an iteration.
+A native design mock must meet a high visual standard even when inference and remote execution are simulated. Widgets need deliberate composition, clear controls, accurate alignment, intentional truncation, readable hierarchy, and finished visual treatments. Review the actual app in both appearances, at ordinary and minimum window sizes, and with small and large workloads before presenting an iteration.
 
 Agents must be recognizable by task name without memorizing numbered glyphs or hovering for basic information. Expose state in words and a distinct symbol, retain a visible route to deeper evidence, and make pin selection obvious. Let the user allocate space between swarm browsing and retained evidence without leaving the session. A swarm surface must show materially more agents than the sidebar; a few rows behind repeated pagination is insufficient. Lists should grow with the window, scroll continuously and independently, and offer local density and expansion controls. Keep pinned evidence reachable when browsing takes priority. Avoid nesting the agent lists in a scrolling page: a gesture over an agent list should move that list, while filters, the other group, and retained evidence stay stationary. Use fixed sibling areas and local space-allocation controls to support browsing and reading without competing scroll targets. Nested scrolling inside retained evidence cards is less disruptive and can remain where needed. Show one agent browser at a time: when the full side panel is open, give the Observatory’s center to pinned evidence; when it closes, restore the compact overview. Running and finished work need independent access so a large active batch cannot crowd completed results out of view. Counts, empty states, visible ranges, timestamps, and selected controls must describe the data being shown accurately. Sample clocks should remain deterministic across long review sessions.
 
 ### Native behavior and responsiveness
 
-Use native macOS text, menus, keyboard navigation, focus behavior, accessibility labels, and scalable drawing. Important controls should be discoverable with the mouse and efficient from the keyboard. Keep the GUI main thread free of non-trivial computation, filesystem work, subprocesses, network calls, and OMP interactions. Background operations must show an active state and deliver results asynchronously.
+Use the desktop's own text, menus, keyboard navigation, focus behavior, accessibility labels, and scalable drawing, through Aizome's toolkit. Important controls should be discoverable with the mouse and efficient from the keyboard. Keep the interface thread free of non-trivial computation, filesystem work, subprocesses, network calls, and OMP interactions. Background operations must show an active state and deliver results asynchronously.
 
 ## The bitter lesson: tools that let agents reason
 

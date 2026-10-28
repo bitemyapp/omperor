@@ -1,9 +1,0 @@
-{
-  "samples": 20,
-  "seconds": 20.060364791192114,
-  "cpu_ms": 5.127458333333333,
-  "mean_core_percent": 0.025560145025800535,
-  "idle_wakeups": 0,
-  "interrupt_wakeups": 85,
-  "footprint_mib": 127.89181518554688
-}

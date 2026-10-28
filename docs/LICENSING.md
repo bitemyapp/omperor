@@ -19,22 +19,18 @@ release-preparation record, not a complete binary attribution bundle.
 | Component | Applicable licenses and notices |
 | --- | --- |
 | `vendor/oh-my-pi` | Its [MIT license](../vendor/oh-my-pi/LICENSE) applies to first-party OMP code unless a package says otherwise. Its [third-party notices](../vendor/oh-my-pi/THIRD-PARTY-NOTICES.txt) include package-specific terms, MPL-2.0 dependencies, Python notices, and explicit exclusions. |
-| `vendor/upleft` | Its [MIT license](../vendor/upleft/LICENSE) has exceptions for individual components. In particular, [`upleft-elk`](../vendor/upleft/crates/elk/Cargo.toml) retains [EPL-2.0](../vendor/upleft/crates/elk/LICENSE). Omperor enables the Mermaid renderer's default ELK feature. |
-| `vendor/sidestep` | [MIT](../vendor/sidestep/LICENSE-MIT) OR [Apache-2.0](../vendor/sidestep/LICENSE-APACHE), with separate notices for incorporated third-party material. |
-| Math font bundle | SwiftMath's font tables and code keep their [MIT notice](../vendor/upleft/vendor/downright/Vendor/SwiftMath/Sources/SwiftMath/mathFonts.bundle/LICENSE). Latin Modern Math and TeX Gyre Termes Math are under the [GUST Font License](../vendor/upleft/vendor/downright/Vendor/SwiftMath/Sources/SwiftMath/mathFonts.bundle/GUST-FONT-LICENSE.txt), which refers to LPPL-1.3c-or-later. XITS Math is under the [STIX Font License](../vendor/upleft/vendor/downright/Vendor/SwiftMath/Sources/SwiftMath/mathFonts.bundle/OFL.txt), which is based on SIL OFL 1.1. Asana, Euler, Fira, Garamond, KpMath (Light and Sans), Lete Sans, Libertinus and Noto Sans Math are under SIL OFL 1.1, stated in each font's name table. Preserve the fonts' copyright notices and reserved font names. |
+| `vendor/sekka` | Aizome and its toolkit, `aizome-kit` (`desktop/aizome`), are [MIT](../vendor/sekka/desktop/aizome/Cargo.toml) OR Apache-2.0. Sekka as a whole carries an [Apache-2.0 license](../vendor/sekka/LICENSE) and a [NOTICE](../vendor/sekka/NOTICE) for adapted material. |
+| `vendor/sekka/vendor/sidestep` | [MIT](../vendor/sekka/vendor/sidestep/LICENSE-MIT) OR [Apache-2.0](../vendor/sekka/vendor/sidestep/LICENSE-APACHE), with separate notices for incorporated third-party material. |
+| Syntax highlighting | `syntect` is MIT. `two-face` is MIT OR Apache-2.0 and bundles `bat`'s syntax definitions, each under its own license (MIT, Apache-2.0, BSD and others), listed with the crate. |
+| Math | The RaTeX crates (`ratex-*`) are MIT. `ratex-katex-fonts` embeds KaTeX's fonts, which are under the SIL Open Font License 1.1 (`fonts/FONT_NOTICE.txt` and `fonts/OFL.txt` in that crate). `skrifa` is MIT OR Apache-2.0. |
+| Diagrams | `merman` and the parts of it Omperor uses (`merman-core`, `merman-render`, `dugong`, `manatee`) are MIT OR Apache-2.0; `merman-unicode-linebreak` is Apache-2.0. Omperor leaves out merman's ELK layout, whose port (`merman-elk-layered`) is EPL-2.0. `usvg` is Apache-2.0 OR MIT. |
+| Fonts | Omperor bundles none: Aizome's session provides Archivo, IBM Plex Mono and Noto Sans Symbols 2 (SIL OFL 1.1). The dev shell links the same files for tests (`nix/aizome-fonts.nix`). |
 | Other Rust and native dependencies | Follow each package's license and attribution terms, including those of bundled native libraries and data. Inspect the resolved dependencies for each release target and feature set. |
 
 The dependency versions reviewed were OMP
-`12d59c0937e1e5ed1b52dee3d237279521fe847f`, Upleft
-`4b28a9e758dc1f8832d1d902857dc2348931516b`, and Sidestep
-`5e5c08b19ceaa84e3add0fc4019bf1ffbdfc98bb`.
-
-EPL-2.0's source and notice obligations still apply to `upleft-elk`, including
-modifications to that component. Its source must remain available under EPL-2.0,
-and distributions must tell recipients how to obtain it. Omperor's separate
-application code is offered under the root dual license; that does not turn
-the ELK implementation into MIT/Apache code. See
-[EPL-2.0 sections 1 and 3](https://www.eclipse.org/org/documents/epl-2.0/EPL-2.0.txt).
+`12d59c0937e1e5ed1b52dee3d237279521fe847f`, Sekka
+`4dc885718ce48fd5555adff48908ab517efb62fe` (with Omperor's toolkit
+additions on top), and Sidestep `dae957e913376a26e642d6abee533eb755fb9092`.
 
 ## Before a public release
 
@@ -53,12 +49,11 @@ the ELK implementation into MIT/Apache code. See
 3. Ship the license texts, copyright notices, and source-availability statements
    required by the actual release payload. Cover the Omperor executable,
    patched OMP helper, embedded Python, native libraries, fonts, and other
-   bundled data. Include matching EPL/MPL source or working source locations.
-   `scripts/build-app.sh` currently preserves the font bundle's notices but
-   does not assemble an app-wide license and attribution bundle.
+   bundled data. Include matching MPL source or working source locations.
+   `just install` does not yet assemble a license and attribution bundle.
 
 The root Cargo dependency inventory was checked with
 `cargo metadata --locked --offline --format-version 1`. It does not cover the
 complete separately built OMP helper or all bundled assets. Refresh the
-inventory against both Cargo lockfiles, the helper, and the packaged files
+inventory against the Cargo lockfile, the helper, and the packaged files
 before distributing a release.

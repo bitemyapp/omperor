@@ -1,5 +1,5 @@
 {
-  description = "Dev shell for Omperor's Linux build through Sidestep";
+  description = "Omperor, a native Aizome app for coding agents: its dev shell";
 
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1";
@@ -20,6 +20,10 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
+      packages = forAllSystems (pkgs: {
+        aizome-fonts = pkgs.callPackage ./nix/aizome-fonts.nix { };
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [
@@ -29,16 +33,15 @@
               sha256 = "sha256-lYQxtgBt4zZfd4p7QDOaE26H7qwHwl9Pny1he+Nmn+s=";
             })
             pkgs.just
-            # scripts/linux-cargo and scripts/linux-prepare.py. An environment
-            # rather than python3 itself, whose setup hook (for building
-            # nixpkgs packages) sets PYTHONPATH and _PYTHON_SYSCONFIGDATA_NAME
-            # for every interpreter, the OMP helper's embedded one included.
+            # scripts/test-concurrent-rpc.py. An environment rather than
+            # python3 itself, whose setup hook (for building nixpkgs
+            # packages) sets PYTHONPATH and _PYTHON_SYSCONFIGDATA_NAME for
+            # every interpreter, the OMP helper's embedded one included.
             (pkgs.python3.withPackages (_: [ ]))
             pkgs.git
             pkgs.util-linux
-            # scripts/build-omp-helper.sh (shasum) and the embedded Python it
-            # fetches (crates/py/scripts/fetch-python.sh in vendor/oh-my-pi).
-            pkgs.perl
+            # The embedded Python scripts/build-omp-helper.sh fetches
+            # (crates/py/scripts/fetch-python.sh in vendor/oh-my-pi).
             pkgs.curl
             pkgs.zstd
             pkgs.uv
@@ -68,6 +71,8 @@
           ];
           # Keep nix develop's ./outputs/out/lib out of the binary's RUNPATH.
           env.NIX_NO_SELF_RPATH = "1";
+          # Aizome's type for tests, screenshots and runs outside the session.
+          env.AIZOME_FONT_DIR = "${pkgs.callPackage ./nix/aizome-fonts.nix { }}";
         };
       });
 

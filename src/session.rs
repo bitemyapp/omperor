@@ -122,9 +122,6 @@ enum HistoryMode {
 
 #[derive(Debug)]
 pub(crate) enum HistoryUpdate {
-    /// The heights the transcript had when the session was last shown,
-    /// before its first page.
-    Heights(crate::saved_heights::SavedHeights),
     Page(Vec<SessionMessage>),
     Complete,
     Failed(SessionError),
@@ -139,7 +136,7 @@ pub(crate) enum DiscoveryUpdate {
 impl SessionSummary {
     /// Builds a summary for tests in other modules, which cannot name the
     /// private ownership and history fields.
-    #[cfg(any(test, feature = "design-preview"))]
+    #[cfg(test)]
     pub(crate) fn for_test(id: &str, title: &str, cwd: Option<&str>, omperor_owned: bool) -> Self {
         Self {
             id: id.into(),
@@ -171,48 +168,6 @@ impl SessionSummary {
         }
     }
 
-    /// The mock backend's live conversation as a row: it has a session id
-    /// like any other, so the sidebar and the Agents panel treat it as one,
-    /// but nothing on disk. Its path is the one the header would derive, so
-    /// selecting it is a no-op rather than a read of a journal that is not
-    /// there.
-    pub(crate) fn live_mock(id: &str, cwd: &Path, sessions_dir: &Path) -> Self {
-        Self {
-            id: id.into(),
-            title: "Mock conversation".into(),
-            project: cwd
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Unknown project".into()),
-            path: sessions_dir.join(format!("{id}.oms")),
-            cwd: Some(cwd.to_path_buf()),
-            modified: SystemTime::now(),
-            history_mode: HistoryMode::Journal,
-            ownership: SessionOwnership::Omperor,
-            model: Some(crate::mock_inference::MODEL.to_owned()),
-            outcome: None,
-            spawned: Vec::new(),
-        }
-    }
-
-    /// A session the headless benchmark makes up: its history comes from
-    /// memory (`stream_messages`), not from a file.
-    pub(crate) fn bench(id: &str, title: &str, cwd: &Path) -> Self {
-        Self {
-            id: id.into(),
-            title: title.into(),
-            project: "project".into(),
-            path: cwd.join(format!("{id}.oms")),
-            cwd: Some(cwd.to_path_buf()),
-            modified: SystemTime::now(),
-            history_mode: HistoryMode::Journal,
-            ownership: SessionOwnership::Omperor,
-            model: None,
-            outcome: None,
-            spawned: Vec::new(),
-        }
-    }
-
     /// When the session's journal last changed, in unix milliseconds.
     pub(crate) fn modified_ms(&self) -> i64 {
         self.modified
@@ -223,10 +178,6 @@ impl SessionSummary {
     /// Whether this is the mock backend's transient conversation.
     pub(crate) fn is_mock(&self) -> bool {
         self.id.starts_with("mock-")
-    }
-
-    pub(crate) fn set_title(&mut self, title: &str) {
-        self.title = title.to_owned();
     }
 
     pub(crate) fn menu_label(&self) -> String {
@@ -319,23 +270,6 @@ fn stream_discovery_with_roots(
 pub(crate) fn stream_history(summary: SessionSummary, sender: flume::Sender<HistoryUpdate>) {
     let pager = HistoryPager::open(&summary);
     stream_pages(pager, &summary.path, sender);
-}
-
-/// `messages` streamed as a session's history is, in the pages a journal's
-/// messages are read in: the headless benchmark's long sessions.
-pub(crate) fn stream_messages(messages: Vec<SessionMessage>, sender: flume::Sender<HistoryUpdate>) {
-    let path = PathBuf::from("bench-session.oms");
-    let pager = HistoryPager {
-        lines: None,
-        journal: Some(messages),
-        path: path.clone(),
-        mode: HistoryMode::Journal,
-        pending: VecDeque::new(),
-        legacy_started: false,
-        legacy_parent: None,
-        legacy_complete: false,
-    };
-    stream_pages(Ok(pager), &path, sender);
 }
 
 fn stream_pages(pager: Result<HistoryPager, SessionError>, path: &Path, sender: flume::Sender<HistoryUpdate>) {

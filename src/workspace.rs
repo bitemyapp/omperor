@@ -10,18 +10,11 @@ use crate::perf;
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 
 /// Git, by absolute path, which keeps the spawn atomic (see
-/// `eval::resolve_program`). On macOS that is `/usr/bin/git`, since an app
-/// opened from the Finder has a minimal PATH; elsewhere, the `git` on PATH,
-/// as NixOS and others have no `/usr/bin/git`. Found once, on a worker.
+/// `eval::resolve_program`): the `git` on PATH, as NixOS and others have no
+/// `/usr/bin/git`. Found once, on a worker.
 pub(crate) fn git() -> &'static Path {
     static GIT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    GIT.get_or_init(|| {
-        if cfg!(target_os = "macos") {
-            PathBuf::from("/usr/bin/git")
-        } else {
-            crate::eval::resolve_program("git", &Default::default())
-        }
-    })
+    GIT.get_or_init(|| crate::eval::resolve_program("git", &Default::default()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,10 +28,6 @@ pub(crate) struct WorkspaceChange {
 }
 
 impl WorkspaceChange {
-    pub(crate) fn label(&self) -> String {
-        format!("{}  {}", status_label(&self.status), self.path.display())
-    }
-
     /// A one-word reading of the porcelain status.
     pub(crate) fn kind(&self) -> &'static str {
         status_label(&self.status)

@@ -206,16 +206,6 @@ pub(crate) enum Changes {
     Prepended(usize),
 }
 
-impl Changes {
-    pub(crate) fn covers(&self, index: usize) -> bool {
-        match self {
-            Self::All => true,
-            Self::Messages(indices) => indices.contains(&index),
-            Self::Prepended(count) => index < *count,
-        }
-    }
-}
-
 impl Default for Conversation {
     fn default() -> Self {
         Self {

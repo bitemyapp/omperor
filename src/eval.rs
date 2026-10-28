@@ -382,7 +382,7 @@ fn run(spec_path: &Path, output: &Path) -> Result<ResultRecord, String> {
         checks: vec![],
     };
     let runtime = OmpRuntime::start_configured(RuntimeStartup {
-        helper: Some(crate::omp_runtime::eval_executable()),
+        helper: Some(crate::omp_runtime::omp_executable()),
         backend: Backend::Omp,
         project: spec.workspace.clone(),
         model: Some(spec.model.clone()),

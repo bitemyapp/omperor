@@ -28,11 +28,13 @@ pub(crate) const TOUR_MODELS: [&str; 3] = [
     "anthropic/claude-haiku-5-5",
 ];
 
-/// Set by `--readme-shots`: every plain prompt is a [`Scenario::Tour`] turn.
+/// While set (the README's pictures, `just shots`), every plain prompt is
+/// a [`Scenario::Tour`] turn.
 static TOUR: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn start_tour() {
-    TOUR.store(true, Ordering::Relaxed);
+#[cfg(test)]
+pub(crate) fn set_tour(on: bool) {
+    TOUR.store(on, Ordering::Relaxed);
 }
 
 pub(crate) fn tour() -> bool {
@@ -547,7 +549,7 @@ impl Request {
                 "Read the crate manifest",
                 Duration::from_millis(350),
                 None,
-                "[package]\nname = \"omperor\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nobjc2 = \"0.6\"\nserde_json = \"1\"\n",
+                "[package]\nname = \"omperor\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\naizome-kit = { path = \"vendor/sekka/desktop/aizome/crates/aizome-kit\" }\nserde_json = \"1\"\n",
             );
             if self.scenario == Scenario::Subagents {
                 at += Duration::from_millis(200);
@@ -557,7 +559,7 @@ impl Request {
                         label: "scout-layout".into(),
                         task: "Map the crate layout and report the modules that matter.".into(),
                         runs_for: Duration::from_millis(5_500),
-                        output: "src/main.rs holds the AppKit delegate; chat.rs and native_markdown.rs render the transcript; omp_runtime.rs owns the child process.".into(),
+                        output: "src/app holds the program and its messages; src/ui draws the windows; markdown/ renders answers; omp_runtime.rs owns the child process.".into(),
                     },
                     Child {
                         id: "mock-child-2".into(),
@@ -1051,17 +1053,36 @@ mod tests {
         out
     }
 
-    /// Every formula in the stress document copies as TeX that is the math
-    /// it typesets and parses back as the same formula (Upleft's
-    /// `math_copy_conformance`).
+    /// Every formula in the stress and showcase documents is set as math,
+    /// and every diagram drawn.
     #[test]
-    fn the_stress_documents_formulas_copy_as_the_math_they_typeset() {
-        use upleft_render::view::math_copy_conformance::{Report, check_document};
-        let mut report = Report::default();
-        check_document(STRESS_DOCUMENT, "stress", &mut report);
-        let checked: usize = report.counts.iter().filter(|((property, _), _)| property == "typeset").map(|(_, (passed, failed))| passed + failed).sum();
-        assert!(checked > 0, "the stress document has formulas");
-        assert_eq!(report.failed(), 0, "{}\n{:#?}", report.summary(), report.failures);
+    fn the_documents_formulas_are_set_and_diagrams_drawn() {
+        use crate::markdown::{Block, parse};
+        for document in [STRESS_DOCUMENT, SHOWCASE_DOCUMENT] {
+            let doc = parse(document);
+            let display: Vec<_> =
+                doc.blocks.iter().filter_map(|block| if let Block::Math(f) = block { Some(f) } else { None }).collect();
+            assert!(display.len() >= 2, "display formulas");
+            for f in display {
+                assert!(f.set.is_ok(), "{} → {:?}", f.source, f.set.as_ref().err());
+            }
+            let inline: Vec<_> = doc
+                .blocks
+                .iter()
+                .filter_map(|block| if let Block::Paragraph(runs) = block { Some(runs) } else { None })
+                .flatten()
+                .filter_map(|r| r.math.as_ref())
+                .collect();
+            assert!(inline.len() >= 2, "and inline ones");
+            assert!(inline.iter().all(|f| f.set.is_ok() && !f.display), "{inline:?}");
+        }
+        let doc = parse(SHOWCASE_DOCUMENT);
+        let diagrams: Vec<_> =
+            doc.blocks.iter().filter_map(|block| if let Block::Diagram(d) = block { Some(d) } else { None }).collect();
+        assert_eq!(diagrams.len(), 6);
+        for d in diagrams {
+            assert!(d.drawn.is_ok(), "{}: {:?}", d.kind(), d.drawn.as_ref().err());
+        }
     }
 
     #[test]

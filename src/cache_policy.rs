@@ -240,17 +240,6 @@ pub(crate) struct CacheWarning {
 }
 
 impl CacheWarning {
-    pub(crate) fn waiting() -> Self {
-        let explanation = "The KV cache timer starts when an inference response finishes streaming. If the provider does not return a usable minimum TTL, Omperor estimates five minutes. No response has completed for the current chat, model, and account yet.";
-        Self {
-            headline: "KV cache timer",
-            badge_label: "KV —".into(),
-            urgent: false,
-            explanation: explanation.into(),
-            tooltip: format!("{explanation}\nClick for cache details."),
-        }
-    }
-
     pub(crate) fn for_response(observation: &CacheObservation, elapsed: Duration) -> Self {
         let ttl = observation.ttl_seconds.filter(|&seconds| seconds > 0);
         let seconds = ttl.unwrap_or(5 * 60);
@@ -310,16 +299,6 @@ impl CacheWarning {
             ),
             explanation,
         }
-    }
-
-    pub(crate) fn with_window(mut self, window: Option<Self>) -> Self {
-        if let Some(window) = window {
-            self.badge_label = window.badge_label;
-            self.tooltip.push_str(&format!("\n{}", window.tooltip));
-            self.explanation
-                .push_str(&format!("\n\n{}\n{}", window.headline, window.explanation));
-        }
-        self
     }
 
     pub(crate) fn for_action(model: &str, action: CacheAction<'_>) -> Option<Self> {
@@ -632,9 +611,9 @@ impl CachePolicy {
 }
 
 fn duration_label(seconds: u64) -> String {
-    if seconds >= 3600 && seconds % 3600 == 0 {
+    if seconds >= 3600 && seconds.is_multiple_of(3600) {
         format!("{}h", seconds / 3600)
-    } else if seconds >= 60 && seconds % 60 == 0 {
+    } else if seconds >= 60 && seconds.is_multiple_of(60) {
         format!("{}m", seconds / 60)
     } else if seconds >= 60 {
         format!("{}m {}s", seconds / 60, seconds % 60)
@@ -839,25 +818,6 @@ mod tests {
         assert!(clock.warning(4000).is_none());
         clock.observe(Some(observation(4000, None)), 4000);
         assert_eq!(clock.warning(5000).unwrap().badge_label, "KV ~04:59");
-    }
-
-    #[test]
-    fn action_and_timer_share_a_badge_without_losing_either_explanation() {
-        let action = CacheWarning::for_action(
-            "anthropic/claude-sonnet-4-6",
-            CacheAction::ModelSwitch {
-                from: "old",
-                to: "new",
-            },
-        )
-        .unwrap();
-        let window = CacheWarning::for_response(&observation(1000, None), Duration::from_secs(1));
-        let combined = action.clone().with_window(Some(window));
-        assert_eq!(combined.headline, action.headline);
-        assert_eq!(combined.badge_label, "KV ~04:59");
-        assert!(combined.urgent);
-        assert!(combined.explanation.contains(&action.explanation));
-        assert!(combined.tooltip.contains("Estimate:"));
     }
 
     #[test]

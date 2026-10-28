@@ -122,7 +122,8 @@ fn ready(events: &UiEventSender, launch: &LaunchConfiguration, session: &str) {
         session_id: Some(session.to_owned()),
         session_file: None,
         project: launch.project.clone(),
-        authenticated_providers: Vec::new(),
+        // The tour's stand-ins are Claude models, shown as if signed in.
+        authenticated_providers: if crate::mock_inference::tour() { vec![AuthProvider::Anthropic] } else { Vec::new() },
         accounts: None,
         account: None,
         session_is_fresh: launch.resume.is_none(),
@@ -401,7 +402,7 @@ pub(super) async fn run(
     // clock, runs as its own task; dropping the sender stops it.
     let mut omperor: Option<(tokio::task::JoinHandle<()>, flume::Sender<()>)> = None;
     loop {
-        // With no turn, sleep on the channel: no idle polling. When AppKit
+        // With no turn, sleep on the channel: no idle polling. When the interface
         // is behind, cap queued output at eight events (~32 KiB ASCII).
         let next = match turn.as_ref().and_then(Turn::deadline) {
             Some(deadline) => {

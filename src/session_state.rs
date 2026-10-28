@@ -1,10 +1,41 @@
-//! Versioned session reading metadata. Transcript bodies stay in OMP journals.
+//! Versioned session reading metadata: what each session's window held
+//! (an unsent draft and its attachments, the panel beside the
+//! conversation, the change in view, the agents' filter). Transcript
+//! bodies stay in OMP's journals. Fields of earlier versions that are gone
+//! (the earlier interface's pins and scroll positions) are ignored when
+//! read, so drafts written by older builds still come back.
 use crate::agents::ViewState;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
+
+/// Launch preferences needed to restore a draft without starting inference.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DraftContext {
+    pub(crate) project: PathBuf,
+    pub(crate) project_id: Option<String>,
+    pub(crate) model: String,
+    pub(crate) account: Option<String>,
+    pub(crate) thinking_level: String,
+    pub(crate) fast_mode: bool,
+}
+
+/// One session's working arrangement.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Desk {
+    pub(crate) draft: String,
+    pub(crate) attachments: Vec<crate::attachments::SavedAttachment>,
+    pub(crate) draft_context: Option<DraftContext>,
+    pub(crate) selected_change: Option<PathBuf>,
+    /// Which panel shows beside the conversation: 0 Changes, 1 Agents.
+    pub(crate) panel: isize,
+    /// Whether that panel shows at all.
+    pub(crate) workspace_inspector: bool,
+}
 
 /// Draft keys occupy a relative namespace that is never passed to OMP or read as a journal.
 pub(crate) fn draft_path(key: u64) -> PathBuf {
@@ -36,10 +67,7 @@ struct SavedView {
 
 impl Default for SavedViews {
     fn default() -> Self {
-        Self {
-            version: 2,
-            sessions: Vec::new(),
-        }
+        Self { version: 2, sessions: Vec::new() }
     }
 }
 
@@ -49,22 +77,11 @@ impl SavedViews {
             .iter()
             .map(|(path, view)| {
                 let draft_key = path.as_deref().and_then(draft_key);
-                SavedView {
-                    path: if draft_key.is_some() {
-                        None
-                    } else {
-                        path.clone()
-                    },
-                    draft_key,
-                    view: view.clone(),
-                }
+                SavedView { path: if draft_key.is_some() { None } else { path.clone() }, draft_key, view: view.clone() }
             })
             .collect();
         sessions.sort_by(|a, b| (&a.path, a.draft_key).cmp(&(&b.path, b.draft_key)));
-        Self {
-            version: 2,
-            sessions,
-        }
+        Self { version: 2, sessions }
     }
 
     pub(crate) fn decode(json: &str) -> Result<Self, String> {
@@ -89,165 +106,93 @@ impl SavedViews {
             if !paths.insert((item.path.clone(), item.draft_key)) {
                 return Err("duplicate session identity".into());
             }
-            let desk = &mut item.view.desk;
-            let mut ids = HashSet::new();
-            desk.pins
-                .retain(|pin| !pin.id.is_empty() && ids.insert(pin.id.clone()));
-            // The fixed native pane pool reserves one slot for the preview.
-            let mut kept = 0;
-            let mut preview = false;
-            desk.pins.retain(|pin| {
-                if pin.kept {
-                    kept += 1;
-                    kept <= crate::workspace_model::MAX_PINS
-                } else if preview {
-                    false
-                } else {
-                    preview = true;
-                    true
-                }
-            });
-            if !desk
-                .pins
-                .iter()
-                .any(|pin| Some(&pin.id) == desk.selected_pin.as_ref())
-            {
-                desk.selected_pin = desk.pins.first().map(|pin| pin.id.clone());
-            }
-            if !desk
-                .pins
-                .iter()
-                .any(|pin| Some(&pin.id) == desk.focused_pin.as_ref())
-            {
-                desk.focused_pin = None;
-            }
-            desk.panel = desk.panel.clamp(0, 1);
-            // Negative positions can occur after overscroll, but are not useful anchors.
-            desk.conversation_y = desk.conversation_y.max(0.0);
-            desk.change_scroll_y = desk.change_scroll_y.max(0.0);
-            desk.diff_scroll_y = desk.diff_scroll_y.max(0.0);
-            for pin in &mut desk.pins {
-                pin.scroll_y = pin.scroll_y.max(0.0);
-            }
+            item.view.desk.panel = item.view.desk.panel.clamp(0, 1);
         }
         saved.version = 2;
         Ok(saved)
     }
 
     pub(crate) fn into_states(self) -> impl Iterator<Item = (Option<PathBuf>, ViewState)> {
-        self.sessions
-            .into_iter()
-            .map(|saved| (saved.draft_key.map(draft_path).or(saved.path), saved.view))
+        self.sessions.into_iter().map(|saved| (saved.draft_key.map(draft_path).or(saved.path), saved.view))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn restores_drafts_tabs_and_positions_without_copying_transcript_bodies() {
+    fn restores_drafts_and_filters_without_copying_transcript_bodies() {
         let mut view = ViewState::default();
         view.desk.draft = "Unsent: 日本語 🦀".into();
+        view.desk.panel = 1;
         view.query = "review".into();
-        view.desk.inspect("agent-a");
-        view.desk.keep(0);
-        view.desk.pins[0].expanded_tools.insert(3);
-        view.desk.pins[0].scroll_y = 42.5;
-        view.desk.pins[0].snapshot.body = "DO NOT COPY TRANSCRIPT".into();
-        view.desk.inspect("agent-b");
         let path = PathBuf::from("/sessions/one.oms");
         let saved = SavedViews::capture(&HashMap::from([(Some(path.clone()), view)]));
         let json = serde_json::to_string(&saved).unwrap();
-        assert!(!json.contains("DO NOT COPY TRANSCRIPT"));
         let states: HashMap<_, _> = SavedViews::decode(&json).unwrap().into_states().collect();
         assert!(!states.contains_key(&None));
         let restored = &states[&Some(path)];
         assert_eq!(restored.desk.draft, "Unsent: 日本語 🦀");
+        assert_eq!(restored.desk.panel, 1);
         assert_eq!(restored.query, "review");
-        assert!(restored.desk.pins[0].kept);
-        assert_eq!(restored.desk.pins[0].scroll_y, 42.5);
-        assert!(restored.desk.pins[0].expanded_tools.contains(&3));
-        assert!(!restored.desk.pins[1].kept);
     }
+
+    #[test]
+    fn an_older_builds_desk_still_gives_back_its_draft() {
+        let json = r#"{"version":2,"sessions":[{"path":"/s/a.oms","view":{"desk":{"draft":"kept",
+            "pins":[{"id":"x","kept":true}],"conversation_y":120.5,"panel":7},"query":"q","page":3}}]}"#;
+        let states: HashMap<_, _> = SavedViews::decode(json).unwrap().into_states().collect();
+        let view = &states[&Some(PathBuf::from("/s/a.oms"))];
+        assert_eq!(view.desk.draft, "kept");
+        assert_eq!(view.desk.panel, 1, "clamped to a panel that exists");
+        assert_eq!(view.query, "q");
+    }
+
     #[test]
     fn rejects_unknown_versions_and_duplicate_session_keys() {
         assert!(SavedViews::decode(r#"{"version":3,"sessions":[]}"#).is_err());
-        assert!(
-            SavedViews::decode(
-                r#"{"version":1,"sessions":[{"path":null,"view":{}},{"path":null,"view":{}}]}"#
-            )
-            .is_err()
-        );
+        assert!(SavedViews::decode(r#"{"version":1,"sessions":[{"path":null,"view":{}},{"path":null,"view":{}}]}"#).is_err());
         assert!(SavedViews::decode("broken").is_err());
-        assert!(
-            SavedViews::decode(r#"{"version":1,"sessions":[{"path":null,"view":{}}]}"#).is_ok()
-        );
+        assert!(SavedViews::decode(r#"{"version":1,"sessions":[{"path":null,"view":{}}]}"#).is_ok());
     }
 
     #[test]
     fn distinct_drafts_and_attachment_descriptors_survive_round_trip() {
         let mut first = ViewState::default();
         first.desk.draft = "first unsent prompt".into();
-        first
-            .desk
-            .attachments
-            .push(crate::attachments::SavedAttachment {
-                name: "image.png".into(),
-                path: Some("/attachments/image.png".into()),
-                error: None,
-            });
+        first.desk.attachments.push(crate::attachments::SavedAttachment {
+            name: "image.png".into(),
+            path: Some("/attachments/image.png".into()),
+            error: None,
+        });
         let mut second = ViewState::default();
         second.desk.draft = "second unsent prompt".into();
-        let states = HashMap::from([
-            (Some(draft_path(12)), first),
-            (Some(draft_path(13)), second),
-        ]);
+        let states = HashMap::from([(Some(draft_path(12)), first), (Some(draft_path(13)), second)]);
         let json = serde_json::to_string(&SavedViews::capture(&states)).unwrap();
         assert!(!json.contains("@omperor-draft"));
         let restored: HashMap<_, _> = SavedViews::decode(&json).unwrap().into_states().collect();
-        assert_eq!(
-            restored[&Some(draft_path(12))].desk.draft,
-            "first unsent prompt"
-        );
-        assert_eq!(
-            restored[&Some(draft_path(13))].desk.draft,
-            "second unsent prompt"
-        );
+        assert_eq!(restored[&Some(draft_path(12))].desk.draft, "first unsent prompt");
+        assert_eq!(restored[&Some(draft_path(13))].desk.draft, "second unsent prompt");
         assert_eq!(restored[&Some(draft_path(12))].desk.attachments.len(), 1);
     }
 
     #[test]
     fn rejects_ambiguous_or_repeated_draft_identities() {
+        assert!(SavedViews::decode(r#"{"version":2,"sessions":[{"path":"/one.oms","draft_key":12,"view":{}}]}"#).is_err());
         assert!(
-            SavedViews::decode(
-                r#"{"version":2,"sessions":[{"path":"/one.oms","draft_key":12,"view":{}}]}"#
-            )
-            .is_err()
+            SavedViews::decode(r#"{"version":2,"sessions":[{"draft_key":12,"view":{}},{"draft_key":12,"view":{}}]}"#)
+                .is_err()
         );
-        assert!(SavedViews::decode(r#"{"version":2,"sessions":[{"draft_key":12,"view":{}},{"draft_key":12,"view":{}}]}"#).is_err());
-        assert_eq!(
-            draft_key(std::path::Path::new("/real/@omperor-draft/12")),
-            None
-        );
-        assert_eq!(
-            draft_key(std::path::Path::new("@omperor-draft/12/extra")),
-            None
-        );
+        assert_eq!(draft_key(std::path::Path::new("/real/@omperor-draft/12")), None);
+        assert_eq!(draft_key(std::path::Path::new("@omperor-draft/12/extra")), None);
     }
 
     #[test]
     fn rejects_reserved_path_alias_and_exhausted_draft_key() {
+        assert!(SavedViews::decode(r#"{"version":2,"sessions":[{"path":"@omperor-draft/12","view":{}}]}"#).is_err());
         assert!(
-            SavedViews::decode(
-                r#"{"version":2,"sessions":[{"path":"@omperor-draft/12","view":{}}]}"#
-            )
-            .is_err()
-        );
-        assert!(
-            SavedViews::decode(
-                r#"{"version":2,"sessions":[{"draft_key":18446744073709551615,"view":{}}]}"#
-            )
-            .is_err()
+            SavedViews::decode(r#"{"version":2,"sessions":[{"draft_key":18446744073709551615,"view":{}}]}"#).is_err()
         );
     }
 }

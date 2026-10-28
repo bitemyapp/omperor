@@ -7,8 +7,6 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{chat_typography::TextSizes, theme::ChatStyle};
-
 /// Current schema of the Omperor preferences database. Bumped whenever a
 /// migration in [`migrate`] adds or changes tables beyond the original
 /// key/value `preferences` table, which is created unconditionally.
@@ -21,51 +19,13 @@ const PROJECTS_BOOTSTRAPPED_KEY: &str = "projects_bootstrapped";
 const PROJECT_KEY: &str = "active_project";
 const MODEL_KEY: &str = "model";
 const THINKING_LEVEL_KEY: &str = "thinking_level";
-const APPEARANCE_KEY: &str = "appearance";
 const CHAT_TEXT_SIZE_KEY: &str = "chat_text_size";
 const SHOW_INLINE_IMAGES_KEY: &str = "show_inline_images";
 const LOAD_REMOTE_IMAGES_KEY: &str = "load_remote_images";
-const FRAME_TIMING_OVERLAY_KEY: &str = "frame_timing_overlay";
-const CHAT_TEXT_SIZES_KEY: &str = "chat_text_sizes";
-const CHAT_STYLE_KEY: &str = "chat_style";
 const EDITOR_KEY: &str = "editor_app";
 const TERMINAL_KEY: &str = "terminal_app";
 const BROWSER_KEY: &str = "browser_app";
 const AGENTS_FILTER_KEY: &str = "agents_filter";
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AppearancePreference {
-    #[default]
-    System,
-    Light,
-    Dark,
-}
-
-impl AppearancePreference {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-        }
-    }
-
-    pub(crate) fn from_stored(value: Option<String>) -> Self {
-        match value.as_deref() {
-            Some("light") => Self::Light,
-            Some("dark") => Self::Dark,
-            _ => Self::System,
-        }
-    }
-
-    const fn stored(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Light => "light",
-            Self::Dark => "dark",
-        }
-    }
-}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChatTextSize {
@@ -76,14 +36,6 @@ pub(crate) enum ChatTextSize {
 }
 
 impl ChatTextSize {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Compact => "Compact",
-            Self::Default => "Default",
-            Self::Large => "Large",
-        }
-    }
-
     pub(crate) const fn scale(self) -> f64 {
         match self {
             Self::Compact => 0.9,
@@ -115,16 +67,10 @@ pub(crate) struct Preferences {
     /// Enable desktop input/capture in newly launched sessions.
     pub(crate) computer_use: bool,
     pub(crate) inference_backend: crate::mock_inference::Backend,
-    /// Whether the main thread's frame timing is shown live in the window;
-    /// takes effect only while Developer mode is on.
-    pub(crate) frame_timing_overlay: bool,
     pub(crate) project: Option<PathBuf>,
     pub(crate) model: Option<String>,
     pub(crate) thinking_level: Option<String>,
-    pub(crate) appearance: AppearancePreference,
     pub(crate) chat_text_size: ChatTextSize,
-    pub(crate) chat_style: ChatStyle,
-    pub(crate) chat_text_sizes: TextSizes,
     pub(crate) show_inline_images: bool,
     /// Whether images on the web that a reply links to are fetched. Off by
     /// default: fetching tells the image's server that the reply was read,
@@ -149,14 +95,10 @@ impl Default for Preferences {
             developer_mode: false,
             computer_use: false,
             inference_backend: crate::mock_inference::Backend::Omp,
-            frame_timing_overlay: false,
             project: None,
             model: None,
             thinking_level: None,
-            appearance: AppearancePreference::System,
             chat_text_size: ChatTextSize::Default,
-            chat_style: ChatStyle::Modern,
-            chat_text_sizes: TextSizes::default(),
             show_inline_images: true,
             load_remote_images: false,
             editor: None,
@@ -179,6 +121,8 @@ impl Preferences {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PreferencesError {
+    #[error("{} is not a folder", .0.display())]
+    NotAFolder(PathBuf),
     #[error("{path} already belongs to project {project}")]
     DirectoryOwned { path: PathBuf, project: String },
     #[error("invalid saved session state: {0}")]
@@ -436,14 +380,10 @@ fn load_from(path: &Path) -> Result<Preferences, PreferencesError> {
         inference_backend: crate::mock_inference::Backend::from_stored(
             get("inference_backend")?.as_deref(),
         ),
-        frame_timing_overlay: get(FRAME_TIMING_OVERLAY_KEY)?.as_deref() == Some("true"),
         project: get(PROJECT_KEY)?.map(PathBuf::from),
         model: get(MODEL_KEY)?,
         thinking_level: get(THINKING_LEVEL_KEY)?,
-        appearance: AppearancePreference::from_stored(get(APPEARANCE_KEY)?),
         chat_text_size: ChatTextSize::from_stored(get(CHAT_TEXT_SIZE_KEY)?),
-        chat_style: ChatStyle::from_stored(get(CHAT_STYLE_KEY)?),
-        chat_text_sizes: TextSizes::from_stored(get(CHAT_TEXT_SIZES_KEY)?),
         show_inline_images: get(SHOW_INLINE_IMAGES_KEY)?
             .and_then(|value| value.parse().ok())
             .unwrap_or(true),
@@ -478,10 +418,6 @@ fn store_in(path: &Path, preferences: &Preferences) -> Result<(), PreferencesErr
             Some(preferences.effective_backend().stored().to_owned()),
         ),
         (
-            FRAME_TIMING_OVERLAY_KEY,
-            Some(preferences.frame_timing_overlay.to_string()),
-        ),
-        (
             PROJECT_KEY,
             preferences
                 .project
@@ -491,16 +427,8 @@ fn store_in(path: &Path, preferences: &Preferences) -> Result<(), PreferencesErr
         (MODEL_KEY, preferences.model.clone()),
         (THINKING_LEVEL_KEY, preferences.thinking_level.clone()),
         (
-            APPEARANCE_KEY,
-            Some(preferences.appearance.stored().to_owned()),
-        ),
-        (
             CHAT_TEXT_SIZE_KEY,
             Some(preferences.chat_text_size.stored().to_owned()),
-        ),
-        (
-            CHAT_STYLE_KEY,
-            Some(preferences.chat_style.stored().to_owned()),
         ),
         (
             SHOW_INLINE_IMAGES_KEY,
@@ -509,10 +437,6 @@ fn store_in(path: &Path, preferences: &Preferences) -> Result<(), PreferencesErr
         (
             LOAD_REMOTE_IMAGES_KEY,
             Some(preferences.load_remote_images.to_string()),
-        ),
-        (
-            CHAT_TEXT_SIZES_KEY,
-            Some(preferences.chat_text_sizes.stored()),
         ),
         (EDITOR_KEY, preferences.editor.clone()),
         (TERMINAL_KEY, preferences.terminal.clone()),
@@ -1004,10 +928,6 @@ pub(crate) fn project_draft(name: &str, directories: &[PathBuf]) -> Project {
         id: new_project_id(), name: name.to_owned(), directories: directories.to_vec(),
         last_opened_at_ms: now_ms(), collapsed: false,
     }
-}
-
-pub(crate) fn insert_project(project: &Project) -> Result<(), PreferencesError> {
-    insert_project_in(&database_path()?, project)
 }
 
 fn create_project_in(path: &Path, name: &str, directories: &[PathBuf]) -> Result<Project, PreferencesError> {
@@ -1671,9 +1591,6 @@ mod tests {
         let (scratch, path) = scratch_database("session-views");
         let mut view = crate::agents::ViewState::default();
         view.desk.draft = "Unsent draft 🦀".into();
-        view.desk.inspect("child");
-        view.desk.keep(0);
-        view.desk.pins[0].snapshot.body = "journal only".into();
         let key = Some(crate::session_state::draft_path(42));
         let views =
             crate::session_state::SavedViews::capture(&HashMap::from([(key.clone(), view)]));
@@ -1684,8 +1601,6 @@ mod tests {
             .into_states()
             .collect();
         assert_eq!(restored[&key].desk.draft, "Unsent draft 🦀");
-        assert!(restored[&key].desk.pins[0].kept);
-        assert!(restored[&key].desk.pins[0].snapshot.body.is_empty());
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
@@ -1734,16 +1649,10 @@ mod tests {
             developer_mode: true,
             computer_use: true,
             inference_backend: crate::mock_inference::Backend::Mock,
-            frame_timing_overlay: true,
             project: Some("/work/project".into()),
             model: Some("openai-codex/gpt-5.6-luna".into()),
             thinking_level: Some("high".into()),
-            appearance: super::AppearancePreference::Dark,
             chat_text_size: super::ChatTextSize::Large,
-            chat_style: super::ChatStyle::Editorial,
-            chat_text_sizes: super::TextSizes::from_stored(Some(
-                r#"{"user":19.5,"assistant":18,"code_block":16}"#.into(),
-            )),
             show_inline_images: false,
             load_remote_images: true,
             editor: Some("Zed".into()),
@@ -1838,7 +1747,7 @@ mod tests {
         record_account_in(&path, "anthropic:b@x", "anthropic", None, Some(30)).expect("reauth");
         set_default_account_in(&path, "anthropic", Some("anthropic:b@x")).expect("default");
         let accounts = load_accounts_from(&path).expect("accounts");
-        assert_eq!(accounts[0].is_default, false);
+        assert!(!accounts[0].is_default);
         assert_eq!(accounts[1].authenticated_at_ms, 30);
         assert!(accounts[1].is_default);
         set_default_account_in(&path, "anthropic", None).expect("clear default");

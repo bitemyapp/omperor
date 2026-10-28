@@ -34,6 +34,6 @@ a different account's listing is not substituted. When no prior Anthropic
 listing exists, startup can expose the bundled chat models as a fallback.
 These fallbacks are not new provider availability confirmations.
 
-Discovery runs on the existing OMP runtime worker. The AppKit main thread does
+Discovery runs on the existing OMP runtime worker. The interface thread does
 not make network requests or wait for the helper. Fetching a model list does not
 send a prompt or generate model tokens.

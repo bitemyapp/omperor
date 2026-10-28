@@ -259,7 +259,7 @@ pub(crate) fn fold(entries: &[Entry]) -> Timeline {
     // The model of the response now streaming, which its tool calls take.
     let mut current_model: Option<String> = None;
     for entry in live_chain(entries) {
-        let at = u64::try_from(entry.id.as_ulid().timestamp_ms()).unwrap_or(u64::MAX);
+        let at = entry.id.as_ulid().timestamp_ms();
         match entry.kind.name.as_str() {
             kind::MSG_USER => {
                 let Ok(payload) = serde_json::from_str::<data::MsgUser>(entry.data.as_str())
@@ -1000,7 +1000,7 @@ impl Summary {
 /// What the timeline worker sends, newest first, the way the chat's
 /// history arrives: the most recent events straight away, then older ones
 /// page by page until the session's start.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Update {
     /// The fold finished: the session's figures and its newest events,
     /// oldest first.
@@ -1012,20 +1012,12 @@ pub(crate) enum Update {
 }
 
 /// Reads and folds the journal at `path`, then sends it newest first in
-/// pages, calling `wake` after each so the main thread picks it up. The
-/// channel is meant to be bounded: each page waits until the last is
-/// taken, and the worker stops as soon as the receiver goes away.
+/// pages through `send`, stopping as soon as `send` says no one is
+/// listening (the window closed).
 ///
 /// This touches the filesystem and belongs on a worker thread.
-pub(crate) fn stream(path: &std::path::Path, sender: &flume::Sender<Update>, wake: impl Fn()) {
+pub(crate) fn stream(path: &std::path::Path, send: impl Fn(Update) -> bool) {
     let _span = crate::perf::span("gui.timeline.stream");
-    let send = |update| {
-        let sent = sender.send(update).is_ok();
-        if sent {
-            wake();
-        }
-        sent
-    };
     let timeline = match read(path) {
         Ok(timeline) => timeline,
         Err(error) => {
@@ -1121,12 +1113,6 @@ pub(crate) enum Row {
 }
 
 impl Row {
-    pub(crate) const fn height(&self) -> f64 {
-        match self {
-            Self::Event { .. } => 40.0,
-            Self::Hidden { .. } => 26.0,
-        }
-    }
 
     /// What names a hidden run in the set of opened ones: the index just
     /// past its last event, which stays put when older events arrive and
@@ -1195,117 +1181,6 @@ pub(crate) fn rows(
         }
     }
     rows
-}
-
-/// Where each row's top sits, measured down from the list's top, with one
-/// more entry for the bottom of the last row.
-pub(crate) fn row_tops(rows: &[Row]) -> Vec<f64> {
-    let mut tops = Vec::with_capacity(rows.len() + 1);
-    let mut top = 0.0;
-    tops.push(top);
-    for row in rows {
-        top += row.height();
-        tops.push(top);
-    }
-    tops
-}
-
-/// The rows that reach into `from..to` (measured down from the list's top)
-/// in `tops` as `row_tops` lays them out.
-pub(crate) fn rows_between(tops: &[f64], from: f64, to: f64) -> std::ops::Range<usize> {
-    let Some((_, bottoms)) = tops.split_first() else {
-        return 0..0;
-    };
-    let starts = &tops[..bottoms.len()];
-    // From the first row that ends below `from` to the last that starts
-    // above `to`.
-    let start = bottoms.partition_point(|bottom| *bottom <= from);
-    let end = starts.partition_point(|top| *top < to);
-    start..end.max(start)
-}
-
-/// One mark on the minimap: where the event's row sits in the list, how
-/// long it took against the longest, and whether it is among the slow ones
-/// a click snaps to.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Mark {
-    /// 0 at the top of the list, 1 at the bottom.
-    pub(crate) position: f64,
-    /// 0 for a moment, 1 for the longest event.
-    pub(crate) weight: f64,
-    pub(crate) slow: bool,
-}
-
-/// How many of the longest events count as slow.
-const SLOW_COUNT: usize = 5;
-
-/// The minimap's marks for the list as laid out: one per row, at the row's
-/// centre down the list's height, an event's weighed against the longest
-/// shown and a hidden run's a quiet tick.
-pub(crate) fn marks(loaded: &Loaded, rows: &[Row]) -> Vec<Mark> {
-    let shown: Vec<&Event> = rows
-        .iter()
-        .filter_map(|row| match row {
-            Row::Event { index, .. } => loaded.get(*index),
-            Row::Hidden { .. } => None,
-        })
-        .collect();
-    let longest = shown
-        .iter()
-        .map(|event| event.duration_ms())
-        .max()
-        .unwrap_or(0)
-        .max(1) as f64;
-    let mut durations: Vec<u64> = shown
-        .iter()
-        .map(|event| event.duration_ms())
-        .filter(|duration| *duration > 0)
-        .collect();
-    durations.sort_unstable_by(|a, b| b.cmp(a));
-    let threshold = durations
-        .get(SLOW_COUNT.min(durations.len()).saturating_sub(1))
-        .copied()
-        .unwrap_or(u64::MAX);
-    let total: f64 = rows.iter().map(Row::height).sum::<f64>().max(1.0);
-    let mut top = 0.0;
-    rows.iter()
-        .map(|row| {
-            let centre = (top + row.height() / 2.0) / total;
-            top += row.height();
-            match row {
-                Row::Event { index, .. } => {
-                    let duration = loaded.get(*index).map_or(0, Event::duration_ms);
-                    Mark {
-                        position: centre,
-                        weight: duration as f64 / longest,
-                        slow: duration > 0 && duration >= threshold,
-                    }
-                }
-                Row::Hidden { .. } => Mark {
-                    position: centre,
-                    weight: 0.0,
-                    slow: false,
-                },
-            }
-        })
-        .collect()
-}
-
-/// The row a click at `position` on the minimap should go to: the nearest
-/// slow event when one is close, otherwise the nearest event.
-pub(crate) fn target_row(marks: &[Mark], position: f64) -> Option<usize> {
-    let nearest = |candidates: &mut dyn Iterator<Item = (usize, &Mark)>| {
-        candidates
-            .map(|(index, mark)| (index, (mark.position - position).abs()))
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-    };
-    let slow = nearest(&mut marks.iter().enumerate().filter(|(_, mark)| mark.slow));
-    if let Some((index, distance)) = slow
-        && distance <= 0.06
-    {
-        return Some(index);
-    }
-    nearest(&mut marks.iter().enumerate()).map(|(index, _)| index)
 }
 
 #[cfg(test)]
@@ -1763,44 +1638,6 @@ mod tests {
         assert_eq!(tool_detail("read", Some("Look"), Some(r#"{"path":"a.rs"}"#)), "Look");
     }
 
-    #[test]
-    fn marks_place_rows_down_the_strip_and_a_click_snaps_to_a_slow_one() {
-        let event = |kind, started, ended| Event {
-            kind,
-            info: Info::default(),
-            agent: None,
-            model: None,
-            started_ms: started,
-            ended_ms: ended,
-            waiting_ms: 0,
-            label: String::new(),
-            detail: String::new(),
-            failed: false,
-            search: String::new(),
-        };
-        let events = vec![
-            event(Kind::Prompt, 0, 0),
-            event(Kind::Response, 0, 4_000),
-            event(Kind::Tool, 4_000, 4_100),
-            event(Kind::Response, 4_100, 12_000),
-            event(Kind::Tool, 12_000, 12_050),
-        ];
-        let loaded = arrived(&events);
-        let all = rows(&loaded, &Filter::default(), &Default::default());
-        let marks = marks(&loaded, &all);
-        assert_eq!(marks.len(), 5);
-        assert!((marks[0].position - 0.1).abs() < 1e-9);
-        assert!((marks[4].position - 0.9).abs() < 1e-9);
-        assert_eq!(marks[0].weight, 0.0);
-        assert_eq!(marks[3].weight, 1.0);
-        assert!(marks[3].slow && marks[1].slow, "the longest count as slow");
-        assert!(!marks[0].slow, "a moment is never slow");
-        // A click near the bottom lands on the last row, a click near the
-        // long response snaps to it even from a little way off.
-        assert_eq!(target_row(&marks, 0.95), Some(4));
-        assert_eq!(target_row(&marks, 0.66), Some(3));
-        assert_eq!(target_row(&[], 0.5), None);
-    }
 
     #[test]
     fn filters_fold_what_they_take_out_into_runs_that_open_on_request() {
@@ -1929,15 +1766,6 @@ mod tests {
         assert!(matches!(opened[1], Row::Event { index: 0, dimmed: true }));
         assert!(matches!(opened[5], Row::Event { index: 4, dimmed: false }));
 
-        // The minimap follows the rows as laid out: a hidden run is a quiet
-        // tick, the shown event weighs against the longest shown.
-        let marks = marks(&loaded, &folded);
-        assert_eq!(marks.len(), 3);
-        assert_eq!(marks[0].weight, 0.0);
-        assert!(!marks[0].slow);
-        assert_eq!(marks[1].weight, 1.0);
-        let total = 26.0 + 40.0 + 26.0;
-        assert!((marks[1].position - (26.0 + 20.0) / total).abs() < 1e-9);
 
         // Nearest rank: six durations, rank round(5 × 0.9) = 5, the longest.
         assert_eq!(percentile_ms(&events, 0.9), Some(230_000));
@@ -2011,8 +1839,10 @@ mod tests {
         let wakes = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                stream(&path, &sender, || {
+                stream(&path, |update| {
+                    let sent = sender.send(update).is_ok();
                     wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sent
                 });
                 drop(sender);
             });
@@ -2047,14 +1877,14 @@ mod tests {
                 "search text is set against the session's start"
             );
         });
-        assert_eq!(wakes.into_inner(), 5, "one wake per update sent");
+        assert_eq!(wakes.into_inner(), 5, "one send per update");
 
         // A reader that goes away stops the worker at its next page.
         let (sender, receiver) = flume::bounded(1);
         drop(receiver);
-        stream(&path, &sender, || {});
+        stream(&path, |update| sender.send(update).is_ok());
         let (sender, receiver) = flume::bounded(1);
-        stream(&directory.join("missing.oms"), &sender, || {});
+        stream(&directory.join("missing.oms"), |update| sender.send(update).is_ok());
         assert!(matches!(receiver.try_recv(), Ok(Update::Failed(_))));
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2103,23 +1933,6 @@ mod tests {
         assert_eq!(loaded.get(4).map(|event| event.started_ms), Some(4));
     }
 
-    #[test]
-    fn the_rows_in_view_are_found_by_their_tops() {
-        let rows = [
-            Row::Event { index: 0, dimmed: false },
-            Row::Hidden { first: 1, count: 2, total_ms: 0, open: false },
-            Row::Event { index: 3, dimmed: false },
-        ];
-        let tops = row_tops(&rows);
-        assert_eq!(tops, [0.0, 40.0, 66.0, 106.0]);
-        assert_eq!(rows_between(&tops, 0.0, 10.0), 0..1);
-        assert_eq!(rows_between(&tops, 39.0, 41.0), 0..2);
-        assert_eq!(rows_between(&tops, 40.0, 66.0), 1..2);
-        assert_eq!(rows_between(&tops, 50.0, 500.0), 1..3);
-        assert_eq!(rows_between(&tops, 106.0, 200.0), 3..3);
-        assert_eq!(rows_between(&[0.0], 0.0, 100.0), 0..0);
-        assert_eq!(rows_between(&[], 0.0, 100.0), 0..0);
-    }
 
     #[test]
     fn argument_excerpts_pick_the_telling_field() {

@@ -1,5 +1,7 @@
 # Readiness review — 7 October 2026
 
+_A dated record. It predates the move to Aizome: the interface it reviews was the AppKit one, with Upleft's Markdown renderer and macOS app bundles; the OMP patches and data-safety fixes it describes still apply._
+
 Branch `claude/dogfood-release-readiness`, on top of `codex/dogfooding-evals`. This is the second readiness pass. It covers code review of the app and its OMP patches, GUI testing of an isolated build with real inference, a headless eval suite against real accounts, and preparation for releasing the source.
 
 ## Verdict

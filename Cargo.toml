@@ -2,49 +2,42 @@
 name = "omperor"
 version = "0.1.0"
 edition = "2024"
-description = "A native desktop shell for oh-my-pi"
+description = "A native Aizome app for working with coding agents, around oh-my-pi"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [features]
 # Installed application state. Local builds, even optimized ones, use Dev state.
 production = []
-# Local, deterministic visual review with no inference process or real account data.
-design-preview = []
 
 [dependencies]
+# Aizome's widget kit, from Sekka (vendor/sekka/desktop/aizome), on the
+# Sidestep fork Sekka pins (vendor/sekka/vendor/sidestep).
+aizome-kit = { path = "vendor/sekka/desktop/aizome/crates/aizome-kit" }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff"] }
-block2 = "0.6"
 flume = "0.11"
 ignore = "0.4"
 libc = "0.2"
-objc2 = "0.6.4"
-objc2-foundation = { version = "0.3.2", default-features = false, features = [
-    "std",
-    "block2",
-    "NSArray",
-    "NSBundle",
-    "NSAttributedString",
-    "NSData",
-    "NSDictionary",
-    "NSError",
-    "NSGeometry",
-    "NSNotification",
-    "NSDate",
-    "NSDateFormatter",
-    "NSFormatter",
-    "NSObject",
-    "NSRunLoop",
-    "NSString",
-    "NSThread",
-    "NSTimer",
-    "NSURL",
-    "NSValue",
-] }
+# Mermaid diagrams: laid out as Mermaid lays them out, as SVG, which usvg
+# turns into shapes to draw. No ELK (its port is EPL-2.0): diagrams that ask
+# for it get the default layout.
+merman = { version = "0.9.2", default-features = false, features = ["svg", "all-diagrams", "layout-cytoscape"] }
+usvg = { version = "0.49", default-features = false, features = ["text", "system-fonts"] }
+notify = "8"
 omp-journal = { path = "vendor/oh-my-pi/crates/journal" }
 omp-rpc = { path = "vendor/oh-my-pi/crates/rpc" }
 pulldown-cmark = { version = "0.13.4", default-features = false }
+# Math: LaTeX laid out as KaTeX lays it out, in KaTeX's fonts, whose glyphs
+# skrifa outlines for the kit to draw.
+ratex-katex-fonts = "0.1.15"
+ratex-layout = "0.1.15"
+ratex-parser = "0.1.15"
+ratex-types = "0.1.15"
+# Only so debug builds carry KaTeX's fonts too, rather than reading them
+# from Cargo's registry.
+rust-embed = { version = "8.11", default-features = false, features = ["debug-embed"] }
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
@@ -53,7 +46,6 @@ tar = { version = "0.4", default-features = false }
 zstd = "0.13"
 syntect = { version = "5.3", default-features = false, features = [
     "default-syntaxes",
-    "default-themes",
     "regex-fancy",
 ] }
 thiserror = "2"
@@ -62,123 +54,29 @@ toml = "1.1"
 tokio = { version = "1.53", features = ["rt", "time"] }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 ureq = "3.4"
-# The Markdown renderer (vendor/upleft, docs/EMBEDDING.md there): hosted
-# views for the chat transcript, Mermaid with ELK layouts, math.
-upleft-core = { path = "vendor/upleft/crates/core" }
-upleft-math = { path = "vendor/upleft/crates/math" }
-upleft-mermaid = { path = "vendor/upleft/crates/mermaid" }
-upleft-render = { path = "vendor/upleft/crates/render" }
-
-objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-    "std",
-    "block2",
-    "objc2-core-foundation",
-    "NSAccessibilityProtocols",
-    "NSAlert",
-    "NSAnimation",
-    "NSAnimationContext",
-    "NSApplication",
-    "NSAppearance",
-    "NSAttributedString",
-    "NSStringDrawing",
-    "NSBezierPath",
-    "NSBitmapImageRep",
-    "NSButton",
-    "NSButtonCell",
-    "NSBox",
-    "NSCell",
-    "NSClipView",
-    "NSColor",
-    "NSColorList",
-    "NSControl",
-    "NSCursor",
-    "NSDragging",
-    "NSPasteboardItem",
-    "NSEvent",
-    "NSFont",
-    "NSFontDescriptor",
-    "NSGraphics",
-    "NSGraphicsContext",
-    "NSImage",
-    "NSImageRep",
-    "NSImageView",
-    "NSLayoutManager",
-    "NSMenu",
-    "NSMenuItem",
-    "NSOpenPanel",
-    "NSPanel",
-    "NSPasteboard",
-    "NSParagraphStyle",
-    "NSPopUpButton",
-    "NSProgressIndicator",
-    "NSResponder",
-    "NSRunningApplication",
-    "NSSavePanel",
-    "NSScreen",
-    "NSScrollView",
-    "NSScroller",
-    "NSSearchField",
-    "NSSecureTextField",
-    "NSSegmentedControl",
-    "NSSplitView",
-    "NSStepper",
-    "NSTabView",
-    "NSTabViewItem",
-    "NSText",
-    "NSTextAttachment",
-    "NSTextContainer",
-    "NSTextField",
-    "NSTextStorage",
-    "NSTextTable",
-    "NSTextView",
-    "NSTextContentManager",
-    "NSTextElement",
-    "NSTextLayoutFragment",
-    "NSTextLayoutManager",
-    "NSTextRange",
-    "NSTextSelectionNavigation",
-    "NSTrackingArea",
-    "NSView",
-    "NSVisualEffectView",
-    "NSWindow",
-    "NSWorkspace",
-    "objc2-quartz-core",
-] }
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
-    "std",
-    "CADisplayLink",
-] }
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
-    "std",
-    "block2",
-    "CFArray",
-    "CFBase",
-    "CFDate",
-    "CFRunLoop",
-    "CFString",
-] }
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-core-services = { version = "0.3.2", default-features = false, features = [
-    "std",
-    "FSEvents",
-] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-sidestep = { path = "vendor/sidestep/crates/sidestep" }
-notify = "8"
 
 [profile.release]
 lto = "thin"
 panic = "abort"
 strip = "symbols"
 
-# AppKit diagnostics must run on the process's main thread.
-[[test]]
-name = "linux_display"
-harness = false
-
 # Match release optimization while retaining CPU-profile attribution.
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
 strip = false
+
+# Debug builds keep line tables for our own crates; dependencies build
+# optimized and without debug info, as Aizome's workspace does, so a debug
+# app still draws at a usable speed.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+# tiny-skia's portable SIMD wraps 16-bit lanes on purpose (Sidestep's
+# workspace manifest says so too).
+[profile.dev.package.tiny-skia]
+overflow-checks = false

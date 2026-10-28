@@ -1,6 +1,6 @@
 //! The composer's slash commands: what `/` offers, how the list filters as
-//! the user types, and how a submitted line is recognised. Pure logic, no
-//! AppKit, so it is tested on its own; the popover lives in `slash_ui`.
+//! the user types, and how a submitted line is recognised. Pure logic, so it
+//! is tested on its own; the composer draws the list (`ui::composer`).
 
 /// One command the composer understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,16 +62,15 @@ pub(crate) fn available(mock: bool) -> Vec<Command> {
         .collect()
 }
 
-/// The word being typed when the composer starts with `/` and the caret is
-/// still inside that first word: what the list filters by (without the
+/// The word being typed when the composer holds only `/word` and the caret
+/// (in characters) is within it: what the list filters by (without the
 /// slash). `None` closes the list.
-pub(crate) fn active_query(text: &str, caret_utf16: usize) -> Option<&str> {
+pub(crate) fn active_query(text: &str, caret: usize) -> Option<&str> {
     let rest = text.strip_prefix('/')?;
     let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let word = &rest[..word_end];
-    // The caret must sit within `/word`, counted in UTF-16 as AppKit does.
-    let word_utf16 = 1 + word.encode_utf16().count();
-    (caret_utf16 >= 1 && caret_utf16 <= word_utf16 && word_end == rest.len()).then_some(word)
+    let word_chars = 1 + word.chars().count();
+    (caret >= 1 && caret <= word_chars && word_end == rest.len()).then_some(word)
 }
 
 /// The commands matching `query`, best first: a name that starts with it,

@@ -3,7 +3,7 @@
 //! sub-agents that agent spawned through the `task` tool, the ones still
 //! running first, in spawn order, then the finished ones, newest first,
 //! which can be narrowed to the ones that succeeded or the ones that did
-//! not. Pure data, so the panel's logic is tested without AppKit.
+//! not. Pure data, so the panel's logic is tested without a window.
 
 use std::time::Duration;
 
@@ -35,20 +35,6 @@ pub(crate) enum AgentState {
     Detached,
 }
 
-/// The dot drawn before an agent, one color per family of states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Dot {
-    /// Gold, filled: busy.
-    Working,
-    /// Plum ring: waiting on the user.
-    Blocked,
-    /// Hollow: open and idle, or detached.
-    Idle,
-    /// Green: finished well.
-    Done,
-    /// Red: finished badly.
-    Errored,
-}
 
 impl AgentState {
     pub(crate) fn label(&self) -> String {
@@ -65,15 +51,6 @@ impl AgentState {
         }
     }
 
-    pub(crate) const fn dot(&self) -> Dot {
-        match self {
-            Self::Working | Self::Thinking | Self::RunningTool(_) => Dot::Working,
-            Self::Blocked(_) => Dot::Blocked,
-            Self::Idle | Self::Detached => Dot::Idle,
-            Self::Done => Dot::Done,
-            Self::Errored | Self::Interrupted => Dot::Errored,
-        }
-    }
 
     pub(crate) const fn is_busy(&self) -> bool {
         matches!(self, Self::Working | Self::Thinking | Self::RunningTool(_))
@@ -114,14 +91,12 @@ pub(crate) enum WorkScope {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct ViewState {
-    pub(crate) desk: crate::workspace_model::SessionDesk,
+    pub(crate) desk: crate::session_state::Desk,
     pub(crate) query: String,
     pub(crate) selected: Option<String>,
     pub(crate) scope: WorkScope,
     pub(crate) compact: bool,
     pub(crate) search_open: bool,
-    pub(crate) finished_collapsed: bool,
-    pub(crate) page: usize,
 }
 
 impl Default for ViewState {
@@ -133,8 +108,6 @@ impl Default for ViewState {
             scope: WorkScope::All,
             compact: false,
             search_open: false,
-            finished_collapsed: false,
-            page: 0,
         }
     }
 }
@@ -148,12 +121,6 @@ pub(crate) fn needs_attention(info: &SubagentInfo) -> bool {
         )
 }
 
-pub(crate) struct VisibleWork {
-    pub(crate) rows: Vec<AgentRow>,
-    pub(crate) matched: usize,
-    pub(crate) page: usize,
-    pub(crate) pages: usize,
-}
 
 /// Shared search and scope semantics for the task tree and Observatory.
 pub(crate) fn matching_work<'a>(
@@ -191,67 +158,6 @@ pub(crate) fn matching_work<'a>(
         .collect()
 }
 
-/// Keep the root as orientation even under search. Search/attention explicitly
-/// reveal matching finished work, so a collapsed group cannot conceal a result.
-/// Page the native controls rather than constructing thousands of AppKit views.
-pub(crate) fn visible_work(
-    root: &RootAgent,
-    subagents: &[SubagentInfo],
-    now_ms: u64,
-    view: &ViewState,
-) -> VisibleWork {
-    let query = view.query.trim().to_lowercase();
-    let candidates: Vec<_> = matching_work(subagents, view)
-        .into_iter()
-        .cloned()
-        .collect();
-    let matched = candidates.len();
-    let mut rows = agent_rows(root, &candidates, now_ms, FinishedFilter::All);
-    let collapse = view.finished_collapsed && query.is_empty() && view.scope == WorkScope::All;
-    let available = candidates
-        .iter()
-        .filter(|info| !collapse || AgentState::from_status(&info.status).is_busy())
-        .count();
-    let pages = available.div_ceil(40).max(1);
-    let page = view.page.min(pages - 1);
-    let start = page * 40;
-    let mut seen = 0;
-    let mut in_finished = false;
-    rows.retain(|row| {
-        if let AgentRow::Section { section, .. } = row {
-            in_finished = *section == Section::Finished;
-            return true;
-        }
-        if matches!(row, AgentRow::Subagent { .. }) {
-            if collapse && in_finished {
-                return false;
-            }
-            let show = (start..start + 40).contains(&seen);
-            seen += 1;
-            return show;
-        }
-        true
-    });
-    // Drop headings with no page rows, retaining the collapsed disclosure.
-    let mut index = 0;
-    while index < rows.len() {
-        if let AgentRow::Section { section, .. } = &rows[index] {
-            let collapsed_group = collapse && *section == Section::Finished;
-            let has_child = matches!(rows.get(index + 1), Some(AgentRow::Subagent { .. }));
-            if !collapsed_group && !has_child {
-                rows.remove(index);
-                continue;
-            }
-        }
-        index += 1;
-    }
-    VisibleWork {
-        rows,
-        matched,
-        page,
-        pages,
-    }
-}
 
 /// Legacy finished-state preference retained for database compatibility.
 /// The activity workspace uses per-session WorkScope instead.
@@ -386,6 +292,7 @@ impl AgentRow {
     }
 
     /// The subtitle with the running clock appended.
+    #[cfg(test)]
     pub(crate) fn subtitle_line(&self) -> String {
         match self.elapsed() {
             Some(elapsed) => format!("{} · {}", self.subtitle(), elapsed_text(elapsed)),
@@ -548,8 +455,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AgentRow, AgentState, Dot, FinishedFilter, RootAgent, Section, ViewState, WorkScope,
-        agent_rows, elapsed_text, summary_line, visible_work,
+        AgentRow, AgentState, FinishedFilter, RootAgent, Section, ViewState, WorkScope,
+        agent_rows, elapsed_text, matching_work, summary_line,
     };
     use crate::omp_runtime::SubagentInfo;
 
@@ -600,7 +507,7 @@ mod tests {
                 "reviewer — done · reviewer · 12s",
             ]
         );
-        assert_eq!(rows[2].state().dot(), Dot::Working);
+        assert!(rows[2].state().is_busy());
         assert!(rows[2].elapsed().is_some(), "a running sub-agent ticks");
         assert!(
             rows[5].elapsed().is_none(),
@@ -672,7 +579,7 @@ mod tests {
         done.warning = Some("changes were not merged back: document server rejected".into());
         let rows = agent_rows(&root, &[done], 0, FinishedFilter::All);
         assert_eq!(rows[2].subtitle_line(), "done · task · 30s · needs review");
-        assert_eq!(rows[2].state().dot(), Dot::Done);
+        assert_eq!(*rows[2].state(), AgentState::Done);
     }
 
     #[test]
@@ -686,7 +593,7 @@ mod tests {
         let rows = agent_rows(&root, &[], 0, FinishedFilter::All);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subtitle_line(), "not attached");
-        assert_eq!(rows[0].state().dot(), Dot::Idle);
+        assert_eq!(*rows[0].state(), AgentState::Detached);
     }
 
     #[test]
@@ -715,15 +622,6 @@ mod tests {
         );
     }
 
-    fn test_root() -> RootAgent {
-        RootAgent {
-            title: "Root".into(),
-            state: AgentState::Idle,
-            elapsed: None,
-            model: "test".into(),
-        }
-    }
-
     #[test]
     fn attention_includes_failed_interrupted_and_completed_warnings() {
         let mut review = subagent("review", 0, "reviewer", "completed");
@@ -737,157 +635,26 @@ mod tests {
             subagent("stopped", 3, "task", "cancelled"),
             subagent("fine", 4, "scout", "completed"),
         ];
-        let view = ViewState {
-            scope: WorkScope::Attention,
-            finished_collapsed: true,
-            ..ViewState::default()
-        };
-        let work = visible_work(&test_root(), &board, 0, &view);
-        let ids: Vec<_> = work
-            .rows
-            .iter()
-            .filter_map(|row| {
-                if let AgentRow::Subagent { id, .. } = row {
-                    Some(id.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(work.matched, 4);
-        assert!(
-            ids.contains(&"review")
-                && ids.contains(&"error")
-                && ids.contains(&"failed")
-                && ids.contains(&"stopped")
-        );
-        assert!(!ids.contains(&"fine"));
+        let view = ViewState { scope: WorkScope::Attention, ..ViewState::default() };
+        let ids: Vec<&str> = matching_work(&board, &view).iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(ids, ["review", "error", "failed", "stopped"]);
     }
 
     #[test]
-    fn search_reveals_collapsed_results_and_matches_all_words_across_fields() {
+    fn search_matches_all_words_across_fields_and_the_active_lens_keeps_running_work() {
         let mut issue = subagent("authentication", 0, "reviewer", "failed");
         issue.error = Some("Token expired".into());
         let board = [issue, subagent("rendering", 1, "reviewer", "running")];
-        let view = ViewState {
-            query: "REVIEWER token".into(),
-            finished_collapsed: true,
-            ..ViewState::default()
+        let search = |query: &str| {
+            let view = ViewState { query: query.into(), ..ViewState::default() };
+            matching_work(&board, &view).iter().map(|info| info.id.clone()).collect::<Vec<_>>()
         };
-        let work = visible_work(&test_root(), &board, 0, &view);
-        assert_eq!(work.matched, 1);
-        assert!(matches!(work.rows.first(), Some(AgentRow::Root { .. })));
-        assert!(
-            matches!(work.rows.last(), Some(AgentRow::Subagent { id, .. }) if id == "authentication")
-        );
-        let none = visible_work(
-            &test_root(),
-            &board,
-            0,
-            &ViewState {
-                query: "nonexistent".into(),
-                ..view
-            },
-        );
-        assert_eq!(none.rows.len(), 1);
-    }
-
-    #[test]
-    fn large_workloads_have_bounded_pages_without_missing_or_duplicate_tasks() {
-        let board: Vec<_> = (0..107)
-            .map(|i| {
-                subagent(
-                    &format!("task-{i}"),
-                    i,
-                    "task",
-                    if i < 52 { "running" } else { "completed" },
-                )
-            })
-            .collect();
-        let mut ids = std::collections::HashSet::new();
-        for page in 0..3 {
-            let work = visible_work(
-                &test_root(),
-                &board,
-                0,
-                &ViewState {
-                    page,
-                    ..ViewState::default()
-                },
-            );
-            assert_eq!(work.pages, 3);
-            assert_eq!(work.matched, 107);
-            let tasks: Vec<_> = work
-                .rows
-                .iter()
-                .filter_map(|row| {
-                    if let AgentRow::Subagent { id, .. } = row {
-                        Some(id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            assert!(tasks.len() <= 40);
-            for id in tasks {
-                assert!(ids.insert(id.clone()));
-            }
-            for (i, row) in work.rows.iter().enumerate() {
-                if matches!(row, AgentRow::Section { .. }) {
-                    assert!(matches!(
-                        work.rows.get(i + 1),
-                        Some(AgentRow::Subagent { .. })
-                    ));
-                }
-            }
-        }
-        assert_eq!(ids.len(), board.len());
-        let work = visible_work(
-            &test_root(),
-            &board[..1],
-            0,
-            &ViewState {
-                page: 90,
-                ..ViewState::default()
-            },
-        );
-        assert_eq!(work.page, 0);
-    }
-
-    #[test]
-    fn collapse_and_active_lenses_keep_the_primary_agent_and_running_tasks() {
-        let board = [
-            subagent("active", 0, "task", "running"),
-            subagent("done", 1, "task", "completed"),
-        ];
-        let collapsed = visible_work(
-            &test_root(),
-            &board,
-            0,
-            &ViewState {
-                finished_collapsed: true,
-                ..ViewState::default()
-            },
-        );
-        assert_eq!(collapsed.rows.len(), 4);
-        assert!(matches!(
-            collapsed.rows.last(),
-            Some(AgentRow::Section {
-                section: Section::Finished,
-                ..
-            })
-        ));
-        let active = visible_work(
-            &test_root(),
-            &board,
-            0,
-            &ViewState {
-                scope: WorkScope::Active,
-                ..ViewState::default()
-            },
-        );
-        assert_eq!(active.matched, 1);
-        assert_eq!(active.rows.len(), 3);
+        assert_eq!(search("REVIEWER token"), ["authentication"]);
+        assert_eq!(search("reviewer"), ["authentication", "rendering"]);
+        assert!(search("nonexistent").is_empty());
+        let active = ViewState { scope: WorkScope::Active, ..ViewState::default() };
+        let ids: Vec<&str> = matching_work(&board, &active).iter().map(|info| info.id.as_str()).collect();
+        assert_eq!(ids, ["rendering"]);
     }
 
     #[test]

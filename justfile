@@ -1,91 +1,66 @@
-# Omperor's day-to-day tasks. `just` alone lists them.
+# Omperor's day-to-day tasks. `just` alone lists them. Run them in the dev
+# shell (`nix develop`), which has the toolchain, the linker setup and
+# Aizome's fonts.
 
-# Honor an explicit SDKROOT; otherwise use the newest Command Line Tools SDK
-# compatible with the helper's LLD 22 linker. The macOS 27 CLT SDK also ships
-# arm64e.x1 stubs, so selecting the newest SDK unconditionally breaks install.
-sdk := env("SDKROOT", `ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk 2>/dev/null | sort -Vr | while IFS= read -r candidate; do stub="$candidate/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics.tbd"; if [ -f "$stub" ] && ! grep -Fq 'arm64e.x1-' "$stub"; then printf '%s' "$candidate"; break; fi; done`)
-export SDKROOT := sdk
+# Where `just install` puts Omperor.
+prefix := env("PREFIX", env("HOME") / ".local")
 
 # List the recipes.
 default:
     @just --list --unsorted
 
-# Rebuild the local release app at target/Omperor Dev.app, rebuilding the OMP helper only if its inputs changed.
-release:
-    scripts/build-app.sh
+# Build the OMP helper Omperor runs, at target/omperor-helpers/omp (only when its inputs changed).
+helper:
+    scripts/build-omp-helper.sh
 
+# Run Omperor Dev (org.aizome.OmperorDev, state in ~/.local/share/omperor-dev), release-optimized.
+run *args: helper
+    cargo run --release --locked -- {{args}}
 
-# Build release and replace /Applications/Omperor.app, preserving the local Dev bundle.
-install:
+# Run Omperor Dev as a debug build, for a debugger.
+run-debug *args: helper
+    cargo run --locked -- {{args}}
+
+# Run the tests: the app's own, and the window driven headless with the mock backend.
+test *args:
+    cargo test --locked {{args}}
+
+# Check formatting-independent lints.
+clippy:
+    cargo clippy --locked --all-targets
+
+# Build Omperor (org.aizome.Omperor, state in ~/.local/share/omperor) and install it, its helper,
+# its desktop entry and its icon under {{prefix}}. A running Omperor keeps going until it's quit.
+install: helper
     #!/usr/bin/env bash
     set -euo pipefail
-    app="$(scripts/build-app.sh --production)"
-    staging="$(mktemp -d "${TMPDIR:-/tmp}/omperor-install.XXXXXX")"
-    trap 'rm -rf "$staging"' EXIT
-    bundle="$staging/Omperor.app"
-    /usr/bin/ditto "$app" "$bundle"
-    /usr/bin/codesign --force --deep --sign - "$bundle"
-    /usr/bin/codesign --verify --deep --strict "$bundle"
-    destination="/Applications/Omperor.app"
-    elevate=(/usr/bin/env)
-    if [[ ! -w /Applications || ( -e "$destination" && ! -w "$destination" ) ]]; then
-        elevate=(sudo)
-    fi
-    "${elevate[@]}" /bin/rm -rf "$destination"
-    "${elevate[@]}" /usr/bin/ditto "$bundle" "$destination"
-    /usr/bin/codesign --verify --deep --strict "$destination"
-    # The staging bundle has the production identity. Retire
-    # that launch registration without deleting or stopping a running session.
-    lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-    legacy="$PWD/target/Omperor.app"
-    if [[ -d "$legacy" ]]; then
-        # Unregistering an already retired bundle can return -10814.
-        "$lsregister" -u "$legacy" || echo "Legacy local bundle is not registered; continuing installation." >&2
-    fi
-    "$lsregister" -f "$destination"
-    /usr/bin/swift scripts/update-installed-dock.swift "$legacy" "$destination"
-    echo "Installation does not replace a running Omperor process." >&2
-    echo "Finish active work, quit Omperor, then open /Applications/Omperor.app explicitly." >&2
-    echo "Installed $destination"
-# Rebuild the release bundle and open it.
-run-release:
-    open "$(scripts/build-app.sh)"
+    cargo build --release --locked --features production
+    prefix="{{prefix}}"
+    install -Dm755 target/release/omperor "$prefix/bin/omperor.new"
+    mv -f "$prefix/bin/omperor.new" "$prefix/bin/omperor"
+    install -Dm755 target/omperor-helpers/omp "$prefix/libexec/omperor/omp.new"
+    mv -f "$prefix/libexec/omperor/omp.new" "$prefix/libexec/omperor/omp"
+    install -Dm644 data/org.aizome.Omperor.svg "$prefix/share/icons/hicolor/scalable/apps/org.aizome.Omperor.svg"
+    mkdir -p "$prefix/share/applications"
+    # The session's PATH may not hold $prefix/bin: name the binary in full.
+    sed "s|^Exec=omperor |Exec=$prefix/bin/omperor |" data/org.aizome.Omperor.desktop \
+        > "$prefix/share/applications/org.aizome.Omperor.desktop.new"
+    mv -f "$prefix/share/applications/org.aizome.Omperor.desktop.new" "$prefix/share/applications/org.aizome.Omperor.desktop"
+    echo "Installed Omperor in $prefix"
 
-# The normal run path is release-optimized too.
-run:
-    scripts/run-app.sh
+# Remove what `just install` installed. Omperor's state stays in ~/.local/share/omperor.
+uninstall:
+    rm -f "{{prefix}}/bin/omperor" "{{prefix}}/share/applications/org.aizome.Omperor.desktop" \
+        "{{prefix}}/share/icons/hicolor/scalable/apps/org.aizome.Omperor.svg"
+    rm -rf "{{prefix}}/libexec/omperor"
 
-# Build and open a debug bundle only when a debugger requires it.
-run-debug:
-    open "$(scripts/build-app.sh --debug)"
-
-# Build the debug bundle without opening it.
-debug:
-    scripts/build-app.sh --debug
-
-# Run the app's unit tests, generating Upleft's Markdown corpus first if a fresh checkout lacks it.
-test:
-    test -f vendor/upleft/corpus/generated/docs/Docs__STATUS.md || (cd vendor/upleft && python3 scripts/build-corpus.py)
-    cargo test
-
-# Build the native Linux app using Sidestep, and the OMP helper it runs (rebuilt only if its inputs changed).
-linux:
-    scripts/build-omp-helper.sh >/dev/null
-    scripts/linux-cargo build --release --locked
-
-# Verify the Linux app and its platform-independent unit tests.
-test-linux:
-    scripts/linux-cargo test --locked
-
-# Exercise real pasteboard, native Paste, and Command-V in the installed release.
-# Replaces clipboard contents; exits without starting inference or loading sessions.
-test-installed-paste:
-    /Applications/Omperor.app/Contents/MacOS/omperor --attachment-paste-smoke
-
-# Regenerate the README's screenshots in docs/screenshots, headless, against the mock backend.
-readme-shots:
-    scripts/readme-shots.sh
-
-# Regenerate macos/AppIcon.icns from assets/01-crowned-gate.svg.
-icon:
-    scripts/build-app-icon.sh
+# Redraw the README's screenshots in docs/screenshots: the app tests, headless, on the mock backend.
+shots:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="$(mktemp -d)"
+    OMPEROR_SHOTS="$dir" cargo test --locked --bin omperor app::tests
+    for shot in main-dark main-light agents timeline math settings-metrics; do
+        cp "$dir/$shot.png" docs/screenshots/
+    done
+    echo "The tests' other pictures are in $dir"

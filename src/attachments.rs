@@ -1,4 +1,4 @@
-//! Attachment preparation is blocking work: call `prepare` on the job pool, never AppKit.
+//! Attachment preparation is blocking work: call `prepare` on a worker, never the interface thread.
 //! RPC accepts base64 images, not arbitrary file parts. Every attachment also carries
 //! an honest local path so binary files and text-only steering remain accessible.
 use std::{
@@ -23,7 +23,7 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub(crate) enum AttachmentSource {
     File(PathBuf),
-    /// Owned bytes copied from the pasteboard; no AppKit object crosses threads.
+    /// Owned bytes from the clipboard or a drop.
     Bytes {
         name: String,
         bytes: Vec<u8>,

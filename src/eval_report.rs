@@ -214,7 +214,7 @@ impl Stats {
         values.sort_unstable();
         let total = values.iter().fold(0u64, |sum, value| sum.saturating_add(*value));
         let middle = values.len() / 2;
-        let median = if values.len() % 2 == 0 {
+        let median = if values.len().is_multiple_of(2) {
             (values[middle - 1] as f64 + values[middle] as f64) / 2.0
         } else {
             values[middle] as f64

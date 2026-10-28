@@ -1258,7 +1258,7 @@ fn suite(args: &[String]) -> Result<i32, String> {
             "app_version": env!("CARGO_PKG_VERSION"),
             "created_at_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             "executable": executable,
-            "helper": crate::omp_runtime::eval_executable(),
+            "helper": crate::omp_runtime::omp_executable(),
             "state_root": root,
             "repeat": repeat,
             "jobs": jobs,
@@ -1415,12 +1415,8 @@ fn apply_reference(task: &Task, workspace: &Path) -> Result<(), String> {
         git(Some(workspace), &["apply", "--whitespace=nowarn", &patch.to_string_lossy()])?;
     }
     if let Some(script) = &task.reference_script {
-        // NixOS and others have no /bin/bash.
-        let bash = if cfg!(target_os = "macos") {
-            PathBuf::from("/bin/bash")
-        } else {
-            crate::eval::resolve_program("bash", &task.env)
-        };
+        // From PATH: NixOS and others have no /bin/bash.
+        let bash = crate::eval::resolve_program("bash", &task.env);
         let mut command = Command::new(bash);
         command
             .arg(script)
@@ -1537,7 +1533,7 @@ fn doctor(args: &[String]) -> Result<i32, String> {
     let _ = Arguments::parse(args, &[], &[])?;
     let root = state_root()?;
     let data = root.join("omp/data");
-    let helper = crate::omp_runtime::eval_executable();
+    let helper = crate::omp_runtime::omp_executable();
     let desktop = desktop_accounts(&root);
     let mut problems = Vec::new();
     let live = if !helper.is_file() {
@@ -1614,7 +1610,7 @@ fn login(args: &[String]) -> Result<i32, String> {
         .mode(0o700)
         .create(&data)
         .map_err(|error| format!("{}: {error}", data.display()))?;
-    let helper = crate::omp_runtime::eval_executable();
+    let helper = crate::omp_runtime::omp_executable();
     let before: HashSet<_> = live_accounts(&helper, &data)
         .unwrap_or_default()
         .into_iter()

@@ -29,7 +29,7 @@ Upstream also has an [adaptive hub wait ladder](https://github.com/can1357/oh-my
 
 The author's approximately 30% saving is not an Omperor measurement, and the reviewed commit includes no cost benchmark. Fewer polling turns should reduce inference traffic; actual savings depend on the workload and model behavior. This is guidance, not a hard ban on shell commands needed for real diagnostics.
 
-All 20 focused regressions passed; the three affected crates also passed doctest builds. The updated release is installed at `/Applications/Omperor.app`; both installed programs match the build after excluding code signatures and their size metadata, the signature verifies, and the helper contains the new guidance. The change applies on the next app launch. The build and test evidence was recorded locally and is not kept in the repository. Reproduce the focused offline checks with `just test-omperor-background` in the patched helper source, using the SDK and Cargo settings below.
+All 20 focused regressions passed; the three affected crates also passed doctest builds. The helper built from these patches contains the new guidance; it applies from the next app launch. The build and test evidence was recorded locally and is not kept in the repository. Reproduce the focused offline checks with `just test-omperor-background` in the patched helper source, using the Cargo settings below.
 
 ## Live-model follow-up
 
@@ -56,8 +56,8 @@ The latest driver run passed with one nextest leak warning in an unchanged secre
 
 The full agent suite has two existing failures: `central_truncation_spills_and_notrunc_explicitly_opts_out` and `tool_call_round_settles_in_the_dom_then_runs_second_inference`. Both were reproduced in a separate baseline checkout with only patches 0001–0004. An unrelated session `replay_law` test also fails to compile because its `TurnReceipt` initializer lacks existing fields; the focused suite runs the projection tests and the compaction replay regression directly.
 
-After building the helper, its staged source provides `just test-omperor-efficiency`. On this machine, use `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk` for the bundled LLD linker and `CARGO_NET_OFFLINE=true` for Cargo. The staged source is `vendor/oh-my-pi/target/omperor-source`.
+After building the helper, its staged source provides `just test-omperor-efficiency`. Run it in `nix develop`, with `CARGO_NET_OFFLINE=true` for Cargo. The staged source is `vendor/oh-my-pi/target/omperor-source`.
 
 The synthetic reduction is a regression assertion, not a measured percentage reduction in provider quota use. The observed token burn that motivated these changes came from a recorded session investigation that is not kept in the repository.
 
-The optimized release is installed at `/Applications/Omperor.app`. Its signature was verified. Both installed executables match the final build when excluding their signatures and the associated signature-size metadata. Build hashes and compact test evidence were recorded with that investigation and are not kept in the repository. The changes take effect on the next application launch.
+Build hashes and compact test evidence were recorded with that investigation and are not kept in the repository. The changes take effect on the next application launch.

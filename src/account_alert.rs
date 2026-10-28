@@ -162,12 +162,6 @@ impl Alerts {
             .find(|a| a.account_id.as_deref() == Some(id))
     }
 
-    pub(crate) fn needs_reauth(&self, id: &str) -> bool {
-        self.failures
-            .iter()
-            .any(|a| a.account_id.as_deref() == Some(id))
-    }
-
     /// Call only for a successful login or authenticated inference, never for
     /// an account list's “active” flag or a successful unrelated account.
     pub(crate) fn recovered(&mut self, id: &str, provider: AuthProvider, signed_in: bool) -> bool {
@@ -329,10 +323,10 @@ mod tests {
         state.record(one.clone()); // Duplicate events must not undo snoozing.
         state.retain_accounts(&accounts); // “Active” is not recovery.
         assert!(state.visible(now).is_none());
-        assert!(state.needs_reauth("one") && state.needs_reauth("two"));
+        assert!(state.for_account("one").is_some() && state.for_account("two").is_some());
         assert_eq!(state.visible(now + Duration::from_secs(1800)), Some(&one));
         state.recovered("one", AuthProvider::OpenAi, false);
-        assert!(!state.needs_reauth("one") && state.needs_reauth("two"));
+        assert!(!state.for_account("one").is_some() && state.for_account("two").is_some());
         assert!(state.visible(now + Duration::from_secs(3600)).is_none());
         state.record(one.clone());
         assert_eq!(state.visible(now), Some(&one));

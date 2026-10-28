@@ -6,7 +6,7 @@ The default serializes first-time store initialization; --cold-start races it.
 --isolated-stores checks separate app data roots in the same physical project;
 --other-helper additionally exercises two different packaged executables.
 Artifacts are retained in the printed temporary directory. No user credentials
-or project files are used. Run after scripts/build-app.sh (macOS) or `just linux`,
+or project files are used. Run after `just helper`,
 or pass --helper.
 """
 import argparse
@@ -117,12 +117,10 @@ class Helper:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cold-start", action="store_true", help="Also race first-time credential store initialization")
-    # The macOS Dev bundle's helper, or on Linux the one `just linux` installs.
-    default_helper = ROOT / (
-        "target/Omperor Dev.app/Contents/Helpers/omp" if sys.platform == "darwin" else "target/omperor-helpers/omp"
-    )
+    # The helper `just helper` builds.
+    default_helper = ROOT / "target/omperor-helpers/omp"
     parser.add_argument("--helper", type=Path, default=default_helper)
-    parser.add_argument("--other-helper", type=Path, help="Use a second bundle's helper for isolated-store checks")
+    parser.add_argument("--other-helper", type=Path, help="Use a second helper (an installed one) for isolated-store checks")
     parser.add_argument("--isolated-stores", action="store_true", help="Separate both stores while sharing HOME and the project")
     args = parser.parse_args()
     if args.other_helper and not args.isolated_stores:

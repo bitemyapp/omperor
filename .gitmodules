@@ -2,9 +2,8 @@
 	path = vendor/oh-my-pi
 	url = https://github.com/bitemyapp/oh-my-pi.git
 	branch = codex/omperor-rpc-reliability-omp2
-[submodule "vendor/upleft"]
-	path = vendor/upleft
-	url = https://github.com/bitemyapp/upleft
-[submodule "vendor/sidestep"]
-	path = vendor/sidestep
-	url = https://github.com/bitemyapp/sidestep
+[submodule "vendor/sekka"]
+	path = vendor/sekka
+	url = https://github.com/bitemyapp/sekka.git
+	branch = main
+	shallow = true

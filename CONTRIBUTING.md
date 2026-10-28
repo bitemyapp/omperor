@@ -6,52 +6,77 @@ MIT OR Apache-2.0, as described in [LICENSE](LICENSE).
 
 ## Build and run
 
-Install the prerequisites listed in the [README](README.md#requirements),
-then:
+Set up as the [README](README.md#build-and-run) says, then, in `nix develop`:
 
 ```sh
-git submodule update --init --recursive
-just run        # build target/Omperor Dev.app (optimized) and open it
-just debug      # debug bundle, when you need a debugger
+just run          # Omperor Dev, optimized
+just run-debug    # a debug build, when you need a debugger
 ```
 
 `just` alone lists every recipe. Local builds are **Omperor Dev**, with their
 own state root, so they never touch an installed Omperor's accounts or
-sessions. Quit Omperor Dev before rebuilding it.
+sessions. To try the interface without accounts or inference, turn on
+Settings ▸ Developer ▸ Developer mode and choose the Mock inference backend:
+new sessions are then answered by a scripted local agent (`/mock` lists its
+scenarios).
 
-To review interface changes without accounts or inference,
-`scripts/preview-design.sh` builds a preview with deterministic sample
-content; add `--release` when judging responsiveness.
+## How the app is put together
+
+Omperor is an `aizome-kit` program (`vendor/sekka/desktop/aizome/crates/aizome-kit`,
+documented in `desktop/aizome/docs/kit.md` there): its state lives in
+`App` (`src/app/`), messages (`Msg`) change it in `update`, and `src/ui/`
+draws every window from it, in full, each time it changes. The kit keeps the
+widgets' own state (scroll positions, selections, the composer's text) by
+their place in the tree, so views give lasting parts a `key`.
+
+- `src/app/mod.rs`: the state, the messages, and their dispatch.
+- `src/app/live.rs`: each session's OMP runtime, its events, its history.
+- `src/app/{sessions,compose,accounts,changes,subagents,projects,insights,tools,sheets}.rs`:
+  the rest of the behaviour, by area.
+- `src/ui/`: the main window (`mod.rs`, `sidebar.rs`, `transcript.rs`,
+  `composer.rs`, `changes.rs`, `agents.rs`), Settings, the Timeline and Usage
+  windows, and the sheets.
+- `src/markdown/`: answers parsed into a document on workers, highlighted
+  into theme roles, and drawn.
+
+The kit is a submodule. When Omperor needs something it lacks, extend the kit
+there (in Sekka's style, with its tests), rather than working around it here.
+
+## Never block the interface thread
+
+From [AGENTS.md](AGENTS.md), and binding for every change:
+
+> Do not perform non-trivial compute, I/O (including OMP RPC interactions), or
+> shell commands on the interface thread.
+
+`update` and the views run on the interface thread. Anything that can take
+longer than a frame (git and other subprocesses, reading or even checking
+files, network requests, waiting on the OMP child) runs on a worker:
+`cx.spawn` for one piece of work, the runtime thread for OMP, or a thread of
+its own for a stream (the timeline reader, session discovery). It answers
+with a message. While it runs, the window shows that work is under way (a job
+in the status line, a spinner where the result will go) and stays responsive.
+Results that may arrive out of order carry a generation, and a stale one is
+dropped.
 
 ## Tests
 
 | Command | What it checks |
 |---|---|
-| `just test` | The app's unit and integration tests (`cargo test`), after generating Upleft's Markdown corpus if the checkout lacks it. |
+| `just test` | The unit tests, and the app driven as a person would through the kit's `Harness` (`src/app/tests.rs`), headless, on the mock backend. |
+| `just shots` | Redraws `docs/screenshots` from those tests. Look at them after changing what a window shows. |
 | `cargo test --bin omperor eval` | The eval runner only. |
 | `./target/release/omperor eval validate [TASK...]` | That each eval task's graders reject the untouched fixture and accept the reference solution. No inference. |
-| `just test-linux` | The Linux build and its tests, through Sidestep. See [docs/LINUX_BUILD.md](docs/LINUX_BUILD.md). |
+| `just clippy` | Lints. |
 
 Run `eval validate` for any task you add or change under `evals/tasks`, and
-see [docs/EVALS.md](docs/EVALS.md) for how to write one. Tests and smoke
-checks must not use your real accounts or state. Set `OMPEROR_STATE_DIR`, or a
-temporary `HOME`, for anything that launches the app or the helper.
+see [docs/EVALS.md](docs/EVALS.md) for how to write one. Tests must not use
+your real accounts or state: the app tests set `OMPEROR_STATE_DIR` to a
+temporary root, and anything else that launches the app or the helper must
+too.
 
 The tree is not uniformly rustfmt-formatted. Keep formatting changes out of
 unrelated files.
-
-## Never block the main thread
-
-From [AGENTS.md](AGENTS.md), and binding for every change:
-
-> Do not perform non-trivial compute, I/O (including OMP RPC interactions), or
-> shell commands on the AppKit main thread.
-
-Work that can take longer than a frame (git and other subprocesses,
-filesystem walks, network requests, waiting on the OMP child) runs on a
-background worker: the job pool, the runtime thread, or a dedicated thread.
-It reports back through a channel that the main-thread timer polls. While it
-runs, the interface shows that work is in progress and stays responsive.
 
 ## Changing OMP
 
@@ -71,16 +96,12 @@ apply:
    whenever the patches change.
 3. Add the new file to `PATCH_FILES`. A patch that is not listed there is
    never applied.
-4. Run `just release`. The helper's build key hashes the patches, so changing
+4. Run `just helper`. The helper's build key hashes the patches, so changing
    any of them restages the source and rebuilds the helper.
 
 Add focused tests to the patch itself. Several patches add
-`just test-omperor-*` recipes to OMP's `justfile`. Run them inside the staging
-checkout, with the same `SDKROOT` the build uses.
-
-The Linux-only patches in `patches/upleft/` and `patches/sidestep/` are
-applied by `scripts/linux-cargo`, which picks up every file in those
-directories.
+`just test-omperor-*` recipes to OMP's `justfile`; run them inside the
+staging checkout.
 
 ## Commits
 
@@ -96,6 +117,5 @@ Follow the existing history (`git log`):
 
 ## Documentation
 
-[docs/AGENT_HANDOFF.md](docs/AGENT_HANDOFF.md) is a long working history of
-the code, written for agents and maintainers. The other files in `docs/`
-cover specific subsystems. Update the one your change affects.
+The files in `docs/` cover specific subsystems. Update the one your change
+affects.

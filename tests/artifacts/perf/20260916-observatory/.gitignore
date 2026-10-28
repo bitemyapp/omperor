@@ -1,3 +1,0 @@
-# Raw local traces contain machine-specific stacks; summaries are committed.
-*.sample.txt
-*-interaction.jsonl

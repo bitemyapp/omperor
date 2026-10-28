@@ -5,10 +5,6 @@ use std::path::{Component, Path, PathBuf};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-#[cfg(target_os = "macos")]
-#[path = "file_watcher_macos.rs"]
-mod backend;
-#[cfg(target_os = "linux")]
 #[path = "file_watcher_linux.rs"]
 mod backend;
 
@@ -26,15 +22,6 @@ pub(crate) struct ChangeFilter {
 }
 
 impl ChangeFilter {
-    /// Judges nothing ignored — the state before any ignore file was read.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn empty(root: &Path) -> Self {
-        Self {
-            root: root.to_owned(),
-            matchers: Vec::new(),
-        }
-    }
-
     /// Reads the `.gitignore` of every directory in `ignore_dirs` (shallowest
     /// first, as `index_project_files` reports them), a repository's own
     /// `.git/info/exclude` where present, and the global excludes. Does file
@@ -123,52 +110,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    #[cfg(target_os = "macos")]
-    use super::backend::events_need_refresh;
     use super::{ChangeFilter, git_index_write};
-    #[cfg(target_os = "macos")]
-    use objc2_core_services::kFSEventStreamEventFlagMustScanSubDirs;
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn events_an_inspection_already_covered_do_not_refresh() {
-        let root = Path::new("/project");
-        let filter = ChangeFilter::empty(root);
-        let edit = root.join("src/main.rs");
-        let index = root.join(".git/index");
-        // A tool's edits (ids 5 and 7) were inspected at tool end, which
-        // stamped the watcher with id 10; their events arriving later are
-        // dropped, while an edit after the stamp (id 12) still counts.
-        assert!(!events_need_refresh(
-            10,
-            &filter,
-            [(5, 0, edit.as_path()), (7, 0, edit.as_path())]
-        ));
-        assert!(events_need_refresh(
-            10,
-            &filter,
-            [(5, 0, edit.as_path()), (12, 0, edit.as_path())]
-        ));
-        // The path filter still applies to uncovered events.
-        assert!(!events_need_refresh(
-            10,
-            &filter,
-            [(12, 0, index.as_path())]
-        ));
-        // Lost-track events refresh regardless of path, but not when covered.
-        let lost = kFSEventStreamEventFlagMustScanSubDirs;
-        assert!(events_need_refresh(
-            10,
-            &filter,
-            [(12, lost, index.as_path())]
-        ));
-        assert!(!events_need_refresh(
-            10,
-            &filter,
-            [(9, lost, edit.as_path())]
-        ));
-        assert!(!events_need_refresh(10, &filter, []));
-    }
 
     #[test]
     fn git_index_writes_never_count() {

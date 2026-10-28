@@ -1,14 +1,32 @@
 //! Retained session ownership and UI-independent runtime event reduction.
 use crate::{
-    PendingSession, SessionHistoryLoad, WorkspaceDiffDiscovery, account_alert, agents, attachments,
+    account_alert, agents, attachments,
     chat::Conversation,
-    composer_attachments,
+    composer,
     file_picker::ProjectFile,
     file_watcher, metrics,
     omp_runtime::{self, AuthProvider, OmpRuntime, ToolOutcome, TurnOutcome, UiEvent},
-    session::{SessionMessage, Speaker},
+    session::{self, SessionMessage, Speaker},
     transcripts, workspace,
 };
+
+/// What the next fresh session the child reports should be recorded as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSession {
+    pub(crate) project_id: String,
+    pub(crate) directory: PathBuf,
+    pub(crate) parent_session_id: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) base_branch: Option<String>,
+    pub(crate) worktree_path: Option<PathBuf>,
+}
+
+/// A session's recorded history, arriving a page at a time from its reader.
+#[derive(Debug)]
+pub(crate) struct SessionHistoryLoad {
+    pub(crate) receiver: flume::Receiver<session::HistoryUpdate>,
+    pub(crate) message_count: usize,
+}
 use std::{
     cell::{Cell, OnceCell, RefCell},
     collections::{HashMap, HashSet},
@@ -21,6 +39,7 @@ use std::{
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
+#[derive(Default)]
 pub(crate) struct SessionKey(pub u64);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,7 +113,7 @@ impl PromptHistory {
     /// `-1` moves toward older prompts and `1` toward newer prompts, like a
     /// shell: the draft being written when recall starts is kept, and moving
     /// past the newest prompt brings it back. Moving down again is left to
-    /// AppKit's normal caret behavior.
+    /// the editor's caret.
     pub(crate) fn navigate(&mut self, direction: isize, current: &str) -> Option<String> {
         match direction.cmp(&0) {
             std::cmp::Ordering::Less => {
@@ -130,11 +149,10 @@ pub(crate) struct LiveSession {
     pub(crate) key: SessionKey,
     pub(crate) generation: Cell<u64>,
     pub(crate) lifecycle: Cell<Lifecycle>,
-    pub(crate) draft: RefCell<String>,
     pub(crate) prompt_history: RefCell<PromptHistory>,
     pub(crate) backend: Cell<crate::mock_inference::Backend>,
     pub(crate) attachments_restored: Cell<bool>,
-    pub(crate) pending_attachments: RefCell<composer_attachments::PendingAttachments>,
+    pub(crate) pending_attachments: RefCell<composer::PendingAttachments>,
     pub(crate) attachment_generation: Cell<u64>,
     pub(crate) attachment_submission: Cell<bool>,
     pub(crate) usage_revision: Cell<u64>,
@@ -154,16 +172,11 @@ pub(crate) struct LiveSession {
     pub(crate) session_history: RefCell<Option<SessionHistoryLoad>>,
     pub(crate) active_project_id: RefCell<Option<String>>,
     pub(crate) pending_session: RefCell<Option<PendingSession>>,
-    pub(crate) pending_open_session_id: RefCell<Option<String>>,
     pub(crate) fast_models: RefCell<Vec<String>>,
     pub(crate) fast_mode: Cell<bool>,
     /// Whether the agent is offered the `omperor_` tools in this session.
     pub(crate) omperor_tools: Cell<bool>,
     pub(crate) workspace_snapshot: RefCell<Option<workspace::WorkspaceSnapshot>>,
-    pub(crate) workspace_discovery: RefCell<
-        Option<flume::Receiver<Result<workspace::WorkspaceSnapshot, workspace::WorkspaceError>>>,
-    >,
-    pub(crate) diff_discovery: RefCell<Option<WorkspaceDiffDiscovery>>,
     pub(crate) workspace_refresh_pending: Cell<bool>,
     pub(crate) selected_change: RefCell<Option<PathBuf>>,
     pub(crate) current_project: RefCell<PathBuf>,
@@ -191,16 +204,10 @@ pub(crate) struct LiveSession {
     pub(crate) project_files: RefCell<Arc<Vec<ProjectFile>>>,
     pub(crate) project_files_dir: RefCell<Option<PathBuf>>,
     pub(crate) project_files_indexing: Cell<bool>,
-    pub(crate) project_files_dirty: Cell<bool>,
     pub(crate) project_watcher: RefCell<Option<file_watcher::ProjectWatcher>>,
     pub(crate) workspace_change_seen_at: Cell<Option<Instant>>,
     pub(crate) change_tree_collapsed: RefCell<HashSet<PathBuf>>,
-    pub(crate) workspace_reads: RefCell<HashSet<(u64, String)>>,
     pub(crate) workspace_read_failures: RefCell<HashMap<String, String>>,
-    pub(crate) evidence_generation: Cell<u64>,
-    pub(crate) agent_inspection_generation: Cell<u64>,
-    pub(crate) agent_inspection_loading: RefCell<Option<String>>,
-    pub(crate) agent_inspection_failure: RefCell<Option<(String, String)>>,
     pub(crate) subagents: RefCell<Vec<omp_runtime::SubagentInfo>>,
     pub(crate) subagent_transcripts: RefCell<HashMap<String, transcripts::Entry>>,
     pub(crate) subagent_sync_inflight: Cell<bool>,
@@ -208,12 +215,6 @@ pub(crate) struct LiveSession {
     pub(crate) live_session_id: RefCell<Option<String>>,
     pub(crate) live_state: RefCell<agents::AgentState>,
     pub(crate) turn_started_at: Cell<Option<Instant>>,
-    pub(crate) mock_session_title: RefCell<Option<String>>,
-}
-impl Default for SessionKey {
-    fn default() -> Self {
-        Self(0)
-    }
 }
 
 #[derive(Debug)]
@@ -226,7 +227,7 @@ pub(crate) struct LiveSessions {
 }
 impl Default for LiveSessions {
     fn default() -> Self {
-        let seed = crate::wall_clock_ms().saturating_mul(1_000_000);
+        let seed = crate::rules::wall_clock_ms().saturating_mul(1_000_000);
         let mut registry = Self {
             entries: Vec::new(),
             selected: SessionKey(0),
@@ -318,11 +319,10 @@ impl LiveSessions {
         key: SessionKey,
         path: PathBuf,
     ) -> Result<(), SessionKey> {
-        if let Some(existing) = self.find_path(&path) {
-            if existing.key != key {
+        if let Some(existing) = self.find_path(&path)
+            && existing.key != key {
                 return Err(existing.key);
             }
-        }
         let Some(entry) = self.get(key) else {
             return Err(key);
         };
@@ -361,6 +361,13 @@ pub(crate) struct Effects {
     pub(crate) rejected: bool,
 }
 impl LiveSession {
+    /// Whether OMP has said no account is signed in (the mock needs none).
+    pub(crate) fn signed_out(&self) -> bool {
+        self.accounts_known.get()
+            && self.authenticated_providers.borrow().is_empty()
+            && self.backend.get() != crate::mock_inference::Backend::Mock
+    }
+
     fn status(&self, text: impl Into<String>) {
         self.chat_status_text.replace(text.into());
     }
@@ -465,12 +472,12 @@ impl LiveSession {
                     self.read_only_session.set(false);
                 }
                 self.account_alert_live_since
-                    .set(crate::wall_clock_ms_at(arrived));
+                    .set(crate::rules::wall_clock_ms_at(arrived));
                 self.current_project.replace(project.clone());
                 if *self.current_model.borrow() != *model
                     || (self.current_account.borrow().is_some() && *self.current_account.borrow() != *account)
                 {
-                    self.cache_clock.borrow_mut().reset(crate::wall_clock_ms_at(arrived));
+                    self.cache_clock.borrow_mut().reset(crate::rules::wall_clock_ms_at(arrived));
                 }
                 self.current_model.replace(model.clone());
                 self.current_account.replace(account.clone());
@@ -518,7 +525,7 @@ impl LiveSession {
                 self.status("Working…");
                 self.turn_started_at.set(Some(arrived));
                 self.turn_started_ms
-                    .set(Some(crate::wall_clock_ms_at(arrived)));
+                    .set(Some(crate::rules::wall_clock_ms_at(arrived)));
                 self.tool_starts.borrow_mut().clear();
                 self.state(agents::AgentState::Working);
             }
@@ -553,19 +560,19 @@ impl LiveSession {
             UiEvent::InferenceReceipt(receipt) => {
                 self.cache_clock.borrow_mut().observe(
                     crate::usage::live_cache_observation(&receipt, &self.current_model.borrow()),
-                    crate::wall_clock_ms_at(arrived),
+                    crate::rules::wall_clock_ms_at(arrived),
                 );
                 self.usage_revision.set(self.usage_revision.get().wrapping_add(1));
                 let usage = crate::usage::Evidence::from(&receipt);
                 self.live_receipts
                     .borrow_mut()
-                    .push(crate::usage::live_receipt(&receipt, crate::wall_clock_ms_at(arrived)));
+                    .push(crate::usage::live_receipt(&receipt, crate::rules::wall_clock_ms_at(arrived)));
                 if receipt.tokens_out > 0 {
                     effects.account_recovery = receipt.provider.clone();
                 }
                 let inference = metrics::Inference {
                     usage,
-                    at_ms: crate::wall_clock_ms_at(arrived),
+                    at_ms: crate::rules::wall_clock_ms_at(arrived),
                     session: self
                         .live_session_id
                         .borrow()
@@ -616,10 +623,10 @@ impl LiveSession {
                 }
                 drop(conversation);
                 self.chat_busy.set(false);
-                if let Some(start) = self.turn_started_at.get() {
-                    if !mock {
+                if let Some(start) = self.turn_started_at.get()
+                    && !mock {
                         effects.metrics.push(metrics::Record::Turn(metrics::Turn {
-                            at_ms: crate::wall_clock_ms_at(arrived),
+                            at_ms: crate::rules::wall_clock_ms_at(arrived),
                             session: self
                                 .live_session_id
                                 .borrow()
@@ -638,7 +645,6 @@ impl LiveSession {
                             .into(),
                         }));
                     }
-                }
                 self.turn_started_at.set(None);
                 self.turn_started_ms.set(None);
                 self.tool_starts.borrow_mut().clear();
@@ -708,7 +714,7 @@ impl LiveSession {
                     self.status("Working…");
                 }
                 self.state(agents::AgentState::Working);
-                effects.refresh_workspace = crate::tool_may_change_files(outcome.name.as_deref());
+                effects.refresh_workspace = crate::rules::tool_may_change_files(outcome.name.as_deref());
             }
             UiEvent::TurnResults(outcomes) => {
                 for outcome in outcomes {
@@ -830,7 +836,7 @@ impl LiveSession {
             }
             UiEvent::ModelChanged(model) => {
                 if *self.current_model.borrow() != model {
-                    self.cache_clock.borrow_mut().reset(crate::wall_clock_ms_at(arrived));
+                    self.cache_clock.borrow_mut().reset(crate::rules::wall_clock_ms_at(arrived));
                 }
                 self.current_model.replace(model.clone());
                 if !self.read_only_session.get() {
@@ -863,7 +869,7 @@ impl LiveSession {
             }
             UiEvent::AccountChanged(account) => {
                 if *self.current_account.borrow() != account {
-                    self.cache_clock.borrow_mut().reset(crate::wall_clock_ms_at(arrived));
+                    self.cache_clock.borrow_mut().reset(crate::rules::wall_clock_ms_at(arrived));
                 }
                 self.account_change_pending.set(false);
                 self.current_account.replace(account.clone());
@@ -904,10 +910,10 @@ impl LiveSession {
         self.lifecycle.set(Lifecycle::Failed);
     }
     fn finish_tool(&self, outcome: &ToolOutcome, arrived: Instant, effects: &mut Effects) {
-        if let Some(start) = self.tool_starts.borrow_mut().remove(&outcome.call_id) {
-            if self.backend.get() != crate::mock_inference::Backend::Mock {
+        if let Some(start) = self.tool_starts.borrow_mut().remove(&outcome.call_id)
+            && self.backend.get() != crate::mock_inference::Backend::Mock {
                 effects.metrics.push(metrics::Record::Tool(metrics::Tool {
-                    at_ms: crate::wall_clock_ms_at(arrived),
+                    at_ms: crate::rules::wall_clock_ms_at(arrived),
                     session: self
                         .live_session_id
                         .borrow()
@@ -922,7 +928,6 @@ impl LiveSession {
                     error: outcome.is_error == Some(true),
                 }));
             }
-        }
         self.conversation.borrow_mut().finish_tool(
             &outcome.call_id,
             outcome.name.as_deref(),
@@ -966,7 +971,7 @@ mod tests {
         let model = "anthropic/claude-sonnet-4-6";
         a.current_model.replace(model.into());
         let arrived = Instant::now();
-        let now = crate::wall_clock_ms_at(arrived);
+        let now = crate::rules::wall_clock_ms_at(arrived);
         a.reduce(UiEvent::InferenceReceipt(omp_runtime::InferenceReceipt {
             model: Some(model.into()), recorded_at_ms: Some(now), duration_ms: Some(240_000),
             cache_write: 100, ..Default::default()

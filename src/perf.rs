@@ -62,9 +62,6 @@ pub(crate) fn span(name: &'static str) -> Span {
 }
 
 pub(crate) fn span_with(name: &'static str, fields: impl FnOnce() -> Value) -> Span {
-    // Every span joins the main thread's frame-budget ledger, profiling or
-    // not: a pass over budget must be able to say what ran in it.
-    crate::frame_budget::span_started(name);
     let Some(recorder) = recorder() else {
         return Span { name, id: 0, started: Instant::now(), fields: Value::Null, recorded: false };
     };
@@ -92,7 +89,6 @@ impl Drop for Span {
         {
             recorder.emit("span_end", self.name, Some(self.id), Some(micros), &self.fields);
         }
-        crate::frame_budget::span_finished(self.name, micros);
     }
 }
 

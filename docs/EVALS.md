@@ -5,7 +5,7 @@
 ## Quick start
 
 ```sh
-just release                               # builds target/Omperor Dev.app and its helper
+just helper && cargo build --release      # the helper, then the app
 ./target/release/omperor eval doctor       # is this machine ready?
 ./target/release/omperor eval suite --output /tmp/evals/first --tag smoke
 ```

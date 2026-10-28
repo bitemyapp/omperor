@@ -1,5 +1,5 @@
 //! Provider usage is a ledger of completed requests, not a context-window meter.
-//! Read and aggregate journals on the job pool; never scan them on AppKit.
+//! Read and aggregate journals on a worker; never scan them on the interface thread.
 use crate::{
     cache_policy::{CacheAction, CacheClock, CacheObservation, CachePolicy},
     omp_runtime::InferenceReceipt,
@@ -145,8 +145,8 @@ impl Totals {
     }
 }
 
-/// Presentation data is prepared with the ledger on a worker. AppKit only lays
-/// out a bounded page of native views; it never parses a text report.
+/// Presentation data is prepared with the ledger on a worker; the Usage
+/// window only draws it.
 #[derive(Debug, Clone)]
 pub(crate) struct Metric {
     pub title: &'static str,
@@ -186,8 +186,6 @@ impl Section {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Report {
-    /// Latest root response for the selected model; computed off AppKit.
-    pub cache_observation: Option<CacheObservation>,
     /// The `/usage` card's figures, from the same receipts.
     pub card: Card,
     pub metrics: [Metric; 4],
@@ -260,7 +258,7 @@ pub(crate) fn read(path: Option<PathBuf>, children: Vec<PathBuf>, model: String)
             .into_owned();
         for entry in entries {
             if entry.kind.name.as_str() == kind::TURN_RECEIPT {
-                let at = u64::try_from(entry.id.as_ulid().timestamp_ms()).unwrap_or(u64::MAX);
+                let at = entry.id.as_ulid().timestamp_ms();
                 let receipt = serde_json::from_str(&entry.data).ok().and_then(|value| {
                     Receipt::from_value(&value, entry.id.to_string(), session.clone(), at)
                 });
@@ -651,7 +649,6 @@ fn render(
         ),
     );
     Report {
-        cache_observation: cache_observation(receipts, root, model),
         card: Card::default(),
         metrics,
         scope,
@@ -1093,11 +1090,11 @@ mod tests {
         };
         let valid = make("root", route, json!({"duration_ms":600_000}));
         assert!(
-            cache_window_summary(&[valid.clone()], Some("root"), route, 120_000)
+            cache_window_summary(std::slice::from_ref(&valid), Some("root"), route, 120_000)
                 .contains("KV ~05:00")
         );
         assert!(
-            cache_window_summary(&[valid.clone()], Some("root"), route, 420_000)
+            cache_window_summary(std::slice::from_ref(&valid), Some("root"), route, 420_000)
                 .contains("window elapsed")
         );
         let reported = make(

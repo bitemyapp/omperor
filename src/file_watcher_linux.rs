@@ -78,7 +78,7 @@ impl ProjectWatcher {
                         };
                         if refresh {
                             let _ = notices.send(root.clone());
-                            crate::gui_wake::notify();
+                            crate::wake::notify();
                         }
                     }
                     Ok(())

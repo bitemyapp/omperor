@@ -50,6 +50,12 @@ impl JournalTranscript {
     }
 }
 
+/// Whether `path` names a journal, by its extension alone: safe on the
+/// interface thread, which never touches the disk.
+pub(crate) fn names_journal(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == JOURNAL_EXTENSION)
+}
+
 pub(crate) fn is_journal(path: &Path) -> bool {
     path.is_file()
         && path
@@ -142,7 +148,7 @@ pub(crate) fn fold(entries: &[Entry]) -> JournalTranscript {
                             i64::try_from(entry.id.as_ulid().timestamp_ms()).unwrap_or(i64::MAX);
                         messages.push(SessionMessage::spoken(
                             Speaker::Event,
-                            turn_error_line(&reason, Some(&crate::format_timestamp(at_ms))),
+                            turn_error_line(&reason, Some(&crate::rules::format_timestamp(at_ms))),
                         ));
                     }
                 }

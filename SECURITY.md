@@ -29,10 +29,10 @@ Further points:
   agent chooses. Its parameters also let the agent start a browser binary or
   attach to an existing Chrome DevTools Protocol endpoint, which would expose
   that browser's signed-in sessions.
-- **Computer use** is off by default. Settings → Agent → **Allow computer use
-  in new sessions** turns it on for sessions started afterwards. Agents can
-  then capture the screen and control native apps, within the permissions
-  macOS grants the app.
+- **Computer use** is off by default. Settings ▸ General ▸ New sessions ▸
+  **Desktop control** turns it on for sessions started afterwards. Agents can
+  then capture the screen and use the keyboard and pointer, within what the
+  Wayland session allows.
 - **Omperor's own tools** (`omperor_*`: list, delete and archive sessions and
   projects) are off unless you enable them for one session with `/omperor`.
   Deleting sessions or archives and archiving a project ask for confirmation.
@@ -92,6 +92,6 @@ an attacker gains.
 
 Only the current `main` branch is supported. There are no releases yet.
 
-Vulnerabilities in OMP itself, in Upleft or in Sidestep may belong upstream as
-well. Report them here if Omperor's patches or its use of those components
+Vulnerabilities in OMP itself, or in Aizome's toolkit or Sidestep (Sekka), may
+belong upstream as well. Report them here if Omperor's patches or its use of those components
 are involved.

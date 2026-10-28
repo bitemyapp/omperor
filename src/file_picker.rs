@@ -1,6 +1,6 @@
 //! The composer's `@` file-reference picker: indexing a project's files and
-//! ranking them against a partial query. Pure logic with no AppKit, so it runs
-//! on the worker pool and can be tested (and benchmarked) on its own.
+//! ranking them against a partial query. Pure logic, so it runs
+//! on workers and can be tested (and benchmarked) on its own.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -185,10 +185,10 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
         .all(|target| chars.any(|char| char == target))
 }
 
-/// Extracts the active `@` reference token ending at the caret from the text
-/// before it: returns the query (after `@`) and the UTF-16 location of the `@`.
-/// `None` when there is no `@` word at the caret.
-pub(crate) fn active_at_query(prefix: &str, caret: usize) -> Option<(String, usize)> {
+/// The `@` reference being typed at the caret, from the text before it:
+/// the query (after the `@`) and where the `@` is, in characters. `None`
+/// when there is no `@` word at the caret.
+pub(crate) fn active_at_query(prefix: &str) -> Option<(String, usize)> {
     let at_byte = prefix.rfind('@')?;
     let query = &prefix[at_byte + 1..];
     if query.chars().any(char::is_whitespace) {
@@ -203,9 +203,7 @@ pub(crate) fn active_at_query(prefix: &str, caret: usize) -> Option<(String, usi
     if !starts_word {
         return None;
     }
-    let token_utf16 = prefix[at_byte..].encode_utf16().count();
-    let query_start = caret.checked_sub(token_utf16)?;
-    Some((query.to_owned(), query_start))
+    Some((query.to_owned(), prefix[..at_byte].chars().count()))
 }
 
 #[cfg(test)]
@@ -224,14 +222,14 @@ mod tests {
     fn at_query_only_triggers_on_a_word_starting_at_signal() {
         // A trailing "@token" is a query; the '@' must start a word.
         assert_eq!(
-            active_at_query("read @src/ma", 12),
+            active_at_query("read @src/ma"),
             Some(("src/ma".to_owned(), 5))
         );
-        assert_eq!(active_at_query("@", 1), Some((String::new(), 0)));
+        assert_eq!(active_at_query("@"), Some((String::new(), 0)));
         // Whitespace after '@' ends the token; an email '@' does not start one.
-        assert_eq!(active_at_query("@src now", 8), None);
-        assert_eq!(active_at_query("me@host", 7), None);
-        assert_eq!(active_at_query("no reference here", 17), None);
+        assert_eq!(active_at_query("@src now"), None);
+        assert_eq!(active_at_query("me@host"), None);
+        assert_eq!(active_at_query("no reference here"), None);
     }
 
     #[test]

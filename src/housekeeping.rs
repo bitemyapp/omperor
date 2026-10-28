@@ -22,8 +22,9 @@ use crate::{journal, metrics, perf, preferences, workspace};
 pub(crate) struct Target {
     pub(crate) id: String,
     pub(crate) title: String,
-    /// Whether the session has a journal in the sessions directory. Drafts
-    /// and the mock backend's sessions have none.
+    /// Whether the session may have a journal in the sessions directory
+    /// (drafts and the mock backend's sessions have none). The worker
+    /// looks for it; the main thread does not touch the disk.
     pub(crate) journal: bool,
     /// A worktree Omperor created for this session that no other session
     /// uses: removed if git finds it clean.
@@ -181,7 +182,8 @@ const SHARED_NAMES: [&str; 4] = ["metrics", "frames", "blobs", "tmp"];
 pub(crate) fn files_for(dir: &Path, stem: &str) -> Vec<PathBuf> {
     let journal = dir.join(format!("{stem}.{}", journal::JOURNAL_EXTENSION));
     let mut files = vec![
-        crate::saved_heights::path_for(&journal),
+        // The row heights earlier builds kept beside a journal.
+        journal.with_extension("heights"),
         dir.join(format!("{stem}.heights.tmp")),
         dir.join(format!("{stem}.rpc.json")),
     ];
@@ -426,10 +428,19 @@ pub(crate) fn delete(request: Request) -> Report {
         || serde_json::json!({ "sessions": request.targets.len() }),
     );
     let dir = &request.sessions_dir;
+    let targets: Vec<Target> = request
+        .targets
+        .iter()
+        .cloned()
+        .map(|mut target| {
+            target.journal &= journal_path(dir, &target.id).exists();
+            target
+        })
+        .collect();
     let mut report = Report::default();
     let mut leases = Vec::new();
     let mut accepted = Vec::new();
-    for target in &request.targets {
+    for target in &targets {
         if target.journal {
             match lease(&journal_path(dir, &target.id)) {
                 Ok(lease) => leases.push(lease),
@@ -1065,7 +1076,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn byte_counts_read_like_finder() {
+    fn byte_counts_read_like_a_file_manager() {
         assert_eq!(byte_text(512), "512 bytes");
         assert_eq!(byte_text(1_500), "1.5 KB");
         assert_eq!(byte_text(3_400_000), "3.4 MB");
